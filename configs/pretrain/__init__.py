@@ -42,6 +42,10 @@ class Config:
   gradient_clip: float
   gradient_accumulation_steps: int
   checkpoint_interval: int
+  # model type selection ('vit' or 'cnn')
+  model_type: str = 'vit'
+  # CNN-specific
+  cnn_kernel_size: int = 7
 
   @property
   def num_channels(self):

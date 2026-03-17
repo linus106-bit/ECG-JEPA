@@ -7,7 +7,15 @@ from torch import nn
 import configs
 from models.predictor import Predictor
 from models.utils import apply_mask
-from models.vision_transformer import VisionTransformer
+
+
+def create_encoder(config, **kwargs):
+  if config.model_type == 'cnn':
+    from models.cnn_encoder import CNNEncoder
+    return CNNEncoder(config, **kwargs)
+  else:
+    from models.vision_transformer import VisionTransformer
+    return VisionTransformer(config, **kwargs)
 
 
 class JEPA(nn.Module):
@@ -15,7 +23,7 @@ class JEPA(nn.Module):
     super().__init__()
     self.config = config
     self.momentum_schedule = momentum_schedule
-    self.encoder = VisionTransformer(config, use_sdp_kernel=use_sdp_kernel)
+    self.encoder = create_encoder(config, use_sdp_kernel=use_sdp_kernel)
     self.predictor = Predictor(config, use_sdp_kernel=use_sdp_kernel)
     self.target_encoder = copy.deepcopy(self.encoder)
 
