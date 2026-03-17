@@ -13,6 +13,9 @@ def create_encoder(config, **kwargs):
   if config.model_type == 'cnn':
     from models.cnn_encoder import CNNEncoder
     return CNNEncoder(config, **kwargs)
+  elif config.model_type == 'mamba':
+    from models.mamba_encoder import MambaEncoder
+    return MambaEncoder(config, **kwargs)
   else:
     from models.vision_transformer import VisionTransformer
     return VisionTransformer(config, **kwargs)
