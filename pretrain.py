@@ -1,6 +1,7 @@
 import argparse
 import dataclasses
 import logging.config
+import os
 import pprint
 from contextlib import nullcontext
 from os import path, makedirs
@@ -8,6 +9,8 @@ from time import time
 
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
 import configs
@@ -65,33 +68,52 @@ PTB_XL.std = [0.191, 0.166, 0.173, 0.142, 0.149, 0.147,
 
 
 def main():
-  makedirs(args.out, exist_ok=True)
-  logging.config.fileConfig('logging.ini')
-  logger = logging.getLogger('app')
+  # Setup distributed training
+  local_rank = int(os.environ.get('LOCAL_RANK', 0))
+  rank = int(os.environ.get('RANK', 0))
+  world_size = int(os.environ.get('WORLD_SIZE', 1))
+  is_distributed = world_size > 1
+  is_main_process = rank == 0
 
-  device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+  if is_distributed:
+    dist.init_process_group(backend='nccl')
+    torch.cuda.set_device(local_rank)
+
+  if is_main_process:
+    makedirs(args.out, exist_ok=True)
+    logging.config.fileConfig('logging.ini')
+  logger = logging.getLogger('app')
+  if not is_main_process:
+    logger.setLevel(logging.CRITICAL)
+
+  device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
   using_cuda = device.type == 'cuda'
   num_cpus = get_cpu_count()
-  logger.debug(f'using {device} accelerator and {num_cpus} CPUs')
+  if is_main_process:
+    logger.debug(f'using {device} accelerator, {num_cpus} CPUs, world_size={world_size}')
 
   if using_cuda:
-    logger.debug('TF32 tensor cores are enabled')
+    if is_main_process:
+      logger.debug('TF32 tensor cores are enabled')
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
   if args.amp == 'float32' or not using_cuda:  # don't use AMP on a CPU
-    logger.debug('using float32 precision')
+    if is_main_process:
+      logger.debug('using float32 precision')
     auto_mixed_precision = nullcontext()
   elif args.amp == 'bfloat16':
     # bfloat16 preserves the range of float32, so it does not require scaling
-    logger.debug('using bfloat16 with AMP')
+    if is_main_process:
+      logger.debug('using bfloat16 with AMP')
     auto_mixed_precision = torch.cuda.amp.autocast(dtype=torch.bfloat16)
   else:
     raise ValueError('Failed to choose floating-point format.')
 
   if args.chkpt:
-    logger.debug(f'resuming from checkpoint {args.chkpt}')
+    if is_main_process:
+      logger.debug(f'resuming from checkpoint {args.chkpt}')
     chkpt = torch.load(args.chkpt, map_location=device)
     config = configs.pretrain.Config(**chkpt['config'])
   else:
@@ -104,8 +126,9 @@ def main():
       args.config = config_file
     config_dict = configs.load_config_file(args.config)
     config = configs.pretrain.Config(**config_dict)
-    logger.debug(f'loading configuration file from {args.config}:\n'
-                 f'{pprint.pformat(config_dict, compact=True, sort_dicts=False, width=120)}')
+    if is_main_process:
+      logger.debug(f'loading configuration file from {args.config}:\n'
+                   f'{pprint.pformat(config_dict, compact=True, sort_dicts=False, width=120)}')
     chkpt = None
 
   dump_files = {}
@@ -132,7 +155,8 @@ def main():
   datasets = {}
   for dataset_name, weight in config.datasets.items():
     dump_file = dump_files[dataset_name]
-    logger.debug(f'loading {dataset_name} from {dump_file}')
+    if is_main_process:
+      logger.debug(f'loading {dataset_name} from {dump_file}')
     dataset_cls = DATASETS[dataset_name]
     resample_ratio = config.sampling_frequency / dataset_cls.sampling_frequency
     channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
@@ -166,18 +190,30 @@ def main():
       raise ValueError(f'Unsupported dataset format: {dump_file}')
     datasets[dataset_name] = (dataset, weight)
 
-  logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
+  if is_main_process:
+    logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
+
+  # Each rank seeds numpy differently so DatasetRouter samples different data per rank
+  np.random.seed(42 + rank)
+
+  # With DDP, divide global batch size across all ranks
+  local_batch_size = config.batch_size // world_size
+  num_workers = max(1, num_cpus // world_size)
+
+  def worker_init_fn(worker_id):
+    np.random.seed(rank * num_workers + worker_id)
 
   train_loader = DataLoader(
     dataset=DatasetRouter(datasets.values()),
-    batch_size=config.batch_size,
+    batch_size=local_batch_size,
     pin_memory=using_cuda,
     collate_fn=MaskCollator(
       patch_size=config.patch_size,
       min_block_size=config.min_block_size,
       min_keep_ratio=config.min_keep_ratio,
       max_keep_ratio=config.max_keep_ratio),
-    num_workers=2)
+    num_workers=num_workers,
+    worker_init_fn=worker_init_fn)
 
   def map_to_device(data_iterator, device=None):
     for batch in data_iterator:
@@ -221,16 +257,22 @@ def main():
     step=step)
 
   # setup model
-  model = original_model = JEPA(
+  original_model = JEPA(
     config=config,
     momentum_schedule=momentum_schedule,
     use_sdp_kernel=using_cuda
   ).to(device)
-  optimizer = model.get_optimizer(fused=using_cuda)
+  optimizer = original_model.get_optimizer(fused=using_cuda)
 
   if chkpt is not None:  # resume training from checkpoint
-    model.load_state_dict(chkpt['model'])
+    original_model.load_state_dict(chkpt['model'])
     optimizer.load_state_dict(chkpt['optimizer'])
+
+  # Wrap with DDP after loading checkpoint
+  if is_distributed:
+    model = DDP(original_model, device_ids=[local_rank])
+  else:
+    model = original_model
 
   if args.compile:
     model = torch.compile(model)
@@ -245,9 +287,12 @@ def main():
     update_weight_decay_(optimizer, next(wd_schedule))
     # forward and backward pass
     batch_loss = 0.
-    for _ in range(config.gradient_accumulation_steps):
+    for i in range(config.gradient_accumulation_steps):
       x, mask_encoder, mask_predictor = next(train_iterator)
-      with auto_mixed_precision:
+      # delay gradient sync until the last accumulation step
+      sync_ctx = (nullcontext() if not is_distributed or i == config.gradient_accumulation_steps - 1
+                  else model.no_sync())
+      with sync_ctx, auto_mixed_precision:
         loss = model(x, mask_encoder, mask_predictor)
         loss = loss / config.gradient_accumulation_steps
       loss.backward()
@@ -261,19 +306,22 @@ def main():
     # finalize train step
     step_end = time()
     step_time.update(step_end - step_start)
-    if (step + 1) % 100 == 0:
+    if is_main_process and (step + 1) % 100 == 0:
       logger.info(f'[{step + 1:06d}] '
                   f'step_time {step_time.value:.4f} '
                   f'train_loss {train_loss.value:.4f}')
       step_time = AverageMeter()
       train_loss = AverageMeter()
-    if (step + 1) % config.checkpoint_interval == 0:
+    if is_main_process and (step + 1) % config.checkpoint_interval == 0:
       torch.save({
         'model': original_model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'config': dataclasses.asdict(config),
         'step': step + 1,
       }, path.join(args.out, f'chkpt_{step + 1}.pt'))
+
+  if is_distributed:
+    dist.destroy_process_group()
 
 
 def load_variable_data_dump(dump_file, min_channel_size, transform=None, processes=None):
