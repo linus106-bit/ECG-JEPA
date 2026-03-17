@@ -17,7 +17,7 @@ import configs
 from data import transforms, utils as datautils
 from data.datasets import PTB_XL
 from data.utils import TensorDataset
-from models import VisionTransformer, ViTClassifier
+from models import create_encoder, ViTClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
 from utils.schedules import update_learning_rate_, cosine_schedule
 
@@ -220,7 +220,7 @@ def main():
     warmup_steps=eval_config.learning_rate_warmup_steps,
     warmup_start_value=1e-6)
 
-  encoder = VisionTransformer(
+  encoder = create_encoder(
     config=encoder_config,
     keep_registers=eval_config.use_register,
     use_sdp_kernel=using_cuda)

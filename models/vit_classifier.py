@@ -4,12 +4,11 @@ import torch
 from torch import nn
 
 import configs
-from models import VisionTransformer
 from models.modules import AttentivePooler
 
 
 class ViTClassifier(nn.Module):
-  def __init__(self, encoder: VisionTransformer, config: configs.eval.Config, use_sdp_kernel=True):
+  def __init__(self, encoder: nn.Module, config: configs.eval.Config, use_sdp_kernel=True):
     super().__init__()
     self.config = config
     self.encoder = encoder
