@@ -60,22 +60,20 @@ class SelectiveSSM(nn.Module):
     return y
 
   def _selective_scan(self, x, dt, A, B, C):
-    """Sequential scan. For production use, install mamba-ssm for CUDA kernels."""
-    B_batch, L, D = x.shape
-    N = self.d_state
+    """Parallel selective scan using Heinsen recurrence (no Python for-loop).
+    Converts h[t] = dA[t]*h[t-1] + dB[t] into cumsum operations."""
+    # dt: (B, L, D), A: (D, N), B: (B, L, N), C: (B, L, N), x: (B, L, D)
+    dtA = torch.einsum('bld,dn->bldn', dt, A)  # (B, L, D, N) — log of dA since A < 0
+    dB_x = torch.einsum('bld,bln->bldn', dt * x, B)  # (B, L, D, N)
 
-    # dt: (B, L, D), A: (D, N), B: (B, L, N), C: (B, L, N)
-    dtA = torch.einsum('bld,dn->bldn', dt, A)  # (B, L, D, N)
-    dA = torch.exp(dtA)
-    dB = torch.einsum('bld,bln->bldn', dt * x, B)  # (B, L, D, N)
+    # Heinsen parallel recurrence:
+    # h[t] = exp(log_dA_cum[t]) * cumsum(dB_x * exp(-log_dA_cum))[t]
+    # where log_dA_cum = cumsum(log(dA)) = cumsum(dtA)
+    log_dA_cum = torch.cumsum(dtA, dim=1)  # (B, L, D, N)
+    h = torch.exp(log_dA_cum) * torch.cumsum(dB_x * torch.exp(-log_dA_cum), dim=1)
 
-    h = torch.zeros(B_batch, D, N, device=x.device, dtype=x.dtype)
-    ys = []
-    for i in range(L):
-      h = dA[:, i] * h + dB[:, i]
-      y_i = torch.einsum('bdn,bn->bd', h, C[:, i])
-      ys.append(y_i)
-    y = torch.stack(ys, dim=1)  # (B, L, D)
+    # output: y[t, d] = sum_n C[t, n] * h[t, d, n]
+    y = torch.einsum('bldn,bln->bld', h, C)
     return y
 
 
