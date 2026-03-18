@@ -7,7 +7,7 @@ import configs
 from models.modules import AttentivePooler
 
 
-class ViTClassifier(nn.Module):
+class EncoderClassifier(nn.Module):
   def __init__(self, encoder: nn.Module, config: configs.eval.Config, use_sdp_kernel=True):
     super().__init__()
     self.config = config
