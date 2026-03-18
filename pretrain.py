@@ -41,7 +41,6 @@ from utils.schedules import (
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data', nargs='+', required=True, help='list of dataset=path/to/data.npy pairs')
 parser.add_argument('--out', default='pretrain', help='output directory')
 parser.add_argument('--config', default='ViTS_mimic', help='path to config file or config name')
 parser.add_argument('--chkpt', help='resume training from model checkpoint')
@@ -131,30 +130,21 @@ def main():
                    f'{pprint.pformat(config_dict, compact=True, sort_dicts=False, width=120)}')
     chkpt = None
 
-  dump_files = {}
-  for data_arg in args.data:
-    dataset_name, *maybe_dump_file = data_arg.split('=', 1)
-    if not maybe_dump_file:
-      raise ValueError('Dataset pair must have following format: dataset=path/to/data.npy')
-    dump_file, = maybe_dump_file
-    dump_files[dataset_name] = dump_file
-
-  for dataset_name in config.datasets:
+  for dataset_name, dataset_info in config.datasets.items():
     if dataset_name not in DATASETS:
       raise ValueError(f'Unknown dataset {dataset_name}. '
                        f'Available datasets are {list(DATASETS)}')
-    if dataset_name not in dump_files:
-      raise ValueError(f'Missing {dataset_name} dataset in `--data` argument')
-    dump_file = dump_files[dataset_name]
+    dump_file = dataset_info['path']
     if not path.isfile(dump_file):
-      raise ValueError(f'Dataset does not exist {dump_file}')
+      raise ValueError(f'Dataset does not exist: {dump_file}')
     _, ext = path.splitext(dump_file)
     if ext not in ('.npy', '.npz'):
       raise ValueError(f'Unsupported dataset format: {dump_file}')
 
   datasets = {}
-  for dataset_name, weight in config.datasets.items():
-    dump_file = dump_files[dataset_name]
+  for dataset_name, dataset_info in config.datasets.items():
+    dump_file = dataset_info['path']
+    weight = dataset_info['weight']
     if is_main_process:
       logger.debug(f'loading {dataset_name} from {dump_file}')
     dataset_cls = DATASETS[dataset_name]

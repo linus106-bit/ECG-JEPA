@@ -11,7 +11,7 @@ class Config:
   min_block_size: int
   min_keep_ratio: float
   max_keep_ratio: float
-  datasets: dict[str, float]
+  datasets: dict  # {name: {path: str, weight: float}}
   # model architecture
   dim: int
   depth: int
