@@ -8,16 +8,36 @@ min_block_size: 10
 min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
-  mimic-iv-ecg: 0.7
-  code-15: 0.1
-  ptb-xl: 0.05
-  ptb: 0.01875
-  cpsc: 0.025
-  cpsc-extra: 0.0125
-  georgia: 0.0375
-  ningbo: 0.028125
-  chapman-shaoxing: 0.009375
-  st-petersburg: 0.01875
+  mimic-iv-ecg:
+    path: /path/to/mimic-iv-ecg.npy
+    weight: 0.7
+  code-15:
+    path: /path/to/code-15.npy
+    weight: 0.1
+  ptb-xl:
+    path: /path/to/ptb-xl.npy
+    weight: 0.05
+  ptb:
+    path: /path/to/ptb.npz
+    weight: 0.01875
+  cpsc:
+    path: /path/to/cpsc.npy
+    weight: 0.025
+  cpsc-extra:
+    path: /path/to/cpsc-extra.npy
+    weight: 0.0125
+  georgia:
+    path: /path/to/georgia.npy
+    weight: 0.0375
+  ningbo:
+    path: /path/to/ningbo.npy
+    weight: 0.028125
+  chapman-shaoxing:
+    path: /path/to/chapman-shaoxing.npy
+    weight: 0.009375
+  st-petersburg:
+    path: /path/to/st-petersburg.npy
+    weight: 0.01875
 # model architecture
 dim: 384
 depth: 8
