@@ -20,7 +20,7 @@ import configs
 from data import transforms, utils as datautils
 from data.datasets import PTB_XL
 from data.utils import TensorDataset
-from models import create_encoder, ViTClassifier
+from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
 from utils.schedules import update_learning_rate_, cosine_schedule
 
@@ -268,7 +268,7 @@ def main():
     config=encoder_config,
     keep_registers=eval_config.use_register,
     use_sdp_kernel=using_cuda)
-  original_model = ViTClassifier(encoder, eval_config, use_sdp_kernel=using_cuda).to(device)
+  original_model = EncoderClassifier(encoder, eval_config, use_sdp_kernel=using_cuda).to(device)
   optimizer = original_model.get_optimizer(fused=using_cuda)
 
   if model_state_dict is not None:
