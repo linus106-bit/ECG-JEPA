@@ -31,12 +31,21 @@ NUM_GPUS=8
 
 # -----------------------------------------------------------------------------
 # [3] 데이터 설정
+#     데이터 경로는 두 가지 방법 중 하나로 지정합니다.
+#
+#     방법 A (권장): eval config yaml 파일 안에서 지정
+#       configs/eval/<CONFIG>.yaml 에 아래 내용을 추가:
+#         dataset:
+#           data_dir: /path/to/ptb-xl
+#           dump: /path/to/ptb-xl.npy   # 생략 시 <data_dir>.npy 로 자동 탐색
+#
+#     방법 B: 아래 변수로 직접 지정 (yaml 설정을 덮어씀)
 # -----------------------------------------------------------------------------
 
-# PTB-XL 데이터 디렉토리 (필수)
-DATA_DIR="/path/to/ptb-xl"
+# PTB-XL 데이터 디렉토리 (비워두면 yaml의 dataset.data_dir 사용)
+DATA_DIR=""
 
-# .npy dump 파일 경로 (비워두면 <DATA_DIR>.npy 로 자동 탐색)
+# .npy dump 파일 경로 (비워두면 yaml의 dataset.dump 또는 <DATA_DIR>.npy 로 자동 탐색)
 DUMP=""
 
 # -----------------------------------------------------------------------------
@@ -76,7 +85,6 @@ CMD=(
     --standalone
     --nproc_per_node="${NUM_GPUS}"
   finetune.py
-  --data-dir "${DATA_DIR}"
   --encoder  "${ENCODER}"
   --config   "${CONFIG}"
   --out      "${OUT_DIR}"
@@ -86,6 +94,7 @@ CMD=(
   --amp      "${AMP}"
 )
 
+[[ -n "${DATA_DIR}" ]] && CMD+=(--data-dir "${DATA_DIR}")
 [[ -n "${DUMP}" ]] && CMD+=(--dump "${DUMP}")
 
 echo "Command: ${CMD[*]}"

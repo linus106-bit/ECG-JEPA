@@ -1,3 +1,8 @@
+# dataset paths (can also be passed via --data-dir / --dump CLI arguments)
+# dataset:
+#   data_dir: /path/to/ptb-xl
+#   dump: /path/to/ptb-xl.npy  # optional; defaults to <data_dir>.npy
+
 # data
 crop_duration: 2.5
 crop_stride: 1.25

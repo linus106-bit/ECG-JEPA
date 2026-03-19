@@ -37,11 +37,11 @@ TASKS = (
 FOLDS = tuple(range(1, 11))
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir', required=True, help='path to data directory')
+parser.add_argument('--data-dir', default=None, help='path to PTB-XL data directory (overrides dataset.data_dir in config)')
 parser.add_argument('--encoder', required=True, help='path to checkpoint or config file')
 parser.add_argument('--out', default='eval', help='output directory')
 parser.add_argument('--config', default='linear', help='path to config file or config name')
-parser.add_argument('--dump', help='path to dump file (.npy) with raw ECG signals')
+parser.add_argument('--dump', help='path to dump file (.npy) with raw ECG signals (overrides dataset.dump in config)')
 parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
 parser.add_argument('--task', choices=TASKS, default='all', help='task type')
 parser.add_argument('--val-fold', choices=FOLDS, type=int, default=9, help='validation fold')
@@ -67,11 +67,6 @@ def main():
   logger = logging.getLogger('app')
   if not is_main_process:
     logger.setLevel(logging.CRITICAL)
-
-  dump_file = args.dump or f'{args.data_dir}.npy'
-  if not path.isfile(dump_file):
-    raise ValueError(f'Failed to find .npy data file. Attempted location: {dump_file}. '
-                     f'Use `--dump` to specify location.')
 
   device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
   using_cuda = device.type == 'cuda'
@@ -110,6 +105,16 @@ def main():
     logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
 
+  # resolve data_dir and dump_file from CLI args or config yaml
+  dataset_cfg = eval_config_dict.pop('dataset', None) or {}
+  data_dir = args.data_dir or dataset_cfg.get('data_dir')
+  if not data_dir:
+    raise ValueError('data_dir must be specified via --data-dir or dataset.data_dir in the eval config yaml')
+  dump_file = args.dump or dataset_cfg.get('dump') or f'{data_dir}.npy'
+  if not path.isfile(dump_file):
+    raise ValueError(f'Failed to find .npy data file. Attempted location: {dump_file}. '
+                     f'Use --dump or dataset.dump in the eval config yaml to specify location.')
+
   # load checkpoint
   _, ext = path.splitext(args.encoder)
   if ext == '.yaml':
@@ -140,8 +145,8 @@ def main():
   # load labels
   if is_main_process:
     logger.debug(f'setting up labels for task `{args.task}`')
-  labels_df = PTB_XL.load_raw_labels(args.data_dir)
-  labels_df = PTB_XL.compute_label_aggregations(labels_df, args.data_dir, ptb_xl_task)
+  labels_df = PTB_XL.load_raw_labels(data_dir)
+  labels_df = PTB_XL.compute_label_aggregations(labels_df, data_dir, ptb_xl_task)
 
   # load data
   if is_main_process:
