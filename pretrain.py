@@ -22,12 +22,14 @@ from data.datasets import (
   PTB_XL
 )
 from data.masks import MaskCollator
+from data.transforms import PreprocessECG, TransformECG
 from data.utils import (
   TensorDataset,
   VariableTensorDataset,
   DatasetRouter
 )
 from models import JEPA
+from utils.distributed import setup_distributed, setup_cuda, setup_amp
 from utils.monitoring import (
   AverageMeter,
   get_cpu_count,
@@ -68,15 +70,7 @@ PTB_XL.std = [0.191, 0.166, 0.173, 0.142, 0.149, 0.147,
 
 def main():
   # Setup distributed training
-  local_rank = int(os.environ.get('LOCAL_RANK', 0))
-  rank = int(os.environ.get('RANK', 0))
-  world_size = int(os.environ.get('WORLD_SIZE', 1))
-  is_distributed = world_size > 1
-  is_main_process = rank == 0
-
-  if is_distributed:
-    dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(local_rank)
+  local_rank, rank, world_size, is_distributed, is_main_process = setup_distributed()
 
   if is_main_process:
     makedirs(args.out, exist_ok=True)
@@ -92,23 +86,9 @@ def main():
     logger.debug(f'using {device} accelerator, {num_cpus} CPUs, world_size={world_size}')
 
   if using_cuda:
-    if is_main_process:
-      logger.debug('TF32 tensor cores are enabled')
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    setup_cuda(logger, is_main_process)
 
-  if args.amp == 'float32' or not using_cuda:  # don't use AMP on a CPU
-    if is_main_process:
-      logger.debug('using float32 precision')
-    auto_mixed_precision = nullcontext()
-  elif args.amp == 'bfloat16':
-    # bfloat16 preserves the range of float32, so it does not require scaling
-    if is_main_process:
-      logger.debug('using bfloat16 with AMP')
-    auto_mixed_precision = torch.cuda.amp.autocast(dtype=torch.bfloat16)
-  else:
-    raise ValueError('Failed to choose floating-point format.')
+  auto_mixed_precision = setup_amp(args.amp, using_cuda, logger, is_main_process)
 
   if args.chkpt:
     if is_main_process:
@@ -321,35 +301,6 @@ def load_variable_data_dump(dump_file, min_channel_size, transform=None, process
   starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
   data = np.concatenate(data)
   return data, starts, sizes
-
-
-class PreprocessECG:  # called once when loading the data
-  def __init__(self, *, mean_std, resample_ratio, channel_order):
-    self.mean, self.std = mean_std
-    self.resample_ratio = resample_ratio
-    self.channel_order = channel_order
-
-  def __call__(self, x):
-    transforms.interpolate_NaNs_(x)
-    if self.resample_ratio != 1.0:
-      channel_size, num_channels = x.shape
-      channel_size = int(self.resample_ratio * channel_size)
-      x = transforms.resample(x, channel_size)
-    transforms.normalize_(x, mean_std=(self.mean, self.std))
-    x.clip(-5, 5, out=x)
-    x = x[:, self.channel_order]
-    return x
-
-
-class TransformECG:  # called whenever dataloader accesses the data
-  def __init__(self, crop_size):
-    self.crop_size = crop_size
-
-  def __call__(self, x):
-    x = transforms.random_crop(x, self.crop_size)
-    x = x.transpose()  # channels first
-    x = torch.from_numpy(x).float()
-    return x
 
 
 if __name__ == '__main__':

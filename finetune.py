@@ -2,9 +2,7 @@ import argparse
 import copy
 import dataclasses
 import logging.config
-import os
 import pprint
-from contextlib import nullcontext
 from os import path, makedirs
 from time import time
 
@@ -19,8 +17,10 @@ from torch.utils.data import DataLoader, DistributedSampler
 import configs
 from data import transforms, utils as datautils
 from data.datasets import PTB_XL
+from data.transforms import FinetunePreprocessECG as PreprocessECG, TrainTransformECG, EvalTransformECG, strided_crops
 from data.utils import TensorDataset
 from models import create_encoder, EncoderClassifier
+from utils.distributed import setup_distributed, setup_cuda, setup_amp
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
 from utils.schedules import update_learning_rate_, cosine_schedule
 
@@ -51,15 +51,7 @@ args = parser.parse_args()
 
 def main():
   # Setup distributed training
-  local_rank = int(os.environ.get('LOCAL_RANK', 0))
-  rank = int(os.environ.get('RANK', 0))
-  world_size = int(os.environ.get('WORLD_SIZE', 1))
-  is_distributed = world_size > 1
-  is_main_process = rank == 0
-
-  if is_distributed:
-    dist.init_process_group(backend='nccl')
-    torch.cuda.set_device(local_rank)
+  local_rank, rank, world_size, is_distributed, is_main_process = setup_distributed()
 
   if is_main_process:
     makedirs(args.out, exist_ok=True)
@@ -75,23 +67,9 @@ def main():
     logger.debug(f'using {device} accelerator, {num_cpus} CPUs, world_size={world_size}')
 
   if using_cuda:
-    if is_main_process:
-      logger.debug('TF32 tensor cores are enabled')
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True
+    setup_cuda(logger, is_main_process)
 
-  if args.amp == 'float32' or not using_cuda:  # don't use AMP on a CPU
-    if is_main_process:
-      logger.debug('using float32 precision')
-    auto_mixed_precision = nullcontext()
-  elif args.amp == 'bfloat16':
-    # bfloat16 preserves the range of float32, so it does not require scaling
-    if is_main_process:
-      logger.debug('using bfloat16 with AMP')
-    auto_mixed_precision = torch.cuda.amp.autocast(dtype=torch.bfloat16)
-  else:
-    raise ValueError('Failed to choose floating-point format.')
+  auto_mixed_precision = setup_amp(args.amp, using_cuda, logger, is_main_process)
 
   if not path.isfile(args.config):
     # maybe config is the name of a default config file in configs/pretrain/
@@ -408,57 +386,6 @@ def main():
 
   if is_distributed:
     dist.destroy_process_group()
-
-
-class PreprocessECG:
-  def __init__(self, channel_size=None, remove_baseline_wander=False):
-    self.channel_size = channel_size
-    self.remove_baseline_wander = remove_baseline_wander
-
-  def __call__(self, x):
-    channel_size, num_channels = x.shape
-    if self.remove_baseline_wander:
-      x = transforms.highpass_filter(x, fs=PTB_XL.sampling_frequency)
-    if self.channel_size is not None and self.channel_size != channel_size:
-      x = transforms.resample(x, self.channel_size)
-    return x
-
-
-class TrainTransformECG:   # called whenever dataloader accesses the data
-  def __init__(self, crop_size=None):
-    self.crop_size = crop_size
-
-  def __call__(self, x):
-    if self.crop_size is not None:
-      x = transforms.random_crop(x, self.crop_size)
-    x = x.transpose()  # channels first
-    x = torch.from_numpy(x).float()
-    return x
-
-
-class EvalTransformECG:  # called whenever dataloader accesses the data
-  def __init__(self, crop_size=None, crop_stride=None):
-    self.crop_size = crop_size
-    self.crop_stride = crop_stride or crop_size
-
-  def __call__(self, x):
-    if self.crop_size is not None:
-      x = strided_crops(x, self.crop_size, self.crop_stride)
-      x = np.swapaxes(x, 1, 2)  # channels first
-    else:
-      x = x.transpose()  # channels first
-    x = torch.from_numpy(x).float()
-    return x
-
-
-def strided_crops(x, size, stride):  # x: (channel_size, num_channels)
-  channel_size, num_channels = x.shape
-  crop_starts = range(0, channel_size - size + 1, stride)
-  num_crops = len(crop_starts)
-  x_ = np.empty((num_crops, size, num_channels), dtype=x.dtype)
-  for i, start in enumerate(crop_starts):
-    x_[i] = x[start:start + size]
-  return x_
 
 
 if __name__ == '__main__':
