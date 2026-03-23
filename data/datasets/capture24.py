@@ -17,19 +17,17 @@ class Capture24:
       labels: np.ndarray of shape (N,), dtype int64
       splits: np.ndarray of shape (N,), 'train' or 'test'
     """
-    from datasets import load_from_disk
-
+    from datasets import load_dataset
     from tqdm import tqdm
 
-    dataset = load_from_disk(data_dir)
+    dataset = load_dataset(data_dir)
     all_data, all_labels, all_splits = [], [], []
     for split_name in ('train', 'test'):
       ds = dataset[split_name]
       split_data = []
       split_labels = []
       for sample in tqdm(ds, desc=split_name):
-        x = np.array(sample['data'], dtype=np.float16)  # (1, C, T)
-        x = x.squeeze(0)          # (C, T)
+        x = np.array(sample['data'], dtype=np.float16)  # (C, T)
         x = x.T                   # (T, C) channels last
         split_data.append(x)
         split_labels.append(sample['label'])
