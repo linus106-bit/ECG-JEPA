@@ -23,8 +23,9 @@ class Capture24:
     all_data, all_labels, all_splits = [], [], []
     for split_name in ('train', 'test'):
       ds = dataset[split_name]
-      x = np.array(ds['input_values'], dtype=np.float16)  # (N, 3, 1000)
-      x = x.transpose(0, 2, 1)  # (N, 1000, 3) channels last
+      x = np.array(ds['data'], dtype=np.float16)  # (N, 1, C, T)
+      x = x.squeeze(1)          # (N, C, T)
+      x = x.transpose(0, 2, 1)  # (N, T, C) channels last
       y = np.array(ds['label'], dtype=np.int64)
       all_data.append(x)
       all_labels.append(y)
