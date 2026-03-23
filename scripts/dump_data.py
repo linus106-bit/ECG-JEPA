@@ -14,7 +14,9 @@ args = parser.parse_args()
 
 if args.dataset is None:
   dir_name = path.basename(args.data_dir)
-  if dir_name == 'chapman_shaoxing':
+  if dir_name.startswith('capture-24') or dir_name.startswith('capture24'):
+    args.dataset = 'capture-24'
+  elif dir_name == 'chapman_shaoxing':
     args.dataset = 'chapman-shaoxing'
   elif dir_name == 'cpsc_2018':
     args.dataset = 'cpsc'
@@ -43,7 +45,13 @@ print(f'Loading data from {args.data_dir}')
 
 data, sizes = None, None
 
-if args.dataset == 'chapman-shaoxing':
+if args.dataset == 'capture-24':
+  data, labels, splits = Capture24.load_data(args.data_dir)
+  # save labels and split info alongside the data dump
+  labels_file = f'{args.data_dir}_labels.npz'
+  print(f'Saving labels to {labels_file}')
+  np.savez(labels_file, labels=labels, splits=splits)
+elif args.dataset == 'chapman-shaoxing':
   record_names = ChapmanShaoxing.find_records(args.data_dir)
   data = load_raw_data(record_names, verbose=args.verbose)
 elif args.dataset == 'cpsc':

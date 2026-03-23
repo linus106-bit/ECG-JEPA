@@ -10,7 +10,7 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   capture-24:
-    path: /path/to/capture24_train.npy
+    path: /path/to/capture-24.npy
     weight: 1.
 # model architecture
 dim: 384
