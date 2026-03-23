@@ -1,0 +1,44 @@
+# ViT-Small for Capture-24 accelerometer HAR pretraining
+# learnable encoder parameters: ~14M (same architecture as ViTS_ptbxl)
+# data
+sampling_frequency: 100
+channels: [x, y, z]
+channel_size: 1000
+patch_size: 20
+min_block_size: 5
+min_keep_ratio: 0.15
+max_keep_ratio: 0.25
+datasets:
+  capture-24:
+    path: /path/to/capture24_train.npy
+    weight: 1.
+# model architecture
+dim: 384
+depth: 8
+num_heads: 6
+pred_dim: 192
+pred_depth: 8
+pred_num_heads: 6
+mlp_ratio: 4.
+qkv_bias: False
+dropout: 0.
+attn_dropout: 0.
+num_registers: 1
+bias: False
+norm_eps: 1.0e-6
+layer_scale_eps: 0.
+# training
+steps: 100_000
+batch_size: 2048
+encoder_momentum: 0.998
+final_encoder_momentum: 0.9995
+learning_rate: 1.0e-3
+final_learning_rate: 1.0e-6
+learning_rate_warmup_steps: 10_000
+weight_decay: 1.0e-2
+final_weight_decay: 1.0e-1
+opt_betas: [0.9, 0.99]
+opt_eps: 1.0e-6
+gradient_clip: 0
+gradient_accumulation_steps: 1
+checkpoint_interval: 10_000
