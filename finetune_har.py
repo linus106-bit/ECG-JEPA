@@ -211,18 +211,8 @@ def main():
     batch_size=local_batch_size,
     sampler=train_sampler,
     shuffle=(train_sampler is None),
-    drop_last=(train_sampler is None),
+    drop_last=True,
     num_workers=num_workers)
-
-  def cycle(dataloader):
-    epoch = 0
-    while True:
-      if is_distributed:
-        train_sampler.set_epoch(epoch)
-      yield from dataloader
-      epoch += 1
-
-  train_iterator = cycle(train_loader)
 
   val_loader = DataLoader(
     dataset=TensorDataset(
@@ -243,9 +233,12 @@ def main():
     batch_size=eval_config.batch_size,
     num_workers=num_workers)
 
+  steps_per_epoch = len(train_loader)
+  total_steps = eval_config.epochs * steps_per_epoch
+
   # setup hyperparameter schedules
   lr_schedule = cosine_schedule(
-    total_steps=eval_config.steps,
+    total_steps=total_steps,
     start_value=eval_config.learning_rate,
     final_value=eval_config.final_learning_rate,
     warmup_steps=eval_config.learning_rate_warmup_steps,
@@ -276,67 +269,66 @@ def main():
   train_loss = AverageMeter()
   best_val_f1 = float('-inf')
   best_val_predictions, saved_val_targets = None, None
-  best_step, best_chkpt = None, None
+  best_epoch, best_chkpt = None, None
 
-  for step in range(eval_config.steps):
-    step_start = time()
-    update_learning_rate_(optimizer, next(lr_schedule))
-    # forward pass
-    x, y = (tensor.to(device) for tensor in next(train_iterator))
-    with auto_mixed_precision:
-      logits = model(x)
-      loss = F.cross_entropy(logits, y)
-    # backward pass
-    loss.backward()
-    if eval_config.gradient_clip > 0:
-      torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    # finalize train step
-    step_end = time()
-    step_time.update(step_end - step_start)
-    train_loss.update(loss.item())
-    # evaluation
-    if (step + 1) % eval_config.checkpoint_interval == 0:
-      val_preds, val_targets = [], []
-      model.eval()
-      with torch.inference_mode():
-        for batch in val_loader:
-          bx, by = (tensor.to(device) for tensor in batch)
-          if eval_config.crop_duration is not None:
-            batch_size, num_crops, num_channels, channel_size = bx.size()
-            bx = bx.reshape(-1, num_channels, channel_size)
-          logits = model(bx)
-          if eval_config.crop_duration is not None:
-            logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
-            logits = logits.mean(dim=1)
-          val_preds.append(logits.argmax(dim=1).clone())
-          val_targets.append(by.clone())
-      model.train()
-      val_preds = torch.cat(val_preds).cpu().numpy()
-      val_targets = torch.cat(val_targets).cpu().numpy()
-      val_f1 = f1_score(y_true=val_targets, y_pred=val_preds, average='macro')
-      val_acc = accuracy_score(y_true=val_targets, y_pred=val_preds)
-      new_best = val_f1 > best_val_f1
-      if new_best:
-        best_val_f1 = val_f1
-        best_val_predictions = val_preds
-        saved_val_targets = val_targets
-        best_step = step
-        best_chkpt = copy.deepcopy(original_model.state_dict())
+  for epoch in range(eval_config.epochs):
+    if is_distributed:
+      train_sampler.set_epoch(epoch)
+    # train
+    for x, y in train_loader:
+      step_start = time()
+      update_learning_rate_(optimizer, next(lr_schedule))
+      x, y = x.to(device), y.to(device)
+      with auto_mixed_precision:
+        logits = model(x)
+        loss = F.cross_entropy(logits, y)
+      loss.backward()
+      if eval_config.gradient_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
+      optimizer.step()
+      optimizer.zero_grad(set_to_none=True)
+      step_time.update(time() - step_start)
+      train_loss.update(loss.item())
+    # evaluate after each epoch
+    val_preds, val_targets = [], []
+    model.eval()
+    with torch.inference_mode():
+      for batch in val_loader:
+        bx, by = (tensor.to(device) for tensor in batch)
+        if eval_config.crop_duration is not None:
+          batch_size, num_crops, num_channels, channel_size = bx.size()
+          bx = bx.reshape(-1, num_channels, channel_size)
+        logits = model(bx)
+        if eval_config.crop_duration is not None:
+          logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
+          logits = logits.mean(dim=1)
+        val_preds.append(logits.argmax(dim=1).clone())
+        val_targets.append(by.clone())
+    model.train()
+    val_preds = torch.cat(val_preds).cpu().numpy()
+    val_targets = torch.cat(val_targets).cpu().numpy()
+    val_f1 = f1_score(y_true=val_targets, y_pred=val_preds, average='macro')
+    val_acc = accuracy_score(y_true=val_targets, y_pred=val_preds)
+    new_best = val_f1 > best_val_f1
+    if new_best:
+      best_val_f1 = val_f1
+      best_val_predictions = val_preds
+      saved_val_targets = val_targets
+      best_epoch = epoch
+      best_chkpt = copy.deepcopy(original_model.state_dict())
+    if is_main_process:
+      logger.info(f'[epoch {epoch + 1:04d}] '
+                  f'{"(*)" if new_best else "   "} '
+                  f'step_time {step_time.value:.4f} '
+                  f'train_loss {train_loss.value:.4f} '
+                  f'val_f1 {val_f1:.4f} '
+                  f'val_acc {val_acc:.4f}')
+    step_time = AverageMeter()
+    train_loss = AverageMeter()
+    if epoch - best_epoch >= eval_config.early_stopping_patience:
       if is_main_process:
-        logger.info(f'[{step + 1:06d}] '
-                    f'{"(*)" if new_best else "   "} '
-                    f'step_time {step_time.value:.4f} '
-                    f'train_loss {train_loss.value:.4f} '
-                    f'val_f1 {val_f1:.4f} '
-                    f'val_acc {val_acc:.4f}')
-      step_time = AverageMeter()
-      train_loss = AverageMeter()
-      if step - best_step >= eval_config.early_stopping_patience:
-        if is_main_process:
-          logging.info('stopping training early because validation F1 does not improve')
-        break
+        logging.info('stopping training early because validation F1 does not improve')
+      break
 
   if is_main_process:
     torch.save({
