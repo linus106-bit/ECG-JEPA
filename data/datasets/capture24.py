@@ -19,17 +19,23 @@ class Capture24:
     """
     from datasets import load_from_disk
 
+    from tqdm import tqdm
+
     dataset = load_from_disk(data_dir)
     all_data, all_labels, all_splits = [], [], []
     for split_name in ('train', 'test'):
       ds = dataset[split_name]
-      x = np.array(ds['data'], dtype=np.float16)  # (N, 1, C, T)
-      x = x.squeeze(1)          # (N, C, T)
-      x = x.transpose(0, 2, 1)  # (N, T, C) channels last
-      y = np.array(ds['label'], dtype=np.int64)
-      all_data.append(x)
-      all_labels.append(y)
-      all_splits.extend([split_name] * len(x))
+      split_data = []
+      split_labels = []
+      for sample in tqdm(ds, desc=split_name):
+        x = np.array(sample['data'], dtype=np.float16)  # (1, C, T)
+        x = x.squeeze(0)          # (C, T)
+        x = x.T                   # (T, C) channels last
+        split_data.append(x)
+        split_labels.append(sample['label'])
+      all_data.append(np.stack(split_data))
+      all_labels.append(np.array(split_labels, dtype=np.int64))
+      all_splits.extend([split_name] * len(split_data))
     return np.concatenate(all_data), np.concatenate(all_labels), np.array(all_splits)
 
   @staticmethod
