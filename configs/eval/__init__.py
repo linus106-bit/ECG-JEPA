@@ -16,13 +16,14 @@ class Config:
   dropout: float
   frozen: bool
   # training
-  steps: int
-  batch_size: int
-  learning_rate: float
-  final_learning_rate: float
-  learning_rate_warmup_steps: int
-  weight_decay: float
-  opt_betas: tuple[float, float]
-  gradient_clip: float
-  checkpoint_interval: int
-  early_stopping_patience: int
+  steps: int = 0
+  epochs: int = 0
+  batch_size: int = 256
+  learning_rate: float = 1e-3
+  final_learning_rate: float = 1e-5
+  learning_rate_warmup_steps: int = 0
+  weight_decay: float = 0.
+  opt_betas: tuple[float, float] = (0.9, 0.999)
+  gradient_clip: float = 0.
+  checkpoint_interval: int = 0
+  early_stopping_patience: int = 0
