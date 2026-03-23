@@ -6,13 +6,14 @@ Usage:
 The script expects a HuggingFace dataset directory with train/test splits.
 Each sample has shape (3, 1000) at 100Hz and an integer label (0-9).
 
-Output files:
-  capture24_train.npy         (N_train, 1000, 3) - channels last
-  capture24_train_labels.npy  (N_train,) int
-  capture24_val.npy           (N_val, 1000, 3)
-  capture24_val_labels.npy    (N_val,) int
-  capture24_test.npy          (N_test, 1000, 3)
-  capture24_test_labels.npy   (N_test,) int
+Output files (in --out directory):
+  train.npy         (N_train, 1000, 3) - channels last
+  train_labels.npy  (N_train,) int
+  val.npy           (N_val, 1000, 3)
+  val_labels.npy    (N_val,) int
+  test.npy          (N_test, 1000, 3)
+  test_labels.npy   (N_test,) int
+  pretrain.npy      (N_train+N_val, 1000, 3) - for JEPA pretraining
 """
 
 import argparse
@@ -72,11 +73,14 @@ print(f'Update data/datasets/capture24.py with these values.')
 # save
 print(f'Train: {train_data.shape}, Val: {val_data.shape}, Test: {test_data.shape}')
 
-np.save(path.join(args.out, 'capture24_train.npy'), train_data.astype(np.float16))
-np.save(path.join(args.out, 'capture24_train_labels.npy'), train_labels)
-np.save(path.join(args.out, 'capture24_val.npy'), val_data.astype(np.float16))
-np.save(path.join(args.out, 'capture24_val_labels.npy'), val_labels)
-np.save(path.join(args.out, 'capture24_test.npy'), test_data.astype(np.float16))
-np.save(path.join(args.out, 'capture24_test_labels.npy'), test_labels)
+np.save(path.join(args.out, 'train.npy'), train_data.astype(np.float16))
+np.save(path.join(args.out, 'train_labels.npy'), train_labels)
+np.save(path.join(args.out, 'val.npy'), val_data.astype(np.float16))
+np.save(path.join(args.out, 'val_labels.npy'), val_labels)
+np.save(path.join(args.out, 'test.npy'), test_data.astype(np.float16))
+np.save(path.join(args.out, 'test_labels.npy'), test_labels)
+# also save full training data (train+val) for pretraining
+np.save(path.join(args.out, 'pretrain.npy'),
+        np.concatenate([train_data, val_data]).astype(np.float16))
 
 print('Done.')

@@ -26,15 +26,11 @@ from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
 from utils.schedules import update_learning_rate_, cosine_schedule
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--data-dir', default=None, help='path to Capture-24 data directory (overrides dataset.data_dir in config)')
 parser.add_argument('--encoder', required=True, help='path to checkpoint or config file')
 parser.add_argument('--out', default='eval_har', help='output directory')
 parser.add_argument('--config', default='har_linear', help='path to config file or config name')
-parser.add_argument('--train-data', required=True, help='path to train data .npy')
-parser.add_argument('--train-labels', required=True, help='path to train labels .npy')
-parser.add_argument('--val-data', required=True, help='path to validation data .npy')
-parser.add_argument('--val-labels', required=True, help='path to validation labels .npy')
-parser.add_argument('--test-data', required=True, help='path to test data .npy')
-parser.add_argument('--test-labels', required=True, help='path to test labels .npy')
+parser.add_argument('--dump', help='path to pretrain dump file (.npy) for pretraining data (overrides dataset.dump in config)')
 parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
 args = parser.parse_args()
 
@@ -89,10 +85,15 @@ def main():
     args.config = config_file
 
   eval_config_dict = configs.load_config_file(args.config)
-  eval_config_dict.pop('dataset', None)
+  dataset_cfg = eval_config_dict.pop('dataset', None) or {}
   if is_main_process:
     logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
+
+  # resolve data_dir from CLI args or config yaml
+  data_dir = args.data_dir or dataset_cfg.get('data_dir')
+  if not data_dir:
+    raise ValueError('data_dir must be specified via --data-dir or dataset.data_dir in the eval config yaml')
 
   # load encoder checkpoint or config
   _, ext = path.splitext(args.encoder)
@@ -116,14 +117,15 @@ def main():
                           if k.startswith('target_encoder.')}
 
   # load data  (shape: N, channel_size, num_channels) -- channels last
+  # expects: {data_dir}/train.npy, train_labels.npy, val.npy, val_labels.npy, test.npy, test_labels.npy
   if is_main_process:
-    logger.debug('loading data')
-  x_train = np.load(args.train_data)
-  y_train = np.load(args.train_labels)
-  x_val = np.load(args.val_data)
-  y_val = np.load(args.val_labels)
-  x_test = np.load(args.test_data)
-  y_test = np.load(args.test_labels)
+    logger.debug(f'loading data from {data_dir}')
+  x_train = np.load(path.join(data_dir, 'train.npy'))
+  y_train = np.load(path.join(data_dir, 'train_labels.npy'))
+  x_val = np.load(path.join(data_dir, 'val.npy'))
+  y_val = np.load(path.join(data_dir, 'val_labels.npy'))
+  x_test = np.load(path.join(data_dir, 'test.npy'))
+  y_test = np.load(path.join(data_dir, 'test_labels.npy'))
 
   num_classes = int(max(y_train.max(), y_val.max(), y_test.max()) + 1)
   if is_main_process:
