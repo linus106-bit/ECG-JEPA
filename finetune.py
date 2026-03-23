@@ -231,16 +231,6 @@ def main():
     drop_last=(train_sampler is None),
     num_workers=num_workers)
 
-  def cycle(dataloader):
-    epoch = 0
-    while True:
-      if is_distributed:
-        train_sampler.set_epoch(epoch)
-      yield from dataloader
-      epoch += 1
-
-  train_iterator = cycle(train_loader)
-
   # val/test loaders: each rank evaluates independently on the full dataset
   val_loader = DataLoader(
     dataset=TensorDataset(
@@ -261,9 +251,12 @@ def main():
     batch_size=eval_config.batch_size,
     num_workers=num_workers)
 
+  steps_per_epoch = len(train_loader) if eval_config.epochs > 0 else None
+  total_steps = eval_config.epochs * steps_per_epoch if eval_config.epochs > 0 else eval_config.steps
+
   # setup hyperparameter schedules
   lr_schedule = cosine_schedule(
-    total_steps=eval_config.steps,
+    total_steps=total_steps,
     start_value=eval_config.learning_rate,
     final_value=eval_config.final_learning_rate,
     warmup_steps=eval_config.learning_rate_warmup_steps,
@@ -294,74 +287,112 @@ def main():
   train_loss = AverageMeter()
   best_val_auc = float('-inf')
   best_val_predictions, val_targets = None, None
-  best_step, best_chkpt = None, None
+  best_epoch_or_step, best_chkpt = None, None
 
-  for step in range(eval_config.steps):
-    step_start = time()
-    # update hyperparameters according to schedule
-    update_learning_rate_(optimizer, next(lr_schedule))
-    # forward pass
-    x, y = (tensor.to(device) for tensor in next(train_iterator))
-    with auto_mixed_precision:
-      logits = model(x)
-      if single_label:
-        loss = F.cross_entropy(logits, y)
-      else:
-        loss = F.binary_cross_entropy_with_logits(logits, y)
-    # backward pass
-    loss.backward()
-    if eval_config.gradient_clip > 0:
-      torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-    # finalize train step
-    step_end = time()
-    step_time.update(step_end - step_start)
-    train_loss.update(loss.item())
-    # evaluation (all ranks evaluate independently; only rank 0 tracks best/saves)
-    if (step + 1) % eval_config.checkpoint_interval == 0:
-      val_logits, val_targets = [], []
-      model.eval()
-      with torch.inference_mode():
-        for batch in val_loader:
-          bx, by = (tensor.to(device) for tensor in batch)
-          if eval_config.crop_duration is not None:
-            batch_size, num_crops, num_channels, channel_size = bx.size()
-            bx = bx.reshape(-1, num_channels, channel_size)
-          logits = model(bx)
-          if eval_config.crop_duration is not None:
-            logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
-            logits = logits.mean(dim=1)  # aggregate crop predictions
-          val_logits.append(logits.clone())
-          val_targets.append(by.clone())
-      model.train()
-      if single_label:
-        val_predictions = torch.cat(val_logits).softmax(dim=1).cpu().numpy()
-      else:
-        val_predictions = torch.cat(val_logits).sigmoid().cpu().numpy()
-      val_targets = torch.cat(val_targets).cpu().numpy()
-      val_auc = roc_auc_score(
-        y_true=val_targets,
-        y_score=val_predictions,
-        average='macro')
-      new_best_val_auc = val_auc > best_val_auc
-      if new_best_val_auc:
+  def _eval_val():
+    val_logits, val_targets = [], []
+    model.eval()
+    with torch.inference_mode():
+      for batch in val_loader:
+        bx, by = (tensor.to(device) for tensor in batch)
+        if eval_config.crop_duration is not None:
+          batch_size, num_crops, num_channels, channel_size = bx.size()
+          bx = bx.reshape(-1, num_channels, channel_size)
+        logits = model(bx)
+        if eval_config.crop_duration is not None:
+          logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
+          logits = logits.mean(dim=1)
+        val_logits.append(logits.clone())
+        val_targets.append(by.clone())
+    model.train()
+    if single_label:
+      val_predictions = torch.cat(val_logits).softmax(dim=1).cpu().numpy()
+    else:
+      val_predictions = torch.cat(val_logits).sigmoid().cpu().numpy()
+    return val_predictions, torch.cat(val_targets).cpu().numpy()
+
+  if eval_config.epochs > 0:
+    for epoch in range(eval_config.epochs):
+      if is_distributed:
+        train_sampler.set_epoch(epoch)
+      for x, y in train_loader:
+        step_start = time()
+        update_learning_rate_(optimizer, next(lr_schedule))
+        x, y = x.to(device), y.to(device)
+        with auto_mixed_precision:
+          logits = model(x)
+          loss = F.cross_entropy(logits, y) if single_label else F.binary_cross_entropy_with_logits(logits, y)
+        loss.backward()
+        if eval_config.gradient_clip > 0:
+          torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        step_time.update(time() - step_start)
+        train_loss.update(loss.item())
+      val_predictions, val_targets = _eval_val()
+      val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
+      new_best = val_auc > best_val_auc
+      if new_best:
         best_val_auc = val_auc
         best_val_predictions = val_predictions
-        best_step = step
+        best_epoch_or_step = epoch
         best_chkpt = copy.deepcopy(original_model.state_dict())
       if is_main_process:
-        logger.info(f'[{step + 1:06d}] '
-                    f'{"(*)" if new_best_val_auc else "   "} '
+        logger.info(f'[epoch {epoch + 1:04d}] '
+                    f'{"(*)" if new_best else "   "} '
                     f'step_time {step_time.value:.4f} '
                     f'train_loss {train_loss.value:.4f} '
                     f'val_auc {val_auc:.4f}')
       step_time = AverageMeter()
       train_loss = AverageMeter()
-      if step - best_step >= eval_config.early_stopping_patience:
+      if epoch - best_epoch_or_step >= eval_config.early_stopping_patience:
         if is_main_process:
           logging.info('stopping training early because validation AUC does not improve')
         break
+  else:
+    def _cycle(dataloader):
+      epoch = 0
+      while True:
+        if is_distributed:
+          train_sampler.set_epoch(epoch)
+        yield from dataloader
+        epoch += 1
+    train_iterator = _cycle(train_loader)
+    for step in range(eval_config.steps):
+      step_start = time()
+      update_learning_rate_(optimizer, next(lr_schedule))
+      x, y = (tensor.to(device) for tensor in next(train_iterator))
+      with auto_mixed_precision:
+        logits = model(x)
+        loss = F.cross_entropy(logits, y) if single_label else F.binary_cross_entropy_with_logits(logits, y)
+      loss.backward()
+      if eval_config.gradient_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
+      optimizer.step()
+      optimizer.zero_grad(set_to_none=True)
+      step_time.update(time() - step_start)
+      train_loss.update(loss.item())
+      if (step + 1) % eval_config.checkpoint_interval == 0:
+        val_predictions, val_targets = _eval_val()
+        val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
+        new_best = val_auc > best_val_auc
+        if new_best:
+          best_val_auc = val_auc
+          best_val_predictions = val_predictions
+          best_epoch_or_step = step
+          best_chkpt = copy.deepcopy(original_model.state_dict())
+        if is_main_process:
+          logger.info(f'[{step + 1:06d}] '
+                      f'{"(*)" if new_best else "   "} '
+                      f'step_time {step_time.value:.4f} '
+                      f'train_loss {train_loss.value:.4f} '
+                      f'val_auc {val_auc:.4f}')
+        step_time = AverageMeter()
+        train_loss = AverageMeter()
+        if step - best_epoch_or_step >= eval_config.early_stopping_patience:
+          if is_main_process:
+            logging.info('stopping training early because validation AUC does not improve')
+          break
 
   if is_main_process:
     torch.save({

@@ -14,7 +14,7 @@ bias: False
 dropout: 0.1
 frozen: False
 # training
-steps: 5000
+epochs: 40
 batch_size: 128
 learning_rate: 1.0e-4
 final_learning_rate: 1.0e-6
@@ -22,5 +22,4 @@ learning_rate_warmup_steps: 200
 weight_decay: 0.
 opt_betas: [0.9, 0.999]
 gradient_clip: 1.0
-checkpoint_interval: 100
-early_stopping_patience: 2000
+early_stopping_patience: 15
