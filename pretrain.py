@@ -240,7 +240,7 @@ def main():
     total_steps=total_steps,
     start_value=config.learning_rate,
     final_value=config.final_learning_rate,
-    warmup_steps=config.learning_rate_warmup_steps,
+    warmup_steps=int(total_steps * config.learning_rate_warmup_ratio),
     warmup_start_value=1e-6,
     step=start_step)
   wd_schedule = cosine_schedule(

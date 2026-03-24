@@ -1,15 +1,16 @@
-# learnable encoder parameters: 14,277,888
+# ViT-Small for Capture-24 accelerometer HAR pretraining
+# learnable encoder parameters: ~14M (same architecture as ViTS_ptbxl)
 # data
-sampling_frequency: 500
-channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
-channel_size: 5000
-patch_size: 25
-min_block_size: 10
+sampling_frequency: 100
+channels: [x, y, z]
+channel_size: 1000
+patch_size: 20
+min_block_size: 5
 min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
-  mimic-iv-ecg:
-    path: /path/to/mimic-iv-ecg.npy
+  capture-24:
+    path: /path/to/capture-24.npy
     weight: 1.
 # model architecture
 dim: 384
@@ -27,17 +28,17 @@ bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
 # training
-epochs: 200
+epochs: 300
 batch_size: 2048
 encoder_momentum: 0.998
 final_encoder_momentum: 0.9995
 learning_rate: 1.0e-3
 final_learning_rate: 1.0e-6
-learning_rate_warmup_steps: 10_000
+learning_rate_warmup_ratio: 0.05
 weight_decay: 1.0e-2
 final_weight_decay: 1.0e-1
 opt_betas: [0.9, 0.99]
 opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
-checkpoint_interval: 20
+checkpoint_interval: 30

@@ -1,4 +1,4 @@
-# learnable encoder parameters: 14,277,888
+# learnable encoder parameters: 3,600,000
 # data
 sampling_frequency: 500
 channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
@@ -10,41 +10,14 @@ max_keep_ratio: 0.25
 datasets:
   mimic-iv-ecg:
     path: /path/to/mimic-iv-ecg.npy
-    weight: 0.7
-  code-15:
-    path: /path/to/code-15.npy
-    weight: 0.1
-  ptb-xl:
-    path: /path/to/ptb-xl.npy
-    weight: 0.05
-  ptb:
-    path: /path/to/ptb.npz
-    weight: 0.01875
-  cpsc:
-    path: /path/to/cpsc.npy
-    weight: 0.025
-  cpsc-extra:
-    path: /path/to/cpsc-extra.npy
-    weight: 0.0125
-  georgia:
-    path: /path/to/georgia.npy
-    weight: 0.0375
-  ningbo:
-    path: /path/to/ningbo.npy
-    weight: 0.028125
-  chapman-shaoxing:
-    path: /path/to/chapman-shaoxing.npy
-    weight: 0.009375
-  st-petersburg:
-    path: /path/to/st-petersburg.npy
-    weight: 0.01875
+    weight: 1.
 # model architecture
-dim: 384
+dim: 192
 depth: 8
-num_heads: 6
-pred_dim: 192
+num_heads: 4
+pred_dim: 96
 pred_depth: 8
-pred_num_heads: 6
+pred_num_heads: 4
 mlp_ratio: 4.
 qkv_bias: False
 dropout: 0.
@@ -60,7 +33,7 @@ encoder_momentum: 0.998
 final_encoder_momentum: 0.9995
 learning_rate: 1.0e-3
 final_learning_rate: 1.0e-6
-learning_rate_warmup_steps: 10_000
+learning_rate_warmup_ratio: 0.05
 weight_decay: 1.0e-2
 final_weight_decay: 1.0e-1
 opt_betas: [0.9, 0.99]
