@@ -19,3 +19,4 @@ weight_decay: 1.0e-1
 opt_betas: [0.9, 0.999]
 gradient_clip: 1.
 early_stopping_patience: 10
+checkpoint_interval: 500
