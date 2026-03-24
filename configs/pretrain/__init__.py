@@ -35,7 +35,7 @@ class Config:
   final_encoder_momentum: float
   learning_rate: float
   final_learning_rate: float
-  learning_rate_warmup_steps: int
+  learning_rate_warmup_ratio: float
   weight_decay: float
   final_weight_decay: float
   opt_betas: tuple[float, float]
