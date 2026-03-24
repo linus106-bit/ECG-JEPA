@@ -97,5 +97,7 @@ CMD=(
 [[ -n "${DATA_DIR}" ]] && CMD+=(--data-dir "${DATA_DIR}")
 [[ -n "${DUMP}" ]] && CMD+=(--dump "${DUMP}")
 
+LOG_FILE="${OUT_DIR}/train.log"
 echo "Command: ${CMD[*]}"
-"${CMD[@]}"
+echo "Logging to: ${LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
