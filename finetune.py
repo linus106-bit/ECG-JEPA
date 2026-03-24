@@ -371,7 +371,6 @@ def main():
   best_val_predictions, saved_val_targets = None, None
   best_epoch_or_step = None
   best_chkpt = None
-  prev_chkpt_path = None
   global_step = 0
 
   def _compute_loss(logits, y):
@@ -459,9 +458,6 @@ def main():
             'eval_config': dataclasses.asdict(eval_config),
             'step': global_step,
           }, new_chkpt_path)
-          if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
-            os.remove(prev_chkpt_path)
-          prev_chkpt_path = new_chkpt_path
       val_predictions, val_targets, val_metric, val_acc = _eval_val()
       new_best = val_metric > best_val_metric
       if new_best:
@@ -518,9 +514,6 @@ def main():
             'eval_config': dataclasses.asdict(eval_config),
             'step': step + 1,
           }, new_chkpt_path)
-          if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
-            os.remove(prev_chkpt_path)
-          prev_chkpt_path = new_chkpt_path
         val_predictions, val_targets, val_metric, val_acc = _eval_val()
         new_best = val_metric > best_val_metric
         if new_best:
