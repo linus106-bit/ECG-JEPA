@@ -93,14 +93,16 @@ def main():
     logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
 
-  # resolve data_dir and dump_file from CLI args or config yaml
+  # resolve data_dir and dump files from CLI args or config yaml
   data_dir = args.data_dir or dataset_cfg.get('data_dir')
   if not data_dir:
     raise ValueError('data_dir must be specified via --data-dir or dataset.data_dir in the eval config yaml')
-  dump_file = args.dump or dataset_cfg.get('dump') or f'{data_dir}.npy'
-  if not path.isfile(dump_file):
-    raise ValueError(f'Failed to find .npy data file. Attempted location: {dump_file}. '
-                     f'Use --dump or dataset.dump in the eval config yaml to specify location.')
+  train_dump = args.dump or dataset_cfg.get('dump') or f'{data_dir}_train.npy'
+  test_dump = f'{data_dir}_test.npy'
+  for f in (train_dump, test_dump):
+    if not path.isfile(f):
+      raise ValueError(f'Failed to find .npy data file: {f}. '
+                       f'Run scripts/dump_data.py to generate split files.')
 
   # load encoder checkpoint or config
   _, ext = path.splitext(args.encoder)
@@ -123,46 +125,50 @@ def main():
                           for k, v in chkpt['model'].items()
                           if k.startswith('target_encoder.')}
 
-  # load labels and split info (saved by dump_data.py)
+  # load per-split labels (saved by dump_data.py)
   if is_main_process:
     logger.debug(f'loading labels from {data_dir}')
-  labels, splits = Capture24.load_labels(data_dir)
+  train_labels, test_labels = Capture24.load_labels(data_dir)
 
-  # load data  (shape: N, channel_size, num_channels) -- channels last
+  # load train/test data separately (shape: N, channel_size, num_channels) -- channels last
   if is_main_process:
-    logger.debug(f'loading data from {dump_file}')
-  x = np.load(dump_file)
-
-  train_mask = splits == 'train'
-  test_mask = splits == 'test'
+    logger.debug(f'loading train data from {train_dump}')
+  x_train_all = np.load(train_dump)
+  if is_main_process:
+    logger.debug(f'loading test data from {test_dump}')
+  x_test = np.load(test_dump)
 
   # split train into train/val with a fixed random seed
   rng = np.random.RandomState(VAL_SEED)
-  train_indices = np.where(train_mask)[0]
-  rng.shuffle(train_indices)
-  num_val = int(len(train_indices) * VAL_RATIO)
-  val_indices = train_indices[:num_val]
-  train_indices = train_indices[num_val:]
+  n_train_all = len(x_train_all)
+  indices = np.arange(n_train_all)
+  rng.shuffle(indices)
+  num_val = int(n_train_all * VAL_RATIO)
+  val_indices = indices[:num_val]
+  train_indices = indices[num_val:]
 
-  num_classes = int(labels.max() + 1)
+  num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
   if is_main_process:
     logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
-                 f'test={test_mask.sum()}, num_classes={num_classes}')
+                 f'test={len(x_test)}, num_classes={num_classes}')
 
   # normalize using training statistics
-  mean = np.mean(x[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-  std = np.std(x[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-  transforms.normalize_(x, mean_std=(mean, std))
-  x.clip(-5, 5, out=x)
+  mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+  std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+  transforms.normalize_(x_train_all, mean_std=(mean, std))
+  x_train_all.clip(-5, 5, out=x_train_all)
+  transforms.normalize_(x_test, mean_std=(mean, std))
+  x_test.clip(-5, 5, out=x_test)
 
   # ensure matching channels
   channel_order = get_channel_order(Capture24.channels, encoder_config.channels)
-  x = x[:, :, channel_order]
+  x_train_all = x_train_all[:, :, channel_order]
+  x_test = x_test[:, :, channel_order]
 
-  y = torch.from_numpy(labels).long()
-  x_train, y_train = x[train_indices], y[train_indices]
-  x_val, y_val = x[val_indices], y[val_indices]
-  x_test, y_test = x[test_mask], y[test_mask]
+  y_train_all = torch.from_numpy(train_labels).long()
+  y_test = torch.from_numpy(test_labels).long()
+  x_train, y_train = x_train_all[train_indices], y_train_all[train_indices]
+  x_val, y_val = x_train_all[val_indices], y_train_all[val_indices]
 
   if is_main_process:
     logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')

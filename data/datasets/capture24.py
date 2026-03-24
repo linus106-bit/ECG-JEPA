@@ -38,11 +38,12 @@ class Capture24:
 
   @staticmethod
   def load_labels(data_dir):
-    """Load labels and split info saved by dump_data.py.
+    """Load per-split labels saved by dump_data.py.
 
     Returns:
-      labels: np.ndarray of shape (N,), dtype int64
-      splits: np.ndarray of shape (N,), 'train' or 'test'
+      train_labels: np.ndarray of shape (N_train,), dtype int64
+      test_labels:  np.ndarray of shape (N_test,),  dtype int64
     """
-    archive = np.load(f'{data_dir}_labels.npz')
-    return archive['labels'], archive['splits']
+    train_archive = np.load(f'{data_dir}_train_labels.npz')
+    test_archive = np.load(f'{data_dir}_test_labels.npz')
+    return train_archive['labels'], test_archive['labels']
