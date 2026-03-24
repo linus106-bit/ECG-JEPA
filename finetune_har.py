@@ -277,7 +277,6 @@ def main():
   best_val_predictions, saved_val_targets = None, None
   best_epoch = None
   best_chkpt = None
-  prev_chkpt_path = None
   global_step = 0
 
   for epoch in range(eval_config.epochs):
@@ -315,9 +314,6 @@ def main():
           'eval_config': dataclasses.asdict(eval_config),
           'step': global_step,
         }, new_chkpt_path)
-        if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
-          os.remove(prev_chkpt_path)
-        prev_chkpt_path = new_chkpt_path
     val_preds, val_targets = [], []
     model.eval()
     with torch.inference_mode():

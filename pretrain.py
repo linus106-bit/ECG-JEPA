@@ -295,7 +295,6 @@ def main():
     step_time.update(time() - step_start)
 
   global_step = start_step
-  prev_chkpt_path = None
   if config.epochs > 0:
     for epoch in range(start_epoch, config.epochs):
       train_iterator = iter(train_loader)
@@ -321,9 +320,6 @@ def main():
             'epoch': epoch + 1,
             'step': global_step,
           }, new_chkpt_path)
-          if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
-            os.remove(prev_chkpt_path)
-          prev_chkpt_path = new_chkpt_path
   else:
     train_iterator = iter(train_loader)
     train_iterator = map_to_device(train_iterator, device=device)
@@ -346,9 +342,6 @@ def main():
           'config': dataclasses.asdict(config),
           'step': step + 1,
         }, new_chkpt_path)
-        if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
-          os.remove(prev_chkpt_path)
-        prev_chkpt_path = new_chkpt_path
 
   if is_distributed:
     dist.destroy_process_group()
