@@ -274,7 +274,6 @@ def main():
   for epoch in range(eval_config.epochs):
     if is_distributed:
       train_sampler.set_epoch(epoch)
-    # train
     for x, y in train_loader:
       step_start = time()
       update_learning_rate_(optimizer, next(lr_schedule))
@@ -289,7 +288,6 @@ def main():
       optimizer.zero_grad(set_to_none=True)
       step_time.update(time() - step_start)
       train_loss.update(loss.item())
-    # evaluate after each epoch
     val_preds, val_targets = [], []
     model.eval()
     with torch.inference_mode():

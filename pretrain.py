@@ -218,33 +218,36 @@ def main():
 
   # if device is CUDA, batch data will be asynchronously transferred to the GPU,
   #  so we should perform as many CPU operations as possible between loading and using a batch
-  train_iterator = iter(train_loader)
-  train_iterator = map_to_device(train_iterator, device=device)
-  train_iterator = prefetch_batch(train_iterator)
+  # compute total training steps
+  total_dataset_size = sum(len(d) for d, _ in datasets.values())
+  if config.epochs > 0:
+    steps_per_epoch = max(1, total_dataset_size // (config.batch_size * config.gradient_accumulation_steps))
+    total_steps = config.epochs * steps_per_epoch
+    start_epoch = chkpt.get('epoch', 0) if chkpt is not None else 0
+    start_step = start_epoch * steps_per_epoch
+  else:
+    steps_per_epoch = None
+    total_steps = config.steps
+    start_step = chkpt['step'] if chkpt is not None else 0
 
   # setup hyperparameter schedules
-  if chkpt is not None:
-    step = chkpt['step']
-  else:
-    step = 0
-
   momentum_schedule = linear_schedule(
-    total_steps=config.steps,
+    total_steps=total_steps,
     start_value=config.encoder_momentum,
     final_value=config.final_encoder_momentum,
-    step=step)
+    step=start_step)
   lr_schedule = cosine_schedule(
-    total_steps=config.steps,
+    total_steps=total_steps,
     start_value=config.learning_rate,
     final_value=config.final_learning_rate,
     warmup_steps=config.learning_rate_warmup_steps,
     warmup_start_value=1e-6,
-    step=step)
+    step=start_step)
   wd_schedule = cosine_schedule(
-    total_steps=config.steps,
+    total_steps=total_steps,
     start_value=config.weight_decay,
     final_value=config.final_weight_decay,
-    step=step)
+    step=start_step)
 
   # setup model
   original_model = JEPA(
@@ -270,16 +273,13 @@ def main():
   step_time = AverageMeter()
   train_loss = AverageMeter()
 
-  for step in range(config.steps):
+  def _train_step(train_iterator):
     step_start = time()
-    # update hyperparameters according to schedule
     update_learning_rate_(optimizer, next(lr_schedule))
     update_weight_decay_(optimizer, next(wd_schedule))
-    # forward and backward pass
     batch_loss = 0.
     for i in range(config.gradient_accumulation_steps):
       x, mask_encoder, mask_predictor = next(train_iterator)
-      # delay gradient sync until the last accumulation step
       sync_ctx = (nullcontext() if not is_distributed or i == config.gradient_accumulation_steps - 1
                   else model.no_sync())
       with sync_ctx, auto_mixed_precision:
@@ -287,28 +287,52 @@ def main():
         loss = loss / config.gradient_accumulation_steps
       loss.backward()
       batch_loss += loss.item()
-    # update weights
     if config.gradient_clip > 0:
       torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
     optimizer.step()
     train_loss.update(batch_loss)
     optimizer.zero_grad(set_to_none=True)
-    # finalize train step
-    step_end = time()
-    step_time.update(step_end - step_start)
-    if is_main_process and (step + 1) % 100 == 0:
-      logger.info(f'[{step + 1:06d}] '
-                  f'step_time {step_time.value:.4f} '
-                  f'train_loss {train_loss.value:.4f}')
-      step_time = AverageMeter()
-      train_loss = AverageMeter()
-    if is_main_process and (step + 1) % config.checkpoint_interval == 0:
-      torch.save({
-        'model': original_model.state_dict(),
-        'optimizer': optimizer.state_dict(),
-        'config': dataclasses.asdict(config),
-        'step': step + 1,
-      }, path.join(args.out, f'chkpt_{step + 1}.pt'))
+    step_time.update(time() - step_start)
+
+  if config.epochs > 0:
+    for epoch in range(start_epoch, config.epochs):
+      train_iterator = iter(train_loader)
+      train_iterator = map_to_device(train_iterator, device=device)
+      train_iterator = prefetch_batch(train_iterator)
+      for _ in range(steps_per_epoch):
+        _train_step(train_iterator)
+      if is_main_process:
+        logger.info(f'[epoch {epoch + 1:04d}] '
+                    f'step_time {step_time.value:.4f} '
+                    f'train_loss {train_loss.value:.4f}')
+        step_time = AverageMeter()
+        train_loss = AverageMeter()
+      if is_main_process and (epoch + 1) % config.checkpoint_interval == 0:
+        torch.save({
+          'model': original_model.state_dict(),
+          'optimizer': optimizer.state_dict(),
+          'config': dataclasses.asdict(config),
+          'epoch': epoch + 1,
+        }, path.join(args.out, f'chkpt_{epoch + 1}.pt'))
+  else:
+    train_iterator = iter(train_loader)
+    train_iterator = map_to_device(train_iterator, device=device)
+    train_iterator = prefetch_batch(train_iterator)
+    for step in range(config.steps):
+      _train_step(train_iterator)
+      if is_main_process and (step + 1) % 100 == 0:
+        logger.info(f'[{step + 1:06d}] '
+                    f'step_time {step_time.value:.4f} '
+                    f'train_loss {train_loss.value:.4f}')
+        step_time = AverageMeter()
+        train_loss = AverageMeter()
+      if is_main_process and (step + 1) % config.checkpoint_interval == 0:
+        torch.save({
+          'model': original_model.state_dict(),
+          'optimizer': optimizer.state_dict(),
+          'config': dataclasses.asdict(config),
+          'step': step + 1,
+        }, path.join(args.out, f'chkpt_{step + 1}.pt'))
 
   if is_distributed:
     dist.destroy_process_group()

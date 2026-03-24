@@ -28,7 +28,8 @@ class Config:
   norm_eps: float
   layer_scale_eps: float
   # training
-  steps: int
+  steps: int = 0
+  epochs: int = 0
   batch_size: int
   encoder_momentum: float
   final_encoder_momentum: float
