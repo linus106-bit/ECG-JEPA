@@ -1,6 +1,7 @@
 import argparse
 import copy
 import dataclasses
+import logging
 import logging.config
 import os
 import pprint
@@ -11,15 +12,15 @@ from time import time
 import numpy as np
 import torch
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 import configs
 from data import transforms, utils as datautils
-from data.datasets import PTB_XL
-from data.utils import TensorDataset
+from data.datasets import PTB_XL, Capture24
+from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
 from utils.schedules import update_learning_rate_, cosine_schedule
@@ -36,16 +37,22 @@ TASKS = (
 )
 FOLDS = tuple(range(1, 11))
 
+VAL_RATIO = 0.2
+VAL_SEED = 42
+
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir', default=None, help='path to PTB-XL data directory (overrides dataset.data_dir in config)')
+parser.add_argument('--data-dir', default=None, help='path to data directory (overrides dataset.data_dir in config)')
 parser.add_argument('--encoder', required=True, help='path to checkpoint or config file')
 parser.add_argument('--out', default='eval', help='output directory')
-parser.add_argument('--config', default='linear', help='path to config file or config name')
-parser.add_argument('--dump', help='path to dump file (.npy) with raw ECG signals (overrides dataset.dump in config)')
+parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ptbxl, har_linear for capture24)')
+parser.add_argument('--dump', help='path to dump file (.npy) with raw signals (overrides dataset.dump in config)')
 parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
-parser.add_argument('--task', choices=TASKS, default='all', help='task type')
-parser.add_argument('--val-fold', choices=FOLDS, type=int, default=9, help='validation fold')
-parser.add_argument('--test-fold', choices=FOLDS, type=int, default=10, help='test fold')
+parser.add_argument('--dataset', choices=['ptbxl', 'capture24'], default=None,
+                    help='dataset type (auto-detected from data_dir if not specified)')
+# PTB-XL specific args
+parser.add_argument('--task', choices=TASKS, default='all', help='task type (PTB-XL only)')
+parser.add_argument('--val-fold', choices=FOLDS, type=int, default=9, help='validation fold (PTB-XL only)')
+parser.add_argument('--test-fold', choices=FOLDS, type=int, default=10, help='test fold (PTB-XL only)')
 args = parser.parse_args()
 
 
@@ -93,29 +100,32 @@ def main():
   else:
     raise ValueError('Failed to choose floating-point format.')
 
-  if not path.isfile(args.config):
-    # maybe config is the name of a default config file in configs/pretrain/
-    config_file = path.join(path.dirname(configs.eval.__file__), f'{args.config}.yaml')
-    if not path.isfile(config_file):
-      raise ValueError(f'Failed to read configuration file {args.config}')
-    args.config = config_file
+  # Auto-detect dataset from data_dir if not explicitly specified
+  dataset = args.dataset
+  if dataset is None:
+    dataset = 'capture24' if 'capture24' in (args.data_dir or '').lower() else 'ptbxl'
+  is_capture24 = (dataset == 'capture24')
 
-  eval_config_dict = configs.load_config_file(args.config)
+  default_config = 'har_linear' if is_capture24 else 'linear'
+  config_name = args.config or default_config
+  if not path.isfile(config_name):
+    config_file = path.join(path.dirname(configs.eval.__file__), f'{config_name}.yaml')
+    if not path.isfile(config_file):
+      raise ValueError(f'Failed to read configuration file {config_name}')
+    config_name = config_file
+
+  eval_config_dict = configs.load_config_file(config_name)
   if is_main_process:
-    logger.debug(f'loading configuration file from {args.config}\n'
+    logger.debug(f'loading configuration file from {config_name}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
 
-  # resolve data_dir and dump_file from CLI args or config yaml
+  # resolve data_dir from CLI args or config yaml
   dataset_cfg = eval_config_dict.pop('dataset', None) or {}
   data_dir = args.data_dir or dataset_cfg.get('data_dir')
   if not data_dir:
     raise ValueError('data_dir must be specified via --data-dir or dataset.data_dir in the eval config yaml')
-  dump_file = args.dump or dataset_cfg.get('dump') or f'{data_dir}.npy'
-  if not path.isfile(dump_file):
-    raise ValueError(f'Failed to find .npy data file. Attempted location: {dump_file}. '
-                     f'Use --dump or dataset.dump in the eval config yaml to specify location.')
 
-  # load checkpoint
+  # load encoder checkpoint or config
   _, ext = path.splitext(args.encoder)
   if ext == '.yaml':
     if is_main_process:
@@ -136,55 +146,126 @@ def main():
                           for k, v in chkpt['model'].items()
                           if k.startswith('target_encoder.')}
 
-  ptb_xl_task = args.task
-  single_label = False
-  if args.task == 'ST-MEM':
-    ptb_xl_task = 'superdiagnostic'
+  # -------------------------------------------------------------------------
+  # Dataset loading (branched by dataset type)
+  # -------------------------------------------------------------------------
+  if is_capture24:
+    train_dump = args.dump or dataset_cfg.get('dump') or f'{data_dir}_train.npy'
+    test_dump = f'{data_dir}_test.npy'
+    for f in (train_dump, test_dump):
+      if not path.isfile(f):
+        raise ValueError(f'Failed to find .npy data file: {f}. '
+                         f'Run scripts/dump_data.py to generate split files.')
+
+    if is_main_process:
+      logger.debug(f'loading labels from {data_dir}')
+    train_labels, test_labels = Capture24.load_labels(data_dir)
+
+    if is_main_process:
+      logger.debug(f'loading train data from {train_dump}')
+    x_train_all = np.load(train_dump)
+    if is_main_process:
+      logger.debug(f'loading test data from {test_dump}')
+    x_test = np.load(test_dump)
+
+    # split train into train/val with a fixed random seed
+    rng = np.random.RandomState(VAL_SEED)
+    n_train_all = len(x_train_all)
+    indices = np.arange(n_train_all)
+    rng.shuffle(indices)
+    num_val = int(n_train_all * VAL_RATIO)
+    val_indices = indices[:num_val]
+    train_indices = indices[num_val:]
+
+    num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
+    if is_main_process:
+      logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
+                   f'test={len(x_test)}, num_classes={num_classes}')
+
+    # normalize using training statistics (apply to both splits)
+    mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+    std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+    transforms.normalize_(x_train_all, mean_std=(mean, std))
+    x_train_all.clip(-5, 5, out=x_train_all)
+    transforms.normalize_(x_test, mean_std=(mean, std))
+    x_test.clip(-5, 5, out=x_test)
+
+    # ensure matching channels
+    channel_order = get_channel_order(Capture24.channels, encoder_config.channels)
+    x_train_all = x_train_all[:, :, channel_order]
+    x_test = x_test[:, :, channel_order]
+
+    y_train_all = torch.from_numpy(train_labels).long()
+    y_test = torch.from_numpy(test_labels).long()
+    x_train = x_train_all[train_indices]
+    y_train = y_train_all[train_indices]
+    x_val = x_train_all[val_indices]
+    y_val = y_train_all[val_indices]
+
+    task_name = 'har'
     single_label = True
 
-  # load labels
-  if is_main_process:
-    logger.debug(f'setting up labels for task `{args.task}`')
-  labels_df = PTB_XL.load_raw_labels(data_dir)
-  labels_df = PTB_XL.compute_label_aggregations(labels_df, data_dir, ptb_xl_task)
+  else:  # PTB-XL
+    dump_file = args.dump or dataset_cfg.get('dump') or f'{data_dir}.npy'
+    if not path.isfile(dump_file):
+      raise ValueError(f'Failed to find .npy data file. Attempted location: {dump_file}. '
+                       f'Use --dump or dataset.dump in the eval config yaml to specify location.')
 
-  # load data
-  if is_main_process:
-    logger.debug(f'loading data from {dump_file}')
-  channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
+    ptb_xl_task = args.task
+    single_label = False
+    if args.task == 'ST-MEM':
+      ptb_xl_task = 'superdiagnostic'
+      single_label = True
 
-  x = datautils.load_data_dump(
-    dump_file=dump_file,
-    transform=PreprocessECG(
-      channel_size=channel_size,
-      remove_baseline_wander=False),
-    processes=num_cpus)
+    if is_main_process:
+      logger.debug(f'setting up labels for task `{args.task}`')
+    labels_df = PTB_XL.load_raw_labels(data_dir)
+    labels_df = PTB_XL.compute_label_aggregations(labels_df, data_dir, ptb_xl_task)
 
-  x, labels_df, y, _ = PTB_XL.select_data(x, labels_df, ptb_xl_task, min_samples=0)
-  if single_label:
-    single_label_mask = y.sum(axis=1) == 1
-    x, labels_df, y = x[single_label_mask], labels_df[single_label_mask], y[single_label_mask]
-  y = torch.from_numpy(y).float()
-  num_classes = y.shape[1]
+    if is_main_process:
+      logger.debug(f'loading data from {dump_file}')
+    channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
 
-  val_mask = (labels_df.strat_fold == args.val_fold).to_numpy()
-  test_mask = (labels_df.strat_fold == args.test_fold).to_numpy()
-  train_mask = ~(val_mask | test_mask)
+    x = datautils.load_data_dump(
+      dump_file=dump_file,
+      transform=PreprocessECG(
+        channel_size=channel_size,
+        remove_baseline_wander=False),
+      processes=num_cpus)
 
-  # normalize data
-  mean = np.mean(x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
-  std = np.std(x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
-  transforms.normalize_(x, mean_std=(mean, std))
-  x.clip(-5, 5, out=x)
+    x, labels_df, y, _ = PTB_XL.select_data(x, labels_df, ptb_xl_task, min_samples=0)
+    if single_label:
+      single_label_mask = y.sum(axis=1) == 1
+      x, labels_df, y = x[single_label_mask], labels_df[single_label_mask], y[single_label_mask]
+    y = torch.from_numpy(y).float()
+    num_classes = y.shape[1]
 
-  # ensure matching channels
-  channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
-  x = x[:, :, channel_order]
+    val_mask = (labels_df.strat_fold == args.val_fold).to_numpy()
+    test_mask = (labels_df.strat_fold == args.test_fold).to_numpy()
+    train_mask = ~(val_mask | test_mask)
+
+    # normalize data (train stats only; test not normalized separately here)
+    mean = np.mean(x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
+    std = np.std(x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
+    transforms.normalize_(x, mean_std=(mean, std))
+    x.clip(-5, 5, out=x)
+
+    # ensure matching channels
+    channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
+    x = x[:, :, channel_order]
+
+    x_train, y_train = x[train_mask], y[train_mask]
+    x_val, y_val = x[val_mask], y[val_mask]
+    x_test, y_test = x[test_mask], y[test_mask]
+
+    task_name = args.task
 
   if is_main_process:
     logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
 
-  # initialize configs
+  # -------------------------------------------------------------------------
+  # Config + model setup (shared)
+  # -------------------------------------------------------------------------
   eval_config = configs.eval.Config(**eval_config_dict, num_classes=num_classes)
   if eval_config.use_register and encoder_config.num_registers == 0:
     if is_main_process:
@@ -215,9 +296,9 @@ def main():
   num_workers = max(1, num_cpus // world_size)
 
   train_dataset = TensorDataset(
-    data=x[train_mask],
-    labels=y[train_mask],
-    transform=TrainTransformECG(crop_size=crop_size))
+    data=x_train,
+    labels=y_train,
+    transform=TrainTransform(crop_size=crop_size))
 
   train_sampler = DistributedSampler(
     train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
@@ -231,21 +312,20 @@ def main():
     drop_last=(train_sampler is None),
     num_workers=num_workers)
 
-  # val/test loaders: each rank evaluates independently on the full dataset
   val_loader = DataLoader(
     dataset=TensorDataset(
-      data=x[val_mask],
-      labels=y[val_mask],
-      transform=EvalTransformECG(
+      data=x_val,
+      labels=y_val,
+      transform=EvalTransform(
         crop_size=crop_size,
         crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
     num_workers=num_workers)
   test_loader = DataLoader(
     dataset=TensorDataset(
-      data=x[test_mask],
-      labels=y[test_mask],
-      transform=EvalTransformECG(
+      data=x_test,
+      labels=y_test,
+      transform=EvalTransform(
         crop_size=crop_size,
         crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
@@ -254,7 +334,6 @@ def main():
   steps_per_epoch = len(train_loader) if eval_config.epochs > 0 else None
   total_steps = eval_config.epochs * steps_per_epoch if eval_config.epochs > 0 else eval_config.steps
 
-  # setup hyperparameter schedules
   lr_schedule = cosine_schedule(
     total_steps=total_steps,
     start_value=eval_config.learning_rate,
@@ -283,17 +362,25 @@ def main():
   else:
     model = original_model
 
+  # -------------------------------------------------------------------------
+  # Training loop (shared structure, branched on metric)
+  # -------------------------------------------------------------------------
   step_time = AverageMeter()
   train_loss = AverageMeter()
-  best_val_auc = float('-inf')
-  best_val_predictions, val_targets = None, None
+  best_val_metric = float('-inf')
+  best_val_predictions, saved_val_targets = None, None
   best_epoch_or_step = None
   best_chkpt = None
   prev_chkpt_path = None
   global_step = 0
 
+  def _compute_loss(logits, y):
+    if single_label or is_capture24:
+      return F.cross_entropy(logits, y)
+    return F.binary_cross_entropy_with_logits(logits, y)
+
   def _eval_val():
-    val_logits, val_targets = [], []
+    val_logits_or_preds, val_targets = [], []
     model.eval()
     with torch.inference_mode():
       for batch in val_loader:
@@ -305,14 +392,36 @@ def main():
         if eval_config.crop_duration is not None:
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
-        val_logits.append(logits.clone())
+        if is_capture24:
+          val_logits_or_preds.append(logits.argmax(dim=1).clone())
+        else:
+          val_logits_or_preds.append(logits.clone())
         val_targets.append(by.clone())
     model.train()
-    if single_label:
-      val_predictions = torch.cat(val_logits).softmax(dim=1).cpu().numpy()
+    targets = torch.cat(val_targets).cpu().numpy()
+    if is_capture24:
+      preds = torch.cat(val_logits_or_preds).cpu().numpy()
+      metric = f1_score(y_true=targets, y_pred=preds, average='macro')
+      acc = accuracy_score(y_true=targets, y_pred=preds)
+      return preds, targets, metric, acc
     else:
-      val_predictions = torch.cat(val_logits).sigmoid().cpu().numpy()
-    return val_predictions, torch.cat(val_targets).cpu().numpy()
+      if single_label:
+        preds = torch.cat(val_logits_or_preds).softmax(dim=1).cpu().numpy()
+      else:
+        preds = torch.cat(val_logits_or_preds).sigmoid().cpu().numpy()
+      metric = roc_auc_score(y_true=targets, y_score=preds, average='macro')
+      return preds, targets, metric, None
+
+  def _log_val(epoch_or_step, label, preds, targets, metric, acc, new_best):
+    if is_capture24:
+      logger.info(f'{label}: {epoch_or_step} '
+                  f'{"(*)" if new_best else "   "} '
+                  f'val_f1: {metric:.4f} '
+                  f'val_acc: {acc:.4f}')
+    else:
+      logger.info(f'{label}: {epoch_or_step} '
+                  f'{"(*)" if new_best else "   "} '
+                  f'val_auc: {metric:.4f}')
 
   if eval_config.epochs > 0:
     for epoch in range(eval_config.epochs):
@@ -324,7 +433,7 @@ def main():
         x, y = x.to(device), y.to(device)
         with auto_mixed_precision:
           logits = model(x)
-          loss = F.cross_entropy(logits, y) if single_label else F.binary_cross_entropy_with_logits(logits, y)
+          loss = _compute_loss(logits, y)
         loss.backward()
         if eval_config.gradient_clip > 0:
           torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
@@ -353,21 +462,19 @@ def main():
           if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
             os.remove(prev_chkpt_path)
           prev_chkpt_path = new_chkpt_path
-      val_predictions, val_targets = _eval_val()
-      val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
-      new_best = val_auc > best_val_auc
+      val_predictions, val_targets, val_metric, val_acc = _eval_val()
+      new_best = val_metric > best_val_metric
       if new_best:
-        best_val_auc = val_auc
+        best_val_metric = val_metric
         best_val_predictions = val_predictions
+        saved_val_targets = val_targets
         best_epoch_or_step = epoch
         best_chkpt = copy.deepcopy(original_model.state_dict())
       if is_main_process:
-        logger.info(f'epoch: {epoch + 1} '
-                    f'{"(*)" if new_best else "   "} '
-                    f'val_auc: {val_auc:.4f}')
+        _log_val(epoch + 1, 'epoch', val_predictions, val_targets, val_metric, val_acc, new_best)
       if epoch - best_epoch_or_step >= eval_config.early_stopping_patience:
         if is_main_process:
-          logging.info('stopping training early because validation AUC does not improve')
+          logging.info(f'stopping training early because validation metric does not improve')
         break
   else:
     def _cycle(dataloader):
@@ -385,7 +492,7 @@ def main():
       x, y = (tensor.to(device) for tensor in next(train_iterator))
       with auto_mixed_precision:
         logits = model(x)
-        loss = F.cross_entropy(logits, y) if single_label else F.binary_cross_entropy_with_logits(logits, y)
+        loss = _compute_loss(logits, y)
       loss.backward()
       if eval_config.gradient_clip > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
@@ -414,23 +521,24 @@ def main():
           if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
             os.remove(prev_chkpt_path)
           prev_chkpt_path = new_chkpt_path
-        val_predictions, val_targets = _eval_val()
-        val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
-        new_best = val_auc > best_val_auc
+        val_predictions, val_targets, val_metric, val_acc = _eval_val()
+        new_best = val_metric > best_val_metric
         if new_best:
-          best_val_auc = val_auc
+          best_val_metric = val_metric
           best_val_predictions = val_predictions
+          saved_val_targets = val_targets
           best_epoch_or_step = step
           best_chkpt = copy.deepcopy(original_model.state_dict())
         if is_main_process:
-          logger.info(f'step: {step + 1} '
-                      f'{"(*)" if new_best else "   "} '
-                      f'val_auc: {val_auc:.4f}')
+          _log_val(step + 1, 'step', val_predictions, val_targets, val_metric, val_acc, new_best)
         if step - best_epoch_or_step >= eval_config.early_stopping_patience:
           if is_main_process:
-            logging.info('stopping training early because validation AUC does not improve')
+            logging.info('stopping training early because validation metric does not improve')
           break
 
+  # -------------------------------------------------------------------------
+  # Save best checkpoint and run test evaluation (main process only)
+  # -------------------------------------------------------------------------
   if is_main_process:
     torch.save({
       'model': best_chkpt,
@@ -438,15 +546,14 @@ def main():
       'eval_config': dataclasses.asdict(eval_config),
       'preprocess': {'mean': torch.from_numpy(mean.squeeze()),
                      'std': torch.from_numpy(std.squeeze())},
-      'task': ptb_xl_task
-    }, path.join(args.out, f'{args.task}_best_chkpt.pt'))
+      'task': task_name
+    }, path.join(args.out, f'{task_name}_best_chkpt.pt'))
 
-  # test model (only rank 0 runs final test evaluation)
   if is_main_process:
     logger.info('loading best model checkpoint')
     original_model.load_state_dict(best_chkpt)
 
-    test_logits, test_targets = [], []
+    test_logits_or_preds, test_targets = [], []
     original_model.eval()
     with torch.inference_mode():
       for batch in test_loader:
@@ -457,21 +564,29 @@ def main():
         logits = original_model(bx)
         if eval_config.crop_duration is not None:
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
-          logits = logits.mean(dim=1)  # aggregate crop predictions
-        test_logits.append(logits.clone())
+          logits = logits.mean(dim=1)
+        if is_capture24:
+          test_logits_or_preds.append(logits.argmax(dim=1).clone())
+        else:
+          test_logits_or_preds.append(logits.clone())
         test_targets.append(by.clone())
-    if single_label:
-      test_predictions = torch.cat(test_logits).softmax(dim=1).cpu().numpy()
-    else:
-      test_predictions = torch.cat(test_logits).sigmoid().cpu().numpy()
+
     test_targets = torch.cat(test_targets).cpu().numpy()
-    test_auc = roc_auc_score(
-        y_true=test_targets,
-        y_score=test_predictions,
-        average='macro')
-    logger.info(f'test_auc {test_auc:.4f}')
-    np.savez(path.join(args.out, f'{args.task}_predictions.npz'),
-             val_targets=val_targets, val_predictions=best_val_predictions,
+    if is_capture24:
+      test_predictions = torch.cat(test_logits_or_preds).cpu().numpy()
+      test_f1 = f1_score(y_true=test_targets, y_pred=test_predictions, average='macro')
+      test_acc = accuracy_score(y_true=test_targets, y_pred=test_predictions)
+      logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}')
+    else:
+      if single_label:
+        test_predictions = torch.cat(test_logits_or_preds).softmax(dim=1).cpu().numpy()
+      else:
+        test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
+      test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
+      logger.info(f'test_auc {test_auc:.4f}')
+
+    np.savez(path.join(args.out, f'{task_name}_predictions.npz'),
+             val_targets=saved_val_targets, val_predictions=best_val_predictions,
              test_targets=test_targets, test_predictions=test_predictions)
 
   if is_distributed:
@@ -492,7 +607,7 @@ class PreprocessECG:
     return x
 
 
-class TrainTransformECG:   # called whenever dataloader accesses the data
+class TrainTransform:
   def __init__(self, crop_size=None):
     self.crop_size = crop_size
 
@@ -504,7 +619,7 @@ class TrainTransformECG:   # called whenever dataloader accesses the data
     return x
 
 
-class EvalTransformECG:  # called whenever dataloader accesses the data
+class EvalTransform:
   def __init__(self, crop_size=None, crop_stride=None):
     self.crop_size = crop_size
     self.crop_stride = crop_stride or crop_size
