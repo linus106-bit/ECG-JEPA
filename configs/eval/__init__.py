@@ -21,7 +21,7 @@ class Config:
   batch_size: int = 256
   learning_rate: float = 1e-3
   final_learning_rate: float = 1e-5
-  learning_rate_warmup_steps: int = 0
+  learning_rate_warmup_ratio: float = 0.0
   weight_decay: float = 0.
   opt_betas: tuple[float, float] = (0.9, 0.999)
   gradient_clip: float = 0.
