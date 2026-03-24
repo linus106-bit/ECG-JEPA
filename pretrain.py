@@ -223,8 +223,8 @@ def main():
   if config.epochs > 0:
     steps_per_epoch = max(1, total_dataset_size // (config.batch_size * config.gradient_accumulation_steps))
     total_steps = config.epochs * steps_per_epoch
-    start_epoch = chkpt.get('epoch', 0) if chkpt is not None else 0
-    start_step = start_epoch * steps_per_epoch
+    start_step = chkpt.get('step', chkpt.get('epoch', 0) * steps_per_epoch) if chkpt is not None else 0
+    start_epoch = start_step // steps_per_epoch
   else:
     steps_per_epoch = None
     total_steps = config.steps
@@ -294,6 +294,7 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     step_time.update(time() - step_start)
 
+  global_step = start_step
   if config.epochs > 0:
     for epoch in range(start_epoch, config.epochs):
       train_iterator = iter(train_loader)
@@ -301,29 +302,35 @@ def main():
       train_iterator = prefetch_batch(train_iterator)
       for _ in range(steps_per_epoch):
         _train_step(train_iterator)
-      if is_main_process:
-        logger.info(f'[epoch {epoch + 1:04d}] '
-                    f'step_time {step_time.value:.4f} '
-                    f'train_loss {train_loss.value:.4f}')
-        step_time = AverageMeter()
-        train_loss = AverageMeter()
-      if is_main_process and (epoch + 1) % config.checkpoint_interval == 0:
+        global_step += 1
+        if is_main_process:
+          current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+          logger.info(f'step: {global_step} '
+                      f'epoch: {current_epoch:.4f} '
+                      f'train_loss: {train_loss.value:.4f} '
+                      f'step_time: {step_time.value:.4f}')
+          step_time = AverageMeter()
+          train_loss = AverageMeter()
+      if is_main_process and global_step % config.checkpoint_interval == 0:
         torch.save({
           'model': original_model.state_dict(),
           'optimizer': optimizer.state_dict(),
           'config': dataclasses.asdict(config),
           'epoch': epoch + 1,
-        }, path.join(args.out, f'chkpt_{epoch + 1}.pt'))
+          'step': global_step,
+        }, path.join(args.out, f'chkpt_{global_step}.pt'))
   else:
     train_iterator = iter(train_loader)
     train_iterator = map_to_device(train_iterator, device=device)
     train_iterator = prefetch_batch(train_iterator)
-    for step in range(config.steps):
+    for step in range(start_step, config.steps):
       _train_step(train_iterator)
-      if is_main_process and (step + 1) % 100 == 0:
-        logger.info(f'[{step + 1:06d}] '
-                    f'step_time {step_time.value:.4f} '
-                    f'train_loss {train_loss.value:.4f}')
+      if is_main_process:
+        current_epoch = (step + 1) * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+        logger.info(f'step: {step + 1} '
+                    f'epoch: {current_epoch:.4f} '
+                    f'train_loss: {train_loss.value:.4f} '
+                    f'step_time: {step_time.value:.4f}')
         step_time = AverageMeter()
         train_loss = AverageMeter()
       if is_main_process and (step + 1) % config.checkpoint_interval == 0:
