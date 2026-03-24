@@ -295,6 +295,7 @@ def main():
     step_time.update(time() - step_start)
 
   global_step = start_step
+  prev_chkpt_path = None
   if config.epochs > 0:
     for epoch in range(start_epoch, config.epochs):
       train_iterator = iter(train_loader)
@@ -311,14 +312,18 @@ def main():
                       f'step_time: {step_time.value:.4f}')
           step_time = AverageMeter()
           train_loss = AverageMeter()
-      if is_main_process and global_step % config.checkpoint_interval == 0:
-        torch.save({
-          'model': original_model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'config': dataclasses.asdict(config),
-          'epoch': epoch + 1,
-          'step': global_step,
-        }, path.join(args.out, f'chkpt_{global_step}.pt'))
+        if is_main_process and global_step % config.checkpoint_interval == 0:
+          new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
+          torch.save({
+            'model': original_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'config': dataclasses.asdict(config),
+            'epoch': epoch + 1,
+            'step': global_step,
+          }, new_chkpt_path)
+          if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
+            os.remove(prev_chkpt_path)
+          prev_chkpt_path = new_chkpt_path
   else:
     train_iterator = iter(train_loader)
     train_iterator = map_to_device(train_iterator, device=device)
@@ -334,12 +339,16 @@ def main():
         step_time = AverageMeter()
         train_loss = AverageMeter()
       if is_main_process and (step + 1) % config.checkpoint_interval == 0:
+        new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
         torch.save({
           'model': original_model.state_dict(),
           'optimizer': optimizer.state_dict(),
           'config': dataclasses.asdict(config),
           'step': step + 1,
-        }, path.join(args.out, f'chkpt_{step + 1}.pt'))
+        }, new_chkpt_path)
+        if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
+          os.remove(prev_chkpt_path)
+        prev_chkpt_path = new_chkpt_path
 
   if is_distributed:
     dist.destroy_process_group()
