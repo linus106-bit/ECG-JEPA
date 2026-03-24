@@ -46,11 +46,17 @@ print(f'Loading data from {args.data_dir}')
 data, sizes = None, None
 
 if args.dataset == 'capture-24':
-  data, labels, splits = Capture24.load_data(args.data_dir)
-  # save labels and split info alongside the data dump
-  labels_file = f'{args.data_dir}_labels.npz'
-  print(f'Saving labels to {labels_file}')
-  np.savez(labels_file, labels=labels, splits=splits)
+  all_data, labels, splits = Capture24.load_data(args.data_dir)
+  train_mask = splits == 'train'
+  test_mask = splits == 'test'
+  # save train/test data separately to prevent data leakage during pre-training
+  for split_name, mask in (('train', train_mask), ('test', test_mask)):
+    out_file = f'{args.data_dir}_{split_name}.npy'
+    print(f'Saving {split_name} data ({mask.sum()} samples) to {out_file}')
+    np.save(out_file, all_data[mask])
+    labels_file = f'{args.data_dir}_{split_name}_labels.npz'
+    print(f'Saving {split_name} labels to {labels_file}')
+    np.savez(labels_file, labels=labels[mask])
 elif args.dataset == 'chapman-shaoxing':
   record_names = ChapmanShaoxing.find_records(args.data_dir)
   data = load_raw_data(record_names, verbose=args.verbose)
@@ -85,11 +91,12 @@ elif args.dataset == 'ptb-xl':
 else:
   raise ValueError(f'Unknown dataset type: {args.dataset}')
 
-if sizes is None:  # we are not dealing with variable data
-  out_file = f'{args.data_dir}.npy'
-  print(f'Saving dataset to {out_file}')
-  np.save(out_file, data)
-else:
-  out_file = f'{args.data_dir}.npz'
-  print(f'Saving dataset to {out_file}')
-  np.savez(out_file, data=data, sizes=sizes)
+if args.dataset != 'capture-24':  # capture-24 is already saved per split above
+  if sizes is None:  # we are not dealing with variable data
+    out_file = f'{args.data_dir}.npy'
+    print(f'Saving dataset to {out_file}')
+    np.save(out_file, data)
+  else:
+    out_file = f'{args.data_dir}.npz'
+    print(f'Saving dataset to {out_file}')
+    np.savez(out_file, data=data, sizes=sizes)
