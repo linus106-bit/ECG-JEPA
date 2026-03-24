@@ -53,5 +53,7 @@ CMD=(
 [[ -n "${CHECKPOINT}" ]] && CMD+=(--chkpt "${CHECKPOINT}")
 [[ "${COMPILE}" == "true" ]] && CMD+=(--compile)
 
+LOG_FILE="${OUT_DIR}/train.log"
 echo "Command: ${CMD[*]}"
-"${CMD[@]}"
+echo "Logging to: ${LOG_FILE}"
+"${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
