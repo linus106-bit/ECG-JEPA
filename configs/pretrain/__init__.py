@@ -28,8 +28,6 @@ class Config:
   norm_eps: float
   layer_scale_eps: float
   # training
-  steps: int = 0
-  epochs: int = 0
   batch_size: int
   encoder_momentum: float
   final_encoder_momentum: float
@@ -43,6 +41,8 @@ class Config:
   gradient_clip: float
   gradient_accumulation_steps: int
   checkpoint_interval: int
+  steps: int = 0
+  epochs: int = 0
   # model type selection ('vit', 'cnn', or 'mamba')
   model_type: str = 'vit'
   # CNN-specific
