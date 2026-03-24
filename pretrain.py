@@ -223,8 +223,8 @@ def main():
   if config.epochs > 0:
     steps_per_epoch = max(1, total_dataset_size // (config.batch_size * config.gradient_accumulation_steps))
     total_steps = config.epochs * steps_per_epoch
-    start_epoch = chkpt.get('epoch', 0) if chkpt is not None else 0
-    start_step = start_epoch * steps_per_epoch
+    start_step = chkpt.get('step', chkpt.get('epoch', 0) * steps_per_epoch) if chkpt is not None else 0
+    start_epoch = start_step // steps_per_epoch
   else:
     steps_per_epoch = None
     total_steps = config.steps
@@ -311,13 +311,14 @@ def main():
                       f'step_time: {step_time.value:.4f}')
           step_time = AverageMeter()
           train_loss = AverageMeter()
-      if is_main_process and (epoch + 1) % config.checkpoint_interval == 0:
+      if is_main_process and global_step % config.checkpoint_interval == 0:
         torch.save({
           'model': original_model.state_dict(),
           'optimizer': optimizer.state_dict(),
           'config': dataclasses.asdict(config),
           'epoch': epoch + 1,
-        }, path.join(args.out, f'chkpt_{epoch + 1}.pt'))
+          'step': global_step,
+        }, path.join(args.out, f'chkpt_{global_step}.pt'))
   else:
     train_iterator = iter(train_loader)
     train_iterator = map_to_device(train_iterator, device=device)
