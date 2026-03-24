@@ -288,6 +288,7 @@ def main():
   best_val_auc = float('-inf')
   best_val_predictions, val_targets = None, None
   best_epoch_or_step, best_chkpt = None, None
+  global_step = 0
 
   def _eval_val():
     val_logits, val_targets = [], []
@@ -327,8 +328,17 @@ def main():
           torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        global_step += 1
         step_time.update(time() - step_start)
         train_loss.update(loss.item())
+        if is_main_process:
+          current_epoch = global_step / steps_per_epoch
+          logger.info(f'step: {global_step} '
+                      f'epoch: {current_epoch:.4f} '
+                      f'train_loss: {train_loss.value:.4f} '
+                      f'step_time: {step_time.value:.4f}')
+          step_time = AverageMeter()
+          train_loss = AverageMeter()
       val_predictions, val_targets = _eval_val()
       val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
       new_best = val_auc > best_val_auc
@@ -338,13 +348,9 @@ def main():
         best_epoch_or_step = epoch
         best_chkpt = copy.deepcopy(original_model.state_dict())
       if is_main_process:
-        logger.info(f'[epoch {epoch + 1:04d}] '
+        logger.info(f'epoch: {epoch + 1} '
                     f'{"(*)" if new_best else "   "} '
-                    f'step_time {step_time.value:.4f} '
-                    f'train_loss {train_loss.value:.4f} '
-                    f'val_auc {val_auc:.4f}')
-      step_time = AverageMeter()
-      train_loss = AverageMeter()
+                    f'val_auc: {val_auc:.4f}')
       if epoch - best_epoch_or_step >= eval_config.early_stopping_patience:
         if is_main_process:
           logging.info('stopping training early because validation AUC does not improve')
@@ -357,6 +363,7 @@ def main():
           train_sampler.set_epoch(epoch)
         yield from dataloader
         epoch += 1
+    train_dataset_size = len(train_dataset)
     train_iterator = _cycle(train_loader)
     for step in range(eval_config.steps):
       step_start = time()
@@ -372,6 +379,14 @@ def main():
       optimizer.zero_grad(set_to_none=True)
       step_time.update(time() - step_start)
       train_loss.update(loss.item())
+      if is_main_process:
+        current_epoch = (step + 1) * eval_config.batch_size / train_dataset_size
+        logger.info(f'step: {step + 1} '
+                    f'epoch: {current_epoch:.4f} '
+                    f'train_loss: {train_loss.value:.4f} '
+                    f'step_time: {step_time.value:.4f}')
+        step_time = AverageMeter()
+        train_loss = AverageMeter()
       if (step + 1) % eval_config.checkpoint_interval == 0:
         val_predictions, val_targets = _eval_val()
         val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
@@ -382,13 +397,9 @@ def main():
           best_epoch_or_step = step
           best_chkpt = copy.deepcopy(original_model.state_dict())
         if is_main_process:
-          logger.info(f'[{step + 1:06d}] '
+          logger.info(f'step: {step + 1} '
                       f'{"(*)" if new_best else "   "} '
-                      f'step_time {step_time.value:.4f} '
-                      f'train_loss {train_loss.value:.4f} '
-                      f'val_auc {val_auc:.4f}')
-        step_time = AverageMeter()
-        train_loss = AverageMeter()
+                      f'val_auc: {val_auc:.4f}')
         if step - best_epoch_or_step >= eval_config.early_stopping_patience:
           if is_main_process:
             logging.info('stopping training early because validation AUC does not improve')

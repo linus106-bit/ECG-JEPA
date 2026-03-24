@@ -270,6 +270,7 @@ def main():
   best_val_f1 = float('-inf')
   best_val_predictions, saved_val_targets = None, None
   best_epoch, best_chkpt = None, None
+  global_step = 0
 
   for epoch in range(eval_config.epochs):
     if is_distributed:
@@ -286,8 +287,17 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
       optimizer.step()
       optimizer.zero_grad(set_to_none=True)
+      global_step += 1
       step_time.update(time() - step_start)
       train_loss.update(loss.item())
+      if is_main_process:
+        current_epoch = global_step / steps_per_epoch
+        logger.info(f'step: {global_step} '
+                    f'epoch: {current_epoch:.4f} '
+                    f'train_loss: {train_loss.value:.4f} '
+                    f'step_time: {step_time.value:.4f}')
+        step_time = AverageMeter()
+        train_loss = AverageMeter()
     val_preds, val_targets = [], []
     model.eval()
     with torch.inference_mode():
@@ -315,14 +325,10 @@ def main():
       best_epoch = epoch
       best_chkpt = copy.deepcopy(original_model.state_dict())
     if is_main_process:
-      logger.info(f'[epoch {epoch + 1:04d}] '
+      logger.info(f'epoch: {epoch + 1} '
                   f'{"(*)" if new_best else "   "} '
-                  f'step_time {step_time.value:.4f} '
-                  f'train_loss {train_loss.value:.4f} '
-                  f'val_f1 {val_f1:.4f} '
-                  f'val_acc {val_acc:.4f}')
-    step_time = AverageMeter()
-    train_loss = AverageMeter()
+                  f'val_f1: {val_f1:.4f} '
+                  f'val_acc: {val_acc:.4f}')
     if epoch - best_epoch >= eval_config.early_stopping_patience:
       if is_main_process:
         logging.info('stopping training early because validation F1 does not improve')
