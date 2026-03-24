@@ -1,4 +1,5 @@
 import argparse
+import copy
 import dataclasses
 import logging.config
 import os
@@ -287,7 +288,8 @@ def main():
   best_val_auc = float('-inf')
   best_val_predictions, val_targets = None, None
   best_epoch_or_step = None
-  best_chkpt_path = None
+  best_chkpt = None
+  prev_chkpt_path = None
   global_step = 0
 
   def _eval_val():
@@ -339,6 +341,18 @@ def main():
                       f'step_time: {step_time.value:.4f}')
           step_time = AverageMeter()
           train_loss = AverageMeter()
+        if is_main_process and global_step % eval_config.checkpoint_interval == 0:
+          new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
+          torch.save({
+            'model': original_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'config': dataclasses.asdict(encoder_config),
+            'eval_config': dataclasses.asdict(eval_config),
+            'step': global_step,
+          }, new_chkpt_path)
+          if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
+            os.remove(prev_chkpt_path)
+          prev_chkpt_path = new_chkpt_path
       val_predictions, val_targets = _eval_val()
       val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
       new_best = val_auc > best_val_auc
@@ -346,19 +360,7 @@ def main():
         best_val_auc = val_auc
         best_val_predictions = val_predictions
         best_epoch_or_step = epoch
-        if is_main_process:
-          new_path = path.join(args.out, f'{args.task}_best_chkpt.pt')
-          torch.save({
-            'model': original_model.state_dict(),
-            'config': dataclasses.asdict(encoder_config),
-            'eval_config': dataclasses.asdict(eval_config),
-            'preprocess': {'mean': torch.from_numpy(mean.squeeze()),
-                           'std': torch.from_numpy(std.squeeze())},
-            'task': ptb_xl_task
-          }, new_path)
-          if best_chkpt_path is not None and path.exists(best_chkpt_path):
-            os.remove(best_chkpt_path)
-          best_chkpt_path = new_path
+        best_chkpt = copy.deepcopy(original_model.state_dict())
       if is_main_process:
         logger.info(f'epoch: {epoch + 1} '
                     f'{"(*)" if new_best else "   "} '
@@ -400,6 +402,18 @@ def main():
         step_time = AverageMeter()
         train_loss = AverageMeter()
       if (step + 1) % eval_config.checkpoint_interval == 0:
+        if is_main_process:
+          new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
+          torch.save({
+            'model': original_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'config': dataclasses.asdict(encoder_config),
+            'eval_config': dataclasses.asdict(eval_config),
+            'step': step + 1,
+          }, new_chkpt_path)
+          if prev_chkpt_path is not None and path.exists(prev_chkpt_path):
+            os.remove(prev_chkpt_path)
+          prev_chkpt_path = new_chkpt_path
         val_predictions, val_targets = _eval_val()
         val_auc = roc_auc_score(y_true=val_targets, y_score=val_predictions, average='macro')
         new_best = val_auc > best_val_auc
@@ -407,19 +421,7 @@ def main():
           best_val_auc = val_auc
           best_val_predictions = val_predictions
           best_epoch_or_step = step
-          if is_main_process:
-            new_path = path.join(args.out, f'{args.task}_best_chkpt.pt')
-            torch.save({
-              'model': original_model.state_dict(),
-              'config': dataclasses.asdict(encoder_config),
-              'eval_config': dataclasses.asdict(eval_config),
-              'preprocess': {'mean': torch.from_numpy(mean.squeeze()),
-                             'std': torch.from_numpy(std.squeeze())},
-              'task': ptb_xl_task
-            }, new_path)
-            if best_chkpt_path is not None and path.exists(best_chkpt_path):
-              os.remove(best_chkpt_path)
-            best_chkpt_path = new_path
+          best_chkpt = copy.deepcopy(original_model.state_dict())
         if is_main_process:
           logger.info(f'step: {step + 1} '
                       f'{"(*)" if new_best else "   "} '
@@ -429,10 +431,20 @@ def main():
             logging.info('stopping training early because validation AUC does not improve')
           break
 
+  if is_main_process:
+    torch.save({
+      'model': best_chkpt,
+      'config': dataclasses.asdict(encoder_config),
+      'eval_config': dataclasses.asdict(eval_config),
+      'preprocess': {'mean': torch.from_numpy(mean.squeeze()),
+                     'std': torch.from_numpy(std.squeeze())},
+      'task': ptb_xl_task
+    }, path.join(args.out, f'{args.task}_best_chkpt.pt'))
+
   # test model (only rank 0 runs final test evaluation)
   if is_main_process:
     logger.info('loading best model checkpoint')
-    original_model.load_state_dict(torch.load(best_chkpt_path, map_location='cpu')['model'])
+    original_model.load_state_dict(best_chkpt)
 
     test_logits, test_targets = [], []
     original_model.eval()
