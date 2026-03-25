@@ -1,46 +1,46 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
 class Config:
   # data
-  sampling_frequency: int
-  channels: tuple[str, ...]
-  channel_size: int
-  patch_size: int
-  min_block_size: int
-  min_keep_ratio: float
-  max_keep_ratio: float
-  datasets: dict  # {name: {path: str, weight: float}}
+  sampling_frequency: int = 500
+  channels: tuple[str, ...] = ('I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+  channel_size: int = 5000
+  patch_size: int = 25
+  min_block_size: int = 10
+  min_keep_ratio: float = 0.15
+  max_keep_ratio: float = 0.25
+  datasets: dict = field(default_factory=dict)  # {name: {path: str, weight: float}}
   # model architecture
-  dim: int
-  depth: int
-  num_heads: int
-  pred_dim: int
-  pred_depth: int
-  pred_num_heads: int
-  mlp_ratio: float
-  qkv_bias: bool
-  dropout: float
-  attn_dropout: float
-  num_registers: int
-  bias: bool
-  norm_eps: float
-  layer_scale_eps: float
+  dim: int = 384
+  depth: int = 8
+  num_heads: int = 6
+  pred_dim: int = 192
+  pred_depth: int = 8
+  pred_num_heads: int = 6
+  mlp_ratio: float = 4.
+  qkv_bias: bool = False
+  dropout: float = 0.
+  attn_dropout: float = 0.
+  num_registers: int = 1
+  bias: bool = False
+  norm_eps: float = 1e-6
+  layer_scale_eps: float = 0.
   # training
-  batch_size: int
-  encoder_momentum: float
-  final_encoder_momentum: float
-  learning_rate: float
-  final_learning_rate: float
-  learning_rate_warmup_ratio: float
-  weight_decay: float
-  final_weight_decay: float
-  opt_betas: tuple[float, float]
-  opt_eps: float
-  gradient_clip: float
-  gradient_accumulation_steps: int
-  checkpoint_interval: int
+  batch_size: int = 2048
+  encoder_momentum: float = 0.998
+  final_encoder_momentum: float = 0.9995
+  learning_rate: float = 1e-3
+  final_learning_rate: float = 1e-6
+  learning_rate_warmup_ratio: float = 0.05
+  weight_decay: float = 1e-2
+  final_weight_decay: float = 1e-1
+  opt_betas: tuple[float, float] = (0.9, 0.99)
+  opt_eps: float = 1e-6
+  gradient_clip: float = 0.
+  gradient_accumulation_steps: int = 1
+  checkpoint_interval: int = 200
   steps: int = 0
   epochs: int = 0
   # model type selection ('vit', 'cnn', or 'mamba')
