@@ -82,13 +82,15 @@ def main():
     crop_size = None
     crop_stride = None
 
+  num_workers = max(1, num_cpus)
   test_loader = DataLoader(
     dataset=TensorDataset(
       data=x_test,
       labels=y_test,
       transform=EvalTransformSignal(crop_size=crop_size, crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
-    num_workers=max(1, num_cpus))
+    num_workers=num_workers,
+    persistent_workers=True)
 
   # build model
   encoder = create_encoder(config=encoder_config, keep_registers=eval_config.use_register, use_sdp_kernel=using_cuda)
