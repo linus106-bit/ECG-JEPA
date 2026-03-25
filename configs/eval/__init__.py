@@ -8,13 +8,13 @@ class Config:
   crop_duration: Optional[float] = None  # seconds
   crop_stride: Optional[float] = None  # seconds
   # model architecture
-  num_classes: int
-  use_register: bool
-  attn_pooling: bool
-  layer_scale_eps: float
-  bias: bool
-  dropout: float
-  frozen: bool
+  num_classes: int = 0
+  use_register: bool = True
+  attn_pooling: bool = False
+  layer_scale_eps: float = 0.
+  bias: bool = False
+  dropout: float = 0.05
+  frozen: bool = False
   # training
   steps: int = 0
   epochs: int = 0

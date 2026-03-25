@@ -155,15 +155,14 @@ def main():
     _, ext = path.splitext(dump_file)
     if ext == '.npy':
       dataset = TensorDataset(
-        data=datautils.load_data_dump(
-          dump_file=dump_file,
-          transform=PreprocessECG(
+        data=datautils.load_data_dump(dump_file=dump_file),
+        transform=[
+          PreprocessECG(
             mean_std=(mean, std),
             resample_ratio=resample_ratio,
             channel_order=channel_order),
-          processes=num_cpus),
-        transform=TransformECG(
-          crop_size=config.channel_size))
+          TransformECG(crop_size=config.channel_size),
+        ])
     elif ext == '.npz':
       dataset = VariableTensorDataset(
         *load_variable_data_dump(
@@ -356,13 +355,14 @@ def load_variable_data_dump(dump_file, min_channel_size, transform=None, process
   return data, starts, sizes
 
 
-class PreprocessECG:  # called once when loading the data
+class PreprocessECG:  # called per sample in dataloader workers
   def __init__(self, *, mean_std, resample_ratio, channel_order):
     self.mean, self.std = mean_std
     self.resample_ratio = resample_ratio
     self.channel_order = channel_order
 
   def __call__(self, x):
+    x = x.copy()  # mmap slice is read-only; make a writable copy
     transforms.interpolate_NaNs_(x)
     if self.resample_ratio != 1.0:
       channel_size, num_channels = x.shape
