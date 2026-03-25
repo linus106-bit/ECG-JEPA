@@ -210,7 +210,8 @@ def main():
     sampler=train_sampler,
     shuffle=(train_sampler is None),
     drop_last=True,
-    num_workers=num_workers)
+    num_workers=num_workers,
+    persistent_workers=(num_workers > 0))
 
   val_loader = DataLoader(
     dataset=TensorDataset(
@@ -220,7 +221,8 @@ def main():
         crop_size=crop_size,
         crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
-    num_workers=num_workers)
+    num_workers=num_workers,
+    persistent_workers=(num_workers > 0))
   test_loader = DataLoader(
     dataset=TensorDataset(
       data=x_test,
@@ -229,7 +231,8 @@ def main():
         crop_size=crop_size,
         crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
-    num_workers=num_workers)
+    num_workers=num_workers,
+    persistent_workers=(num_workers > 0))
 
   steps_per_epoch = len(train_loader)
   total_steps = eval_config.epochs * steps_per_epoch

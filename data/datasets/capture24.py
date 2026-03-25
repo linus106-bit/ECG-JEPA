@@ -44,6 +44,6 @@ class Capture24:
       train_labels: np.ndarray of shape (N_train,), dtype int64
       test_labels:  np.ndarray of shape (N_test,),  dtype int64
     """
-    train_archive = np.load(f'{data_dir}_train_labels.npz')
-    test_archive = np.load(f'{data_dir}_test_labels.npz')
-    return train_archive['labels'], test_archive['labels']
+    with np.load(f'{data_dir}_train_labels.npz') as train_archive, \
+         np.load(f'{data_dir}_test_labels.npz') as test_archive:
+      return train_archive['labels'].copy(), test_archive['labels'].copy()
