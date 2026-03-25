@@ -152,14 +152,6 @@ def main():
     logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                  f'test={len(x_test)}, num_classes={num_classes}')
 
-  # normalize using training statistics
-  mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-  std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-  transforms.normalize_(x_train_all, mean_std=(mean, std))
-  x_train_all.clip(-5, 5, out=x_train_all)
-  transforms.normalize_(x_test, mean_std=(mean, std))
-  x_test.clip(-5, 5, out=x_test)
-
   # ensure matching channels
   channel_order = get_channel_order(Capture24.channels, encoder_config.channels)
   x_train_all = x_train_all[:, :, channel_order]
@@ -355,8 +347,6 @@ def main():
       'model': best_chkpt,
       'config': dataclasses.asdict(encoder_config),
       'eval_config': dataclasses.asdict(eval_config),
-      'preprocess': {'mean': torch.from_numpy(mean.squeeze()),
-                     'std': torch.from_numpy(std.squeeze())},
       'task': 'har'
     }, path.join(args.out, 'har_best_chkpt.pt'))
 
