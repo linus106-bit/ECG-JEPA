@@ -97,7 +97,9 @@ CMD=(
 [[ -n "${DATA_DIR}" ]] && CMD+=(--data-dir "${DATA_DIR}")
 [[ -n "${DUMP}" ]] && CMD+=(--dump "${DUMP}")
 
-LOG_FILE="${OUT_DIR}/train.log"
+TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
+LOG_FILE="${OUT_DIR}/train_${TIMESTAMP}.log"
+echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "Command: ${CMD[*]}"
 echo "Logging to: ${LOG_FILE}"
-"${CMD[@]}" 2>&1 | tee "${LOG_FILE}"
+{ echo "=== Started at: $(date '+%Y-%m-%d %H:%M:%S') ==="; "${CMD[@]}"; } 2>&1 | tee "${LOG_FILE}"
