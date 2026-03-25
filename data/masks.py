@@ -6,11 +6,13 @@ import torch.utils.data
 
 
 class MaskCollator:
-  def __init__(self, patch_size, min_block_size, min_keep_ratio, max_keep_ratio):
+  def __init__(self, patch_size, min_block_size, min_keep_ratio, max_keep_ratio, strategy='block'):
     self.patch_size = patch_size
     self.min_block_size = min_block_size
     self.min_keep_ratio = min_keep_ratio
     self.max_keep_ratio = max_keep_ratio
+    assert strategy in ('block', 'random'), f"Unknown masking strategy: {strategy}"
+    self.strategy = strategy
 
   def __call__(self, batch):
     batch = torch.utils.data.default_collate(batch)
@@ -20,15 +22,22 @@ class MaskCollator:
     keep_ratio = np.random.uniform(self.min_keep_ratio, self.max_keep_ratio)
     num_keep = math.ceil(keep_ratio * num_patches)
     mask_encoder, mask_predictor = [], []
+    sample_fn = self.sample_mask_random if self.strategy == 'random' else self.sample_mask_block
     for _ in range(batch_size):
-      mask = self.sample_mask(num_keep, num_patches)
+      mask = sample_fn(num_keep, num_patches)
       mask_encoder.append(mask.nonzero().squeeze())  # patches to keep
       mask_predictor.append((1 - mask).nonzero().squeeze())  # patches to mask
     mask_encoder = torch.utils.data.default_collate(mask_encoder)
     mask_predictor = torch.utils.data.default_collate(mask_predictor)
     return batch, mask_encoder, mask_predictor
 
-  def sample_mask(self, num_keep, num_patches):  # number of patches to keep (i.e., to not mask)
+  def sample_mask_random(self, num_keep, num_patches):
+    mask = torch.zeros(num_patches)
+    keep_indices = np.random.choice(num_patches, size=num_keep, replace=False)
+    mask[keep_indices] = 1.
+    return mask
+
+  def sample_mask_block(self, num_keep, num_patches):  # number of patches to keep (i.e., to not mask)
     # intervals that represent unmasked patches in the mask
     patch_intervals = [(0, num_patches)]
     num_mask = num_patches - num_keep
@@ -99,5 +108,5 @@ if __name__ == '__main__':  # visualize masks
   for _ in range(10):
     keep_ratio = np.random.uniform(collate.min_keep_ratio, collate.max_keep_ratio)
     num_keep = math.ceil(keep_ratio * num_patches)
-    mask = collate.sample_mask(num_keep, num_patches)
+    mask = collate.sample_mask_block(num_keep, num_patches)
     draw_mask(mask, gap=0.1)
