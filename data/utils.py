@@ -123,9 +123,10 @@ def load_raw_variable_data(record_names, dtype=np.float16, verbose=False):
 
 
 def load_data_dump(dump_file, transform=None, processes=None, chunk_size=32):
-  """Loads data into memory and optionally preprocesses it."""
+  """Loads data into memory and optionally preprocesses it.
+  If no transform is given, returns a memory-mapped array (instant, low RAM)."""
   if transform is None:
-    return np.load(dump_file)
+    return np.load(dump_file, mmap_mode='r')
   original_data = np.load(dump_file, mmap_mode='r')
   num_records = len(original_data)
   data = None
