@@ -5,8 +5,8 @@ from typing import Optional
 @dataclass
 class Config:
   # data
-  crop_duration: Optional[float]  # seconds
-  crop_stride: Optional[float]  # seconds
+  crop_duration: Optional[float] = None  # seconds
+  crop_stride: Optional[float] = None  # seconds
   # model architecture
   num_classes: int
   use_register: bool
