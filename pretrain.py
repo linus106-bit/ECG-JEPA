@@ -200,7 +200,8 @@ def main():
       patch_size=config.patch_size,
       min_block_size=config.min_block_size,
       min_keep_ratio=config.min_keep_ratio,
-      max_keep_ratio=config.max_keep_ratio),
+      max_keep_ratio=config.max_keep_ratio,
+      strategy=config.masking_strategy),
     num_workers=num_workers,
     worker_init_fn=worker_init_fn)
 

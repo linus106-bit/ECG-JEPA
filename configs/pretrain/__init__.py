@@ -51,6 +51,8 @@ class Config:
   mamba_d_state: int = 16
   mamba_d_conv: int = 4
   mamba_expand: int = 2
+  # masking strategy: 'block' (multi-block) or 'random' (random patch, MAE-style)
+  masking_strategy: str = 'block'
   # DMT-JEPA: discriminative masked targets (0 = disabled)
   dmt_window_size: int = 0
   dmt_num_neighbors: int = 4
