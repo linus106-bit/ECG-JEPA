@@ -122,21 +122,45 @@ def load_raw_variable_data(record_names, dtype=np.float16, verbose=False):
   return data, sizes
 
 
+class LazyHFData:
+  """Lazy wrapper around a HuggingFace dataset column.
+
+  Avoids loading the entire dataset into memory as a numpy array.
+  Each __getitem__ call reads a single sample from the Arrow-backed
+  HuggingFace dataset (memory-mapped, near-instant).
+  """
+  def __init__(self, hf_dataset, column='data', dtype=np.float16):
+    self.ds = hf_dataset
+    self.column = column
+    self.dtype = dtype
+
+  def __getitem__(self, index):
+    return np.array(self.ds[int(index)][self.column], dtype=self.dtype)
+
+  def __len__(self):
+    return len(self.ds)
+
+
 def load_hf_dataset(dataset_path, split='train', dtype=np.float16):
-  """Load a HuggingFace dataset and return data as a numpy array.
+  """Load a HuggingFace dataset lazily (no bulk RAM allocation).
+
+  Returns a LazyHFData wrapper that loads samples on demand from the
+  Arrow-backed dataset.  The first call to load_dataset() may be slow
+  when it builds the Arrow cache from parquet files, but subsequent
+  runs reuse the cache.
 
   Args:
     dataset_path: path to HF dataset directory containing parquet files
     split: dataset split to load ('train', 'val', 'test')
-    dtype: numpy dtype for the output array
+    dtype: numpy dtype for per-sample conversion
 
   Returns:
-    data: np.ndarray of shape (N, num_channels, channel_size), channels first
+    data: LazyHFData with len() and [index] support, each sample is
+          np.ndarray of shape (num_channels, channel_size), channels first
   """
   from datasets import load_dataset
   ds = load_dataset(dataset_path, split=split)
-  data = np.array(ds['data'], dtype=dtype)
-  return data
+  return LazyHFData(ds, column='data', dtype=dtype)
 
 
 def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
