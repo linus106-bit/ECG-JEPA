@@ -1,4 +1,4 @@
-"""Convert raw datasets to HuggingFace Dataset format (Parquet).
+"""Convert raw datasets to HuggingFace Dataset format (sharded Parquet).
 
 Each dataset is saved with columns: ['id', 'data', 'label']
   - id: unique identifier (str or int)
@@ -12,7 +12,7 @@ PTB-XL also includes:
 Capture-24 label column uses HuggingFace ClassLabel feature, so
   dataset.features['label'].names provides class names and num_classes.
 
-Output format: Parquet files saved as {out_dir}/{split}.parquet
+Output format: Sharded parquet files saved as {out_dir}/{split}/XXXX.parquet
   Load with: datasets.load_dataset(out_dir)
 
 Splits:
@@ -49,32 +49,72 @@ TASKS = (
   'rhythm',
 )
 
+DEFAULT_SHARD_SIZE = 50000
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--data-dir', required=True, help='path to raw data directory')
 parser.add_argument('--dataset', choices=list(DATASETS), required=True, help='dataset type')
 parser.add_argument('--out', required=True, help='output directory for HF dataset')
 parser.add_argument('--task', choices=TASKS, default='all',
                     help='label task for PTB-XL (default: all). Ignored for non-PTB-XL datasets.')
+parser.add_argument('--shard-size', type=int, default=DEFAULT_SHARD_SIZE,
+                    help=f'max records per parquet shard (default: {DEFAULT_SHARD_SIZE})')
 parser.add_argument('--verbose', action='store_true', help='verbose mode')
 args = parser.parse_args()
 
 
-def _save_parquet(dataset_or_splits, out_dir):
-  """Save dataset splits as parquet files."""
-  os.makedirs(out_dir, exist_ok=True)
-  if isinstance(dataset_or_splits, dict):
-    for split_name, ds in dataset_or_splits.items():
-      out_path = path.join(out_dir, f'{split_name}.parquet')
-      ds.to_parquet(out_path)
-      print(f'  saved {split_name}.parquet ({len(ds)} samples)')
-  else:
-    out_path = path.join(out_dir, 'train.parquet')
-    dataset_or_splits.to_parquet(out_path)
-    print(f'  saved train.parquet ({len(dataset_or_splits)} samples)')
+def _flush_shard(batch, out_path, features=None):
+  """Write a batch of records as a single parquet shard."""
+  keys = batch[0].keys()
+  dict_of_lists = {k: [r[k] for r in batch] for k in keys}
+  ds = Dataset.from_dict(dict_of_lists, features=features)
+  ds.to_parquet(out_path)
 
 
-def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
-  """Convert PTB-XL to parquet with train/val/test splits and multi-hot labels."""
+def _save_sharded(gen, out_dir, split='train', shard_size=DEFAULT_SHARD_SIZE, features=None):
+  """Stream records from a generator and write sharded parquet files.
+
+  Output: {out_dir}/{split}/0000.parquet, 0001.parquet, ...
+  """
+  split_dir = path.join(out_dir, split)
+  os.makedirs(split_dir, exist_ok=True)
+
+  batch = []
+  shard_idx = 0
+  total = 0
+
+  for record in gen:
+    batch.append(record)
+    if len(batch) >= shard_size:
+      _flush_shard(batch, path.join(split_dir, f'{shard_idx:04d}.parquet'), features)
+      total += len(batch)
+      shard_idx += 1
+      batch = []
+
+  if batch:
+    _flush_shard(batch, path.join(split_dir, f'{shard_idx:04d}.parquet'), features)
+    total += len(batch)
+    shard_idx += 1
+
+  print(f'  {split}/: {total} samples in {shard_idx} shard(s)')
+  return total
+
+
+def _save_dataset_sharded(dataset, out_dir, split='train', shard_size=DEFAULT_SHARD_SIZE):
+  """Save an in-memory Dataset as sharded parquet files."""
+  split_dir = path.join(out_dir, split)
+  os.makedirs(split_dir, exist_ok=True)
+
+  num_shards = max(1, (len(dataset) + shard_size - 1) // shard_size)
+  for i in range(num_shards):
+    shard = dataset.shard(num_shards=num_shards, index=i, contiguous=True)
+    shard.to_parquet(path.join(split_dir, f'{i:04d}.parquet'))
+
+  print(f'  {split}/: {len(dataset)} samples in {num_shards} shard(s)')
+
+
+def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+  """Convert PTB-XL to sharded parquet with train/val/test splits and multi-hot labels."""
   from data.utils import load_raw_data
 
   record_names = PTB_XL.find_records(data_dir)
@@ -94,7 +134,7 @@ def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
   print(f'  task={task}, num_classes={len(label_names)}, label_names={label_names}')
   print(f'  total samples after filtering: {len(all_x)}')
 
-  splits = {}
+  os.makedirs(out_dir, exist_ok=True)
   for split_name, fold_values in [('train', range(1, 9)), ('val', [9]), ('test', [10])]:
     fold_set = set(fold_values)
     indices = [i for i, fold in enumerate(strat_folds) if fold in fold_set]
@@ -105,10 +145,8 @@ def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
       'label_names': [label_names for _ in indices],
       'strat_fold': [strat_folds[i] for i in indices],
     }
-    splits[split_name] = Dataset.from_dict(split_data)
-    print(f'  {split_name}: {len(indices)} samples')
-
-  _save_parquet(splits, out_dir)
+    ds = Dataset.from_dict(split_data)
+    _save_dataset_sharded(ds, out_dir, split=split_name, shard_size=shard_size)
 
   # Copy scp_statements.csv needed for label aggregation if task changes later
   import shutil
@@ -117,11 +155,11 @@ def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
     shutil.copy2(scp_file, path.join(out_dir, 'scp_statements.csv'))
     print(f'Copied scp_statements.csv to {out_dir}')
 
-  print(f'Saved PTB-XL parquet dataset to {out_dir}')
+  print(f'Saved PTB-XL sharded parquet to {out_dir}')
 
 
-def convert_capture24(data_dir, out_dir, verbose=False):
-  """Convert Capture-24 to parquet with train/test splits and ClassLabel."""
+def convert_capture24(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+  """Convert Capture-24 to sharded parquet with train/test splits and ClassLabel."""
   from datasets import load_dataset
   from data.datasets.capture24 import Capture24
 
@@ -146,7 +184,7 @@ def convert_capture24(data_dir, out_dir, verbose=False):
   # Load data using Capture24 loader (returns channels-last)
   all_data, labels, split_names = Capture24.load_data(data_dir)
 
-  splits = {}
+  os.makedirs(out_dir, exist_ok=True)
   for split_name in ('train', 'test'):
     mask = split_names == split_name
     indices = np.where(mask)[0]
@@ -155,19 +193,18 @@ def convert_capture24(data_dir, out_dir, verbose=False):
       'data': [all_data[i].T.tolist() for i in indices],
       'label': [int(labels[i]) for i in indices],
     }
-    splits[split_name] = Dataset.from_dict(split_data, features=features)
-    print(f'  {split_name}: {len(indices)} samples')
+    ds = Dataset.from_dict(split_data, features=features)
+    _save_dataset_sharded(ds, out_dir, split=split_name, shard_size=shard_size)
 
-  _save_parquet(splits, out_dir)
-  print(f'Saved Capture-24 parquet dataset to {out_dir}')
+  print(f'Saved Capture-24 sharded parquet to {out_dir}')
 
 
-def convert_fixed_length(dataset_name, data_dir, out_dir, verbose=False):
-  """Convert fixed-length ECG datasets using streaming to avoid OOM."""
+def convert_fixed_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+  """Convert fixed-length ECG datasets with streaming + sharding to avoid OOM."""
   dataset_cls = DATASETS[dataset_name]
 
   if dataset_name == 'code-15':
-    _convert_code15(data_dir, out_dir, verbose)
+    _convert_code15(data_dir, out_dir, shard_size, verbose)
     return
 
   record_names = dataset_cls.find_records(data_dir)
@@ -185,13 +222,13 @@ def convert_fixed_length(dataset_name, data_dir, out_dir, verbose=False):
       yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
       idx += 1
 
-  ds = Dataset.from_generator(gen)
-  _save_parquet(ds, out_dir)
-  print(f'Saved {dataset_name} parquet dataset to {out_dir}')
+  os.makedirs(out_dir, exist_ok=True)
+  _save_sharded(gen(), out_dir, split='train', shard_size=shard_size)
+  print(f'Saved {dataset_name} sharded parquet to {out_dir}')
 
 
-def _convert_code15(data_dir, out_dir, verbose=False):
-  """Convert CODE-15 using streaming to avoid OOM."""
+def _convert_code15(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+  """Convert CODE-15 with streaming + sharding to avoid OOM."""
   dataset_obj = CODE15(data_dir)
   num_channels = len(CODE15.channels)
   max_channel_size = int(CODE15.record_duration * CODE15.sampling_frequency)
@@ -200,7 +237,6 @@ def _convert_code15(data_dir, out_dir, verbose=False):
     idx = 0
     for x in tqdm(dataset_obj.stream_raw_data(), total=len(dataset_obj.record_list),
                   desc='code-15', disable=not verbose):
-      # Only keep fixed-length records (skip variable)
       slices = []
       for channel in range(num_channels):
         start_idx = np.nonzero(x[:, channel])[0]
@@ -217,13 +253,13 @@ def _convert_code15(data_dir, out_dir, verbose=False):
         yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
         idx += 1
 
-  ds = Dataset.from_generator(gen)
-  _save_parquet(ds, out_dir)
-  print(f'Saved code-15 parquet dataset to {out_dir}')
+  os.makedirs(out_dir, exist_ok=True)
+  _save_sharded(gen(), out_dir, split='train', shard_size=shard_size)
+  print(f'Saved code-15 sharded parquet to {out_dir}')
 
 
-def convert_variable_length(dataset_name, data_dir, out_dir, verbose=False):
-  """Convert variable-length ECG datasets using streaming to avoid OOM."""
+def convert_variable_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+  """Convert variable-length ECG datasets with streaming + sharding to avoid OOM."""
   dataset_cls = DATASETS[dataset_name]
   record_names = dataset_cls.find_records(data_dir)
 
@@ -233,9 +269,9 @@ def convert_variable_length(dataset_name, data_dir, out_dir, verbose=False):
       x = x.astype(np.float16)
       yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
 
-  ds = Dataset.from_generator(gen)
-  _save_parquet(ds, out_dir)
-  print(f'Saved {dataset_name} parquet dataset to {out_dir}')
+  os.makedirs(out_dir, exist_ok=True)
+  _save_sharded(gen(), out_dir, split='train', shard_size=shard_size)
+  print(f'Saved {dataset_name} sharded parquet to {out_dir}')
 
 
 # Dataset type classification
@@ -248,12 +284,12 @@ VARIABLE_LENGTH_DATASETS = {'cpsc', 'cpsc-extra', 'ptb'}
 print(f'Converting {args.dataset} from {args.data_dir}')
 
 if args.dataset == 'ptb-xl':
-  convert_ptb_xl(args.data_dir, args.out, task=args.task, verbose=args.verbose)
+  convert_ptb_xl(args.data_dir, args.out, task=args.task, shard_size=args.shard_size, verbose=args.verbose)
 elif args.dataset == 'capture-24':
-  convert_capture24(args.data_dir, args.out, verbose=args.verbose)
+  convert_capture24(args.data_dir, args.out, shard_size=args.shard_size, verbose=args.verbose)
 elif args.dataset in FIXED_LENGTH_DATASETS:
-  convert_fixed_length(args.dataset, args.data_dir, args.out, verbose=args.verbose)
+  convert_fixed_length(args.dataset, args.data_dir, args.out, shard_size=args.shard_size, verbose=args.verbose)
 elif args.dataset in VARIABLE_LENGTH_DATASETS:
-  convert_variable_length(args.dataset, args.data_dir, args.out, verbose=args.verbose)
+  convert_variable_length(args.dataset, args.data_dir, args.out, shard_size=args.shard_size, verbose=args.verbose)
 else:
   raise ValueError(f'Unknown dataset type: {args.dataset}')
