@@ -126,18 +126,15 @@ def load_hf_dataset(dataset_path, split='train', dtype=np.float16):
   """Load a HuggingFace dataset and return data as a numpy array.
 
   Args:
-    dataset_path: path to HF dataset directory (saved with save_to_disk)
+    dataset_path: path to HF dataset directory containing parquet files
     split: dataset split to load ('train', 'val', 'test')
     dtype: numpy dtype for the output array
 
   Returns:
     data: np.ndarray of shape (N, num_channels, channel_size), channels first
   """
-  from datasets import load_from_disk
-  ds = load_from_disk(dataset_path)
-  if split not in ds:
-    raise ValueError(f'Split "{split}" not found in dataset. Available: {list(ds.keys())}')
-  ds = ds[split]
+  from datasets import load_dataset
+  ds = load_dataset(dataset_path, split=split)
   data = np.array(ds['data'], dtype=dtype)
   return data
 
@@ -146,7 +143,7 @@ def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
   """Load a HuggingFace dataset and return data and labels.
 
   Args:
-    dataset_path: path to HF dataset directory (saved with save_to_disk)
+    dataset_path: path to HF dataset directory containing parquet files
     split: dataset split to load ('train', 'val', 'test')
     dtype: numpy dtype for the output array
 
@@ -154,11 +151,8 @@ def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
     data: np.ndarray of shape (N, num_channels, channel_size), channels first
     labels: list of labels (int for single-label, list[int] for multi-hot)
   """
-  from datasets import load_from_disk
-  ds = load_from_disk(dataset_path)
-  if split not in ds:
-    raise ValueError(f'Split "{split}" not found in dataset. Available: {list(ds.keys())}')
-  ds = ds[split]
+  from datasets import load_dataset
+  ds = load_dataset(dataset_path, split=split)
   data = np.array(ds['data'], dtype=dtype)
   labels = ds['label']
   return data, labels
@@ -168,7 +162,7 @@ def load_hf_variable_dataset(dataset_path, split='train', min_channel_size=None,
   """Load a HuggingFace dataset with variable-length records.
 
   Args:
-    dataset_path: path to HF dataset directory
+    dataset_path: path to HF dataset directory containing parquet files
     split: dataset split to load
     min_channel_size: minimum channel size to keep (filter shorter records)
     dtype: numpy dtype
@@ -178,11 +172,8 @@ def load_hf_variable_dataset(dataset_path, split='train', min_channel_size=None,
     starts: np.ndarray of start indices along time axis
     sizes: np.ndarray of record sizes (channel_size per record)
   """
-  from datasets import load_from_disk
-  ds = load_from_disk(dataset_path)
-  if split not in ds:
-    raise ValueError(f'Split "{split}" not found in dataset. Available: {list(ds.keys())}')
-  ds = ds[split]
+  from datasets import load_dataset
+  ds = load_dataset(dataset_path, split=split)
   records = []
   for sample in ds:
     x = np.array(sample['data'], dtype=dtype)  # (num_channels, channel_size)

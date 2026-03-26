@@ -156,8 +156,8 @@ def main():
   if is_main_process:
     logger.debug(f'loading dataset from {data_dir} (type={dataset_type})')
 
-  from datasets import load_from_disk
-  hf_dataset = load_from_disk(data_dir)
+  from datasets import load_dataset
+  hf_dataset = load_dataset(data_dir)
   available_splits = list(hf_dataset.keys())
   if is_main_process:
     logger.debug(f'available splits: {available_splits}')

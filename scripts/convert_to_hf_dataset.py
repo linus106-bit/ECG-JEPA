@@ -1,4 +1,4 @@
-"""Convert raw datasets to HuggingFace Dataset format.
+"""Convert raw datasets to HuggingFace Dataset format (Parquet).
 
 Each dataset is saved with columns: ['id', 'data', 'label']
   - id: unique identifier (str or int)
@@ -11,6 +11,9 @@ PTB-XL also includes:
 
 Capture-24 label column uses HuggingFace ClassLabel feature, so
   dataset.features['label'].names provides class names and num_classes.
+
+Output format: Parquet files saved as {out_dir}/{split}.parquet
+  Load with: datasets.load_dataset(out_dir)
 
 Splits:
   - PTB-XL: train (folds 1-8), val (fold 9), test (fold 10)
@@ -25,16 +28,17 @@ Usage (run from project root):
 """
 
 import argparse
+import os
 from os import path
 
 import numpy as np
-from datasets import ClassLabel, Dataset, DatasetDict, Features, Sequence, Value
+import wfdb
+from datasets import ClassLabel, Dataset, Features, Sequence, Value
+from tqdm import tqdm
 
 from data.datasets import DATASETS
-from data.datasets.capture24 import Capture24
 from data.datasets.code_15 import CODE15
 from data.datasets.ptb_xl import PTB_XL
-from data.utils import load_raw_data, load_raw_variable_data
 
 TASKS = (
   'all',
@@ -55,9 +59,23 @@ parser.add_argument('--verbose', action='store_true', help='verbose mode')
 args = parser.parse_args()
 
 
+def _save_parquet(dataset_or_splits, out_dir):
+  """Save dataset splits as parquet files."""
+  os.makedirs(out_dir, exist_ok=True)
+  if isinstance(dataset_or_splits, dict):
+    for split_name, ds in dataset_or_splits.items():
+      out_path = path.join(out_dir, f'{split_name}.parquet')
+      ds.to_parquet(out_path)
+      print(f'  saved {split_name}.parquet ({len(ds)} samples)')
+  else:
+    out_path = path.join(out_dir, 'train.parquet')
+    dataset_or_splits.to_parquet(out_path)
+    print(f'  saved train.parquet ({len(dataset_or_splits)} samples)')
+
+
 def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
-  """Convert PTB-XL to HF dataset with train/val/test splits and multi-hot labels."""
-  import pandas as pd
+  """Convert PTB-XL to parquet with train/val/test splits and multi-hot labels."""
+  from data.utils import load_raw_data
 
   record_names = PTB_XL.find_records(data_dir)
   data = load_raw_data(record_names, verbose=verbose)
@@ -82,7 +100,7 @@ def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
     indices = [i for i, fold in enumerate(strat_folds) if fold in fold_set]
     split_data = {
       'id': [str(ecg_ids[i]) for i in indices],
-      'data': [all_x[i].T.tolist() for i in indices],  # (channel_size, num_channels) -> (num_channels, channel_size)
+      'data': [all_x[i].T.tolist() for i in indices],
       'label': [y_multihot[i].tolist() for i in indices],
       'label_names': [label_names for _ in indices],
       'strat_fold': [strat_folds[i] for i in indices],
@@ -90,8 +108,7 @@ def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
     splits[split_name] = Dataset.from_dict(split_data)
     print(f'  {split_name}: {len(indices)} samples')
 
-  dataset_dict = DatasetDict(splits)
-  dataset_dict.save_to_disk(out_dir)
+  _save_parquet(splits, out_dir)
 
   # Copy scp_statements.csv needed for label aggregation if task changes later
   import shutil
@@ -100,12 +117,13 @@ def convert_ptb_xl(data_dir, out_dir, task='all', verbose=False):
     shutil.copy2(scp_file, path.join(out_dir, 'scp_statements.csv'))
     print(f'Copied scp_statements.csv to {out_dir}')
 
-  print(f'Saved PTB-XL HF dataset to {out_dir}')
+  print(f'Saved PTB-XL parquet dataset to {out_dir}')
 
 
 def convert_capture24(data_dir, out_dir, verbose=False):
-  """Convert Capture-24 to HF dataset with train/test splits and ClassLabel."""
+  """Convert Capture-24 to parquet with train/test splits and ClassLabel."""
   from datasets import load_dataset
+  from data.datasets.capture24 import Capture24
 
   # Load original HF dataset to get label names
   original_ds = load_dataset(data_dir)
@@ -113,7 +131,6 @@ def convert_capture24(data_dir, out_dir, verbose=False):
   if hasattr(original_label_feature, 'names'):
     label_names = original_label_feature.names
   else:
-    # Fallback: infer from data
     all_labels = set(original_ds['train']['label']) | set(original_ds['test']['label'])
     label_names = [str(i) for i in range(max(all_labels) + 1)]
 
@@ -135,57 +152,90 @@ def convert_capture24(data_dir, out_dir, verbose=False):
     indices = np.where(mask)[0]
     split_data = {
       'id': [str(i) for i in indices],
-      'data': [all_data[i].T.tolist() for i in indices],  # (channel_size, num_channels) -> (num_channels, channel_size)
+      'data': [all_data[i].T.tolist() for i in indices],
       'label': [int(labels[i]) for i in indices],
     }
     splits[split_name] = Dataset.from_dict(split_data, features=features)
     print(f'  {split_name}: {len(indices)} samples')
 
-  dataset_dict = DatasetDict(splits)
-  dataset_dict.save_to_disk(out_dir)
-  print(f'Saved Capture-24 HF dataset to {out_dir}')
+  _save_parquet(splits, out_dir)
+  print(f'Saved Capture-24 parquet dataset to {out_dir}')
 
 
 def convert_fixed_length(dataset_name, data_dir, out_dir, verbose=False):
-  """Convert fixed-length ECG datasets (pretrain only, no labels)."""
+  """Convert fixed-length ECG datasets using streaming to avoid OOM."""
   dataset_cls = DATASETS[dataset_name]
 
   if dataset_name == 'code-15':
-    dataset_obj = CODE15(data_dir)
-    data = dataset_obj.load_raw_data(skip_variable=True, verbose=verbose)
-  else:
-    record_names = dataset_cls.find_records(data_dir)
-    min_channel_size = None
-    if hasattr(dataset_cls, 'record_duration'):
-      min_channel_size = dataset_cls.record_duration * dataset_cls.sampling_frequency
-    data = load_raw_data(record_names, min_channel_size=min_channel_size, verbose=verbose)
+    _convert_code15(data_dir, out_dir, verbose)
+    return
 
-  split_data = {
-    'id': [str(i) for i in range(len(data))],
-    'data': [data[i].T.tolist() for i in range(len(data))],  # transpose to channels-first
-    'label': [-1] * len(data),
-  }
-  dataset_dict = DatasetDict({'train': Dataset.from_dict(split_data)})
-  dataset_dict.save_to_disk(out_dir)
-  print(f'Saved {dataset_name} HF dataset ({len(data)} samples) to {out_dir}')
+  record_names = dataset_cls.find_records(data_dir)
+  min_channel_size = None
+  if hasattr(dataset_cls, 'record_duration'):
+    min_channel_size = dataset_cls.record_duration * dataset_cls.sampling_frequency
+
+  def gen():
+    idx = 0
+    for record_name in tqdm(record_names, desc=dataset_name, disable=not verbose):
+      x = wfdb.rdrecord(record_name).p_signal  # (channel_size, num_channels)
+      if min_channel_size is not None and x.shape[0] < min_channel_size:
+        continue
+      x = x.astype(np.float16)
+      yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
+      idx += 1
+
+  ds = Dataset.from_generator(gen)
+  _save_parquet(ds, out_dir)
+  print(f'Saved {dataset_name} parquet dataset to {out_dir}')
+
+
+def _convert_code15(data_dir, out_dir, verbose=False):
+  """Convert CODE-15 using streaming to avoid OOM."""
+  dataset_obj = CODE15(data_dir)
+  num_channels = len(CODE15.channels)
+  max_channel_size = int(CODE15.record_duration * CODE15.sampling_frequency)
+
+  def gen():
+    idx = 0
+    for x in tqdm(dataset_obj.stream_raw_data(), total=len(dataset_obj.record_list),
+                  desc='code-15', disable=not verbose):
+      # Only keep fixed-length records (skip variable)
+      slices = []
+      for channel in range(num_channels):
+        start_idx = np.nonzero(x[:, channel])[0]
+        if len(start_idx) == 0:
+          slices.append((0, 0, 0))
+        else:
+          s, e = start_idx[0], start_idx[-1] + 1
+          slices.append((s, e, e - s))
+      starts, ends, channel_sizes = zip(*slices)
+      start, end = min(starts), max(ends)
+      channel_size = end - start
+      if len(set(channel_sizes)) == 1 and channel_size == max_channel_size:
+        x = x.astype(np.float16)
+        yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
+        idx += 1
+
+  ds = Dataset.from_generator(gen)
+  _save_parquet(ds, out_dir)
+  print(f'Saved code-15 parquet dataset to {out_dir}')
 
 
 def convert_variable_length(dataset_name, data_dir, out_dir, verbose=False):
-  """Convert variable-length ECG datasets (pretrain only, no labels)."""
+  """Convert variable-length ECG datasets using streaming to avoid OOM."""
   dataset_cls = DATASETS[dataset_name]
   record_names = dataset_cls.find_records(data_dir)
-  concat_data, sizes = load_raw_variable_data(record_names, verbose=verbose)
 
-  starts = np.concatenate([[0], np.cumsum(sizes[:-1])])
-  split_data = {
-    'id': [str(i) for i in range(len(sizes))],
-    'data': [concat_data[start:start + size].T.tolist()  # transpose to channels-first
-             for start, size in zip(starts, sizes)],
-    'label': [-1] * len(sizes),
-  }
-  dataset_dict = DatasetDict({'train': Dataset.from_dict(split_data)})
-  dataset_dict.save_to_disk(out_dir)
-  print(f'Saved {dataset_name} HF dataset ({len(sizes)} variable-length samples) to {out_dir}')
+  def gen():
+    for idx, record_name in enumerate(tqdm(record_names, desc=dataset_name, disable=not verbose)):
+      x = wfdb.rdrecord(record_name).p_signal  # (channel_size, num_channels)
+      x = x.astype(np.float16)
+      yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
+
+  ds = Dataset.from_generator(gen)
+  _save_parquet(ds, out_dir)
+  print(f'Saved {dataset_name} parquet dataset to {out_dir}')
 
 
 # Dataset type classification
