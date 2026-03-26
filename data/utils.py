@@ -34,7 +34,7 @@ class VariableTensorDataset(Dataset):
   # NOTE: this class could inherit from the TensorDataset above, BUT then the dataloader becomes very slow
   def __init__(self, data, starts, sizes, labels=None, transform=None):
     assert len(starts) == len(sizes)
-    self.data = data
+    self.data = data  # (num_channels, total_time) channels first
     self.starts = starts
     self.sizes = sizes
     self.labels = labels
@@ -43,7 +43,7 @@ class VariableTensorDataset(Dataset):
   def __getitem__(self, index):
     start = self.starts[index]
     size = self.sizes[index]
-    x = self.data[start:start + size]
+    x = self.data[..., start:start + size]  # (num_channels, channel_size)
     if self.transform is not None:
       if callable(self.transform):
         x = self.transform(x)
@@ -131,7 +131,7 @@ def load_hf_dataset(dataset_path, split='train', dtype=np.float16):
     dtype: numpy dtype for the output array
 
   Returns:
-    data: np.ndarray of shape (N, channel_size, num_channels), channels last
+    data: np.ndarray of shape (N, num_channels, channel_size), channels first
   """
   from datasets import load_from_disk
   ds = load_from_disk(dataset_path)
@@ -151,8 +151,8 @@ def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
     dtype: numpy dtype for the output array
 
   Returns:
-    data: np.ndarray of shape (N, channel_size, num_channels), channels last
-    labels: list of labels (int for single-label, str/list for multi-label)
+    data: np.ndarray of shape (N, num_channels, channel_size), channels first
+    labels: list of labels (int for single-label, list[int] for multi-hot)
   """
   from datasets import load_from_disk
   ds = load_from_disk(dataset_path)
@@ -174,9 +174,9 @@ def load_hf_variable_dataset(dataset_path, split='train', min_channel_size=None,
     dtype: numpy dtype
 
   Returns:
-    data: np.ndarray concatenated data
-    starts: np.ndarray of start indices
-    sizes: np.ndarray of record sizes
+    data: np.ndarray of shape (num_channels, total_time), channels first, concatenated along time axis
+    starts: np.ndarray of start indices along time axis
+    sizes: np.ndarray of record sizes (channel_size per record)
   """
   from datasets import load_from_disk
   ds = load_from_disk(dataset_path)
@@ -185,13 +185,14 @@ def load_hf_variable_dataset(dataset_path, split='train', min_channel_size=None,
   ds = ds[split]
   records = []
   for sample in ds:
-    x = np.array(sample['data'], dtype=dtype)
-    if min_channel_size is not None and len(x) < min_channel_size:
+    x = np.array(sample['data'], dtype=dtype)  # (num_channels, channel_size)
+    channel_size = x.shape[-1]
+    if min_channel_size is not None and channel_size < min_channel_size:
       continue
     records.append(x)
-  sizes = np.array([len(x) for x in records])
+  sizes = np.array([x.shape[-1] for x in records])
   starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
-  data = np.concatenate(records)
+  data = np.concatenate(records, axis=-1)  # (num_channels, total_time)
   return data, starts, sizes
 
 

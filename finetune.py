@@ -1,5 +1,4 @@
 import argparse
-import ast
 import copy
 import dataclasses
 import logging
@@ -21,7 +20,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import configs
 from data import transforms, utils as datautils
 from data.datasets import DATASETS, PTB_XL, Capture24
-from data.utils import TensorDataset, get_channel_order, load_hf_dataset_with_labels
+from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
 from utils.schedules import update_learning_rate_, cosine_schedule
@@ -152,6 +151,7 @@ def main():
 
   # -------------------------------------------------------------------------
   # Unified dataset loading from HuggingFace datasets
+  # Data is stored channels-first: (num_channels, channel_size)
   # -------------------------------------------------------------------------
   if is_main_process:
     logger.debug(f'loading dataset from {data_dir} (type={dataset_type})')
@@ -168,7 +168,19 @@ def main():
     task_name = 'har'
     dataset_cls = Capture24
 
-    # Load train split
+    # Get num_classes from ClassLabel feature
+    label_feature = hf_dataset['train'].features.get('label')
+    if hasattr(label_feature, 'names'):
+      num_classes = len(label_feature.names)
+      if is_main_process:
+        logger.debug(f'ClassLabel names: {label_feature.names}')
+    else:
+      # fallback
+      train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
+      test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
+      num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
+
+    # Load train split: data is (N, num_channels, channel_size)
     train_ds = hf_dataset['train']
     x_train_all = np.array(train_ds['data'], dtype=np.float16)
     train_labels = np.array(train_ds['label'], dtype=np.int64)
@@ -187,23 +199,22 @@ def main():
     val_indices = indices[:num_val]
     train_indices = indices[num_val:]
 
-    num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
     if is_main_process:
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
 
-    # normalize using training statistics
-    mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-    std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
+    mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
+    std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
     transforms.normalize_(x_train_all, mean_std=(mean, std))
     x_train_all.clip(-5, 5, out=x_train_all)
     transforms.normalize_(x_test, mean_std=(mean, std))
     x_test.clip(-5, 5, out=x_test)
 
-    # ensure matching channels
+    # ensure matching channels (channels-first: index along axis 1)
     channel_order = get_channel_order(dataset_cls.channels, encoder_config.channels)
-    x_train_all = x_train_all[:, :, channel_order]
-    x_test = x_test[:, :, channel_order]
+    x_train_all = x_train_all[:, channel_order]
+    x_test = x_test[:, channel_order]
 
     y_train_all = torch.from_numpy(train_labels).long()
     y_test = torch.from_numpy(test_labels).long()
@@ -214,87 +225,82 @@ def main():
 
   else:
     # ECG: multi-label classification (e.g., PTB-XL)
+    # HF dataset stores pre-computed multi-hot labels and label_names
     dataset_cls = PTB_XL
-    ptb_xl_task = args.task
     single_label = False
-    if args.task == 'ST-MEM':
-      ptb_xl_task = 'superdiagnostic'
-      single_label = True
     task_name = args.task
 
-    if 'val' in available_splits:
-      # HF dataset with train/val/test splits (PTB-XL converted format)
-      if is_main_process:
-        logger.debug('loading from HF dataset with train/val/test splits')
+    if args.task == 'ST-MEM':
+      single_label = True
 
-      def _load_ecg_split(split_ds):
-        x = np.array(split_ds['data'], dtype=np.float16)
-        scp_codes_raw = split_ds['label']
-        return x, scp_codes_raw
-
-      x_train_raw, train_scp = _load_ecg_split(hf_dataset['train'])
-      x_val_raw, val_scp = _load_ecg_split(hf_dataset['val'])
-      x_test_raw, test_scp = _load_ecg_split(hf_dataset['test'])
-
-      # Process labels for the specific task
-      import pandas as pd
-      all_scp = list(train_scp) + list(val_scp) + list(test_scp)
-      all_x = np.concatenate([x_train_raw, x_val_raw, x_test_raw])
-      n_train = len(x_train_raw)
-      n_val = len(x_val_raw)
-
-      # Build labels dataframe from scp_codes
-      labels_list = []
-      for scp_str in all_scp:
-        labels_list.append({'scp_codes': ast.literal_eval(scp_str) if isinstance(scp_str, str) else scp_str})
-      labels_df = pd.DataFrame(labels_list)
-      labels_df['strat_fold'] = (
-        [f for f in hf_dataset['train']['strat_fold']] +
-        [f for f in hf_dataset['val']['strat_fold']] +
-        [f for f in hf_dataset['test']['strat_fold']]
-      )
-
-      # Use PTB_XL utilities to compute label aggregations
-      labels_df = PTB_XL.compute_label_aggregations(labels_df, data_dir, ptb_xl_task)
-      all_x, labels_df, y, _ = PTB_XL.select_data(all_x, labels_df, ptb_xl_task, min_samples=0)
-
-      if single_label:
-        single_label_mask = y.sum(axis=1) == 1
-        all_x, labels_df, y = all_x[single_label_mask], labels_df[single_label_mask], y[single_label_mask]
-
-      y = torch.from_numpy(y).float()
-      num_classes = y.shape[1]
-
-      # Re-split using strat_fold
-      val_mask = (labels_df.strat_fold == args.val_fold).to_numpy()
-      test_mask = (labels_df.strat_fold == args.test_fold).to_numpy()
-      train_mask = ~(val_mask | test_mask)
-
-      # Preprocess: resample if needed
-      channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
-      if channel_size != all_x.shape[1]:
-        from multiprocessing import Pool
-        preprocess = PreprocessECG(channel_size=channel_size, remove_baseline_wander=False)
-        with Pool(num_cpus) as pool:
-          all_x_list = pool.map(preprocess, [all_x[i] for i in range(len(all_x))])
-        all_x = np.array(all_x_list)
-
-      # normalize using training statistics
-      mean = np.mean(all_x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
-      std = np.std(all_x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
-      transforms.normalize_(all_x, mean_std=(mean, std))
-      all_x.clip(-5, 5, out=all_x)
-
-      # ensure matching channels
-      channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
-      all_x = all_x[:, :, channel_order]
-
-      x_train, y_train = all_x[train_mask], y[train_mask]
-      x_val, y_val = all_x[val_mask], y[val_mask]
-      x_test, y_test = all_x[test_mask], y[test_mask]
-    else:
+    if 'val' not in available_splits:
       raise ValueError('ECG dataset must have train/val/test splits. '
                        'Use scripts/convert_to_hf_dataset.py to create the proper format.')
+
+    if is_main_process:
+      logger.debug('loading from HF dataset with train/val/test splits')
+
+    # Load all splits: data is (N, num_channels, channel_size), label is multi-hot list
+    def _load_ecg_split(split_ds):
+      x = np.array(split_ds['data'], dtype=np.float16)
+      y = np.array(split_ds['label'], dtype=np.float32)
+      strat_folds = split_ds['strat_fold']
+      return x, y, strat_folds
+
+    x_train_raw, y_train_raw, train_folds = _load_ecg_split(hf_dataset['train'])
+    x_val_raw, y_val_raw, val_folds = _load_ecg_split(hf_dataset['val'])
+    x_test_raw, y_test_raw, test_folds = _load_ecg_split(hf_dataset['test'])
+
+    # Get label_names and num_classes from the dataset
+    label_names = hf_dataset['train'][0]['label_names']
+    num_classes = len(label_names)
+    if is_main_process:
+      logger.debug(f'num_classes={num_classes}, label_names={label_names}')
+
+    # Combine all data for consistent preprocessing
+    all_x = np.concatenate([x_train_raw, x_val_raw, x_test_raw])
+    all_y = np.concatenate([y_train_raw, y_val_raw, y_test_raw])
+    all_folds = list(train_folds) + list(val_folds) + list(test_folds)
+    all_folds = np.array(all_folds)
+
+    n_train = len(x_train_raw)
+    n_val = len(x_val_raw)
+
+    if single_label:
+      single_label_mask = all_y.sum(axis=1) == 1
+      all_x = all_x[single_label_mask]
+      all_y = all_y[single_label_mask]
+      all_folds = all_folds[single_label_mask]
+
+    y = torch.from_numpy(all_y).float()
+
+    # Split using strat_fold
+    val_mask = all_folds == args.val_fold
+    test_mask = all_folds == args.test_fold
+    train_mask = ~(val_mask | test_mask)
+
+    # Preprocess: resample if needed (channels-first: shape is (N, C, T))
+    channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
+    if channel_size != all_x.shape[2]:
+      from multiprocessing import Pool
+      preprocess = PreprocessECG(channel_size=channel_size, remove_baseline_wander=False)
+      with Pool(num_cpus) as pool:
+        all_x_list = pool.map(preprocess, [all_x[i] for i in range(len(all_x))])
+      all_x = np.array(all_x_list)
+
+    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
+    mean = np.mean(all_x[train_mask], axis=(0, 2), keepdims=True, dtype=np.float32)
+    std = np.std(all_x[train_mask], axis=(0, 2), keepdims=True, dtype=np.float32)
+    transforms.normalize_(all_x, mean_std=(mean, std))
+    all_x.clip(-5, 5, out=all_x)
+
+    # ensure matching channels (channels-first: index along axis 1)
+    channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
+    all_x = all_x[:, channel_order]
+
+    x_train, y_train = all_x[train_mask], y[train_mask]
+    x_val, y_val = all_x[val_mask], y[val_mask]
+    x_test, y_test = all_x[test_mask], y[test_mask]
 
   if is_main_process:
     logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
@@ -621,8 +627,8 @@ class PreprocessECG:
     self.channel_size = channel_size
     self.remove_baseline_wander = remove_baseline_wander
 
-  def __call__(self, x):
-    channel_size, num_channels = x.shape
+  def __call__(self, x):  # x: (num_channels, channel_size)
+    num_channels, channel_size = x.shape
     if self.remove_baseline_wander:
       x = transforms.highpass_filter(x, fs=PTB_XL.sampling_frequency)
     if self.channel_size is not None and self.channel_size != channel_size:
@@ -634,10 +640,9 @@ class TrainTransform:
   def __init__(self, crop_size=None):
     self.crop_size = crop_size
 
-  def __call__(self, x):
+  def __call__(self, x):  # x: (num_channels, channel_size)
     if self.crop_size is not None:
       x = transforms.random_crop(x, self.crop_size)
-    x = x.transpose()  # channels first
     x = torch.from_numpy(x).float()
     return x
 
@@ -647,23 +652,20 @@ class EvalTransform:
     self.crop_size = crop_size
     self.crop_stride = crop_stride or crop_size
 
-  def __call__(self, x):
+  def __call__(self, x):  # x: (num_channels, channel_size)
     if self.crop_size is not None:
       x = strided_crops(x, self.crop_size, self.crop_stride)
-      x = np.swapaxes(x, 1, 2)  # channels first
-    else:
-      x = x.transpose()  # channels first
     x = torch.from_numpy(x).float()
     return x
 
 
-def strided_crops(x, size, stride):  # x: (channel_size, num_channels)
-  channel_size, num_channels = x.shape
+def strided_crops(x, size, stride):  # x: (num_channels, channel_size)
+  num_channels, channel_size = x.shape
   crop_starts = range(0, channel_size - size + 1, stride)
   num_crops = len(crop_starts)
-  x_ = np.empty((num_crops, size, num_channels), dtype=x.dtype)
+  x_ = np.empty((num_crops, num_channels, size), dtype=x.dtype)
   for i, start in enumerate(crop_starts):
-    x_[i] = x[start:start + size]
+    x_[i] = x[:, start:start + size]
   return x_
 
 

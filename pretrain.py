@@ -150,8 +150,8 @@ def main():
     dataset_cls = DATASETS[dataset_name]
     resample_ratio = config.sampling_frequency / dataset_cls.sampling_frequency
     channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
-    mean = np.array([dataset_cls.mean], dtype=np.float16)
-    std = np.array([dataset_cls.std], dtype=np.float16)
+    mean = np.array(dataset_cls.mean, dtype=np.float16).reshape(-1, 1)
+    std = np.array(dataset_cls.std, dtype=np.float16).reshape(-1, 1)
     _, ext = path.splitext(dataset_path)
     if path.isdir(dataset_path):
       # HuggingFace dataset directory
@@ -166,12 +166,12 @@ def main():
           resample_ratio=resample_ratio,
           channel_order=channel_order)
         for i in range(len(sizes)):
-          x = data[starts[i]:starts[i] + sizes[i]]
+          x = data[..., starts[i]:starts[i] + sizes[i]]  # (num_channels, channel_size)
           preprocessed.append(preprocess(x))
-        preprocessed = [x for x in preprocessed if len(x) >= config.channel_size]
-        new_sizes = np.array([len(x) for x in preprocessed])
+        preprocessed = [x for x in preprocessed if x.shape[-1] >= config.channel_size]
+        new_sizes = np.array([x.shape[-1] for x in preprocessed])
         new_starts = np.concatenate([np.array([0]), np.cumsum(new_sizes[:-1])])
-        new_data = np.concatenate(preprocessed)
+        new_data = np.concatenate(preprocessed, axis=-1)  # (num_channels, total_time)
         dataset = VariableTensorDataset(
           new_data, new_starts, new_sizes,
           transform=TransformECG(crop_size=config.channel_size))
@@ -193,21 +193,27 @@ def main():
           PreprocessECG(
             mean_std=(mean, std),
             resample_ratio=resample_ratio,
-            channel_order=channel_order),
+            channel_order=channel_order,
+            transpose_input=True),  # legacy .npy is channels-last
           TransformECG(crop_size=config.channel_size),
         ])
     elif ext == '.npz':
+      records = load_variable_data_dump(
+        dump_file=dataset_path,
+        transform=PreprocessECG(
+          mean_std=(mean, std),
+          resample_ratio=resample_ratio,
+          channel_order=channel_order,
+          transpose_input=True),  # legacy .npz is channels-last
+        processes=num_cpus)
+      # filter short records and build concatenated variable-length dataset
+      records = [x for x in records if x.shape[-1] >= config.channel_size]
+      var_sizes = np.array([x.shape[-1] for x in records])
+      var_starts = np.concatenate([np.array([0]), np.cumsum(var_sizes[:-1])])
+      var_data = np.concatenate(records, axis=-1)  # (num_channels, total_time)
       dataset = VariableTensorDataset(
-        *load_variable_data_dump(
-          dump_file=dataset_path,
-          min_channel_size=config.channel_size,
-          transform=PreprocessECG(
-            mean_std=(mean, std),
-            resample_ratio=resample_ratio,
-            channel_order=channel_order),
-          processes=num_cpus),
-        transform=TransformECG(
-          crop_size=config.channel_size))
+        var_data, var_starts, var_sizes,
+        transform=TransformECG(crop_size=config.channel_size))
     else:
       raise ValueError(f'Unsupported dataset format: {dataset_path}')
     datasets[dataset_name] = (dataset, weight)
@@ -390,21 +396,24 @@ def load_variable_data_dump(dump_file, min_channel_size, transform=None, process
 
 
 class PreprocessECG:  # called per sample in dataloader workers
-  def __init__(self, *, mean_std, resample_ratio, channel_order):
+  def __init__(self, *, mean_std, resample_ratio, channel_order, transpose_input=False):
     self.mean, self.std = mean_std
     self.resample_ratio = resample_ratio
     self.channel_order = channel_order
+    self.transpose_input = transpose_input  # for legacy channels-last .npy/.npz data
 
-  def __call__(self, x):
+  def __call__(self, x):  # x: (num_channels, channel_size)
+    if self.transpose_input:
+      x = x.T  # (channel_size, num_channels) -> (num_channels, channel_size)
     x = x.copy()  # mmap slice is read-only; make a writable copy
     transforms.interpolate_NaNs_(x)
     if self.resample_ratio != 1.0:
-      channel_size, num_channels = x.shape
+      num_channels, channel_size = x.shape
       channel_size = int(self.resample_ratio * channel_size)
       x = transforms.resample(x, channel_size)
     transforms.normalize_(x, mean_std=(self.mean, self.std))
     x.clip(-5, 5, out=x)
-    x = x[:, self.channel_order]
+    x = x[self.channel_order]
     return x
 
 
@@ -412,9 +421,8 @@ class TransformECG:  # called whenever dataloader accesses the data
   def __init__(self, crop_size):
     self.crop_size = crop_size
 
-  def __call__(self, x):
+  def __call__(self, x):  # x: (num_channels, channel_size)
     x = transforms.random_crop(x, self.crop_size)
-    x = x.transpose()  # channels first
     x = torch.from_numpy(x).float()
     return x
 
