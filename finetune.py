@@ -35,8 +35,6 @@ TASKS = (
   # custom tasks
   'ST-MEM',  # Na et al. (2024)
 )
-FOLDS = tuple(range(1, 11))
-
 VAL_RATIO = 0.2
 VAL_SEED = 42
 
@@ -51,8 +49,6 @@ parser.add_argument('--dataset-type', choices=['ecg', 'har'], default=None,
                          'Auto-detected from data_dir if not specified.')
 # ECG-specific args (PTB-XL tasks)
 parser.add_argument('--task', choices=TASKS, default='all', help='task type (ECG only)')
-parser.add_argument('--val-fold', choices=FOLDS, type=int, default=9, help='validation fold (ECG with strat_fold only)')
-parser.add_argument('--test-fold', choices=FOLDS, type=int, default=10, help='test fold (ECG with strat_fold only)')
 args = parser.parse_args()
 
 
@@ -226,6 +222,7 @@ def main():
   else:
     # ECG: multi-label classification (e.g., PTB-XL)
     # HF dataset stores pre-computed multi-hot labels and label_names
+    # Splits (train/val/test) are pre-computed during conversion
     dataset_cls = PTB_XL
     single_label = False
     task_name = args.task
@@ -240,16 +237,15 @@ def main():
     if is_main_process:
       logger.debug('loading from HF dataset with train/val/test splits')
 
-    # Load all splits: data is (N, num_channels, channel_size), label is multi-hot list
+    # Load each split directly: data is (N, num_channels, channel_size)
     def _load_ecg_split(split_ds):
       x = np.array(split_ds['data'], dtype=np.float16)
       y = np.array(split_ds['label'], dtype=np.float32)
-      strat_folds = split_ds['strat_fold']
-      return x, y, strat_folds
+      return x, y
 
-    x_train_raw, y_train_raw, train_folds = _load_ecg_split(hf_dataset['train'])
-    x_val_raw, y_val_raw, val_folds = _load_ecg_split(hf_dataset['val'])
-    x_test_raw, y_test_raw, test_folds = _load_ecg_split(hf_dataset['test'])
+    x_train, y_train = _load_ecg_split(hf_dataset['train'])
+    x_val, y_val = _load_ecg_split(hf_dataset['val'])
+    x_test, y_test = _load_ecg_split(hf_dataset['test'])
 
     # Get label_names and num_classes from the dataset
     label_names = hf_dataset['train'][0]['label_names']
@@ -257,50 +253,47 @@ def main():
     if is_main_process:
       logger.debug(f'num_classes={num_classes}, label_names={label_names}')
 
-    # Combine all data for consistent preprocessing
-    all_x = np.concatenate([x_train_raw, x_val_raw, x_test_raw])
-    all_y = np.concatenate([y_train_raw, y_val_raw, y_test_raw])
-    all_folds = list(train_folds) + list(val_folds) + list(test_folds)
-    all_folds = np.array(all_folds)
-
-    n_train = len(x_train_raw)
-    n_val = len(x_val_raw)
-
     if single_label:
-      single_label_mask = all_y.sum(axis=1) == 1
-      all_x = all_x[single_label_mask]
-      all_y = all_y[single_label_mask]
-      all_folds = all_folds[single_label_mask]
-
-    y = torch.from_numpy(all_y).float()
-
-    # Split using strat_fold
-    val_mask = all_folds == args.val_fold
-    test_mask = all_folds == args.test_fold
-    train_mask = ~(val_mask | test_mask)
+      for name, (x_arr, y_arr) in [('train', (x_train, y_train)),
+                                     ('val', (x_val, y_val)),
+                                     ('test', (x_test, y_test))]:
+        mask = y_arr.sum(axis=1) == 1
+        if name == 'train':
+          x_train, y_train = x_arr[mask], y_arr[mask]
+        elif name == 'val':
+          x_val, y_val = x_arr[mask], y_arr[mask]
+        else:
+          x_test, y_test = x_arr[mask], y_arr[mask]
 
     # Preprocess: resample if needed (channels-first: shape is (N, C, T))
     channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
-    if channel_size != all_x.shape[2]:
+    if channel_size != x_train.shape[2]:
       from multiprocessing import Pool
       preprocess = PreprocessECG(channel_size=channel_size, remove_baseline_wander=False)
       with Pool(num_cpus) as pool:
-        all_x_list = pool.map(preprocess, [all_x[i] for i in range(len(all_x))])
-      all_x = np.array(all_x_list)
+        x_train = np.array(pool.map(preprocess, [x_train[i] for i in range(len(x_train))]))
+        x_val = np.array(pool.map(preprocess, [x_val[i] for i in range(len(x_val))]))
+        x_test = np.array(pool.map(preprocess, [x_test[i] for i in range(len(x_test))]))
 
     # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
-    mean = np.mean(all_x[train_mask], axis=(0, 2), keepdims=True, dtype=np.float32)
-    std = np.std(all_x[train_mask], axis=(0, 2), keepdims=True, dtype=np.float32)
-    transforms.normalize_(all_x, mean_std=(mean, std))
-    all_x.clip(-5, 5, out=all_x)
+    mean = np.mean(x_train, axis=(0, 2), keepdims=True, dtype=np.float32)
+    std = np.std(x_train, axis=(0, 2), keepdims=True, dtype=np.float32)
+    transforms.normalize_(x_train, mean_std=(mean, std))
+    x_train.clip(-5, 5, out=x_train)
+    transforms.normalize_(x_val, mean_std=(mean, std))
+    x_val.clip(-5, 5, out=x_val)
+    transforms.normalize_(x_test, mean_std=(mean, std))
+    x_test.clip(-5, 5, out=x_test)
 
     # ensure matching channels (channels-first: index along axis 1)
     channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
-    all_x = all_x[:, channel_order]
+    x_train = x_train[:, channel_order]
+    x_val = x_val[:, channel_order]
+    x_test = x_test[:, channel_order]
 
-    x_train, y_train = all_x[train_mask], y[train_mask]
-    x_val, y_val = all_x[val_mask], y[val_mask]
-    x_test, y_test = all_x[test_mask], y[test_mask]
+    y_train = torch.from_numpy(y_train).float()
+    y_val = torch.from_numpy(y_val).float()
+    y_test = torch.from_numpy(y_test).float()
 
   if is_main_process:
     logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
