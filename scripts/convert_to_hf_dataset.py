@@ -10,10 +10,10 @@ Splits:
   - Capture-24: train, test (from original HF dataset)
   - Other ECG datasets: train only (pretrain-only datasets, no labels)
 
-Usage:
-  python scripts/convert_to_hf_dataset.py --data-dir /path/to/ptb-xl --dataset ptb-xl --out /path/to/output
-  python scripts/convert_to_hf_dataset.py --data-dir /path/to/capture24 --dataset capture-24 --out /path/to/output
-  python scripts/convert_to_hf_dataset.py --data-dir /path/to/mimic-iv-ecg --dataset mimic-iv-ecg --out /path/to/output
+Usage (run from project root):
+  python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --out /path/to/output
+  python -m scripts.convert_to_hf_dataset --data-dir /path/to/capture24 --dataset capture-24 --out /path/to/output
+  python -m scripts.convert_to_hf_dataset --data-dir /path/to/mimic-iv-ecg --dataset mimic-iv-ecg --out /path/to/output
 """
 
 import argparse
