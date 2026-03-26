@@ -9,7 +9,8 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   mimic-iv-ecg:
-    path: /path/to/mimic-iv-ecg.npy
+    path: /path/to/mimic-iv-ecg
+    split: train
     weight: 1.
 # model architecture
 dim: 192

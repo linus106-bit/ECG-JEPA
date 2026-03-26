@@ -10,7 +10,8 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   capture-24:
-    path: /path/to/capture-24_train.npy
+    path: /path/to/capture-24  # HF dataset directory (or .npy file for legacy)
+    split: train
     weight: 1.
 # model architecture
 dim: 384

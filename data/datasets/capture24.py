@@ -38,7 +38,7 @@ class Capture24:
 
   @staticmethod
   def load_labels(data_dir):
-    """Load per-split labels saved by dump_data.py.
+    """Load per-split labels saved by dump_data.py (legacy).
 
     Returns:
       train_labels: np.ndarray of shape (N_train,), dtype int64

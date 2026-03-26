@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import configs
 from data import transforms, utils as datautils
-from data.datasets import PTB_XL, Capture24
+from data.datasets import DATASETS, PTB_XL, Capture24
 from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
@@ -35,24 +35,20 @@ TASKS = (
   # custom tasks
   'ST-MEM',  # Na et al. (2024)
 )
-FOLDS = tuple(range(1, 11))
-
 VAL_RATIO = 0.2
 VAL_SEED = 42
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--data-dir', default=None, help='path to data directory (overrides dataset.data_dir in config)')
+parser.add_argument('--data-dir', default=None, help='path to HF dataset directory (overrides dataset.data_dir in config)')
 parser.add_argument('--encoder', required=True, help='path to checkpoint or config file')
 parser.add_argument('--out', default='eval', help='output directory')
-parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ptbxl, har_linear for capture24)')
-parser.add_argument('--dump', help='path to dump file (.npy) with raw signals (overrides dataset.dump in config)')
+parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ecg, har_linear for har)')
 parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
-parser.add_argument('--dataset', choices=['ptbxl', 'capture24'], default=None,
-                    help='dataset type (auto-detected from data_dir if not specified)')
-# PTB-XL specific args
-parser.add_argument('--task', choices=TASKS, default='all', help='task type (PTB-XL only)')
-parser.add_argument('--val-fold', choices=FOLDS, type=int, default=9, help='validation fold (PTB-XL only)')
-parser.add_argument('--test-fold', choices=FOLDS, type=int, default=10, help='test fold (PTB-XL only)')
+parser.add_argument('--dataset-type', choices=['ecg', 'har'], default=None,
+                    help='dataset type: ecg (multi-label, ROC-AUC) or har (single-label, F1+accuracy). '
+                         'Auto-detected from data_dir if not specified.')
+# ECG-specific args (PTB-XL tasks)
+parser.add_argument('--task', choices=TASKS, default='all', help='task type (ECG only)')
 args = parser.parse_args()
 
 
@@ -100,13 +96,16 @@ def main():
   else:
     raise ValueError('Failed to choose floating-point format.')
 
-  # Auto-detect dataset from data_dir if not explicitly specified
-  dataset = args.dataset
-  if dataset is None:
-    dataset = 'capture24' if 'capture24' in (args.data_dir or '').lower() else 'ptbxl'
-  is_capture24 = (dataset == 'capture24')
+  # Auto-detect dataset type from data_dir if not explicitly specified
+  dataset_type = args.dataset_type
+  if dataset_type is None:
+    data_dir_lower = (args.data_dir or '').lower()
+    if 'capture24' in data_dir_lower or 'capture-24' in data_dir_lower:
+      dataset_type = 'har'
+    else:
+      dataset_type = 'ecg'
 
-  default_config = 'har_linear' if is_capture24 else 'linear'
+  default_config = 'har_linear' if dataset_type == 'har' else 'linear'
   config_name = args.config or default_config
   if not path.isfile(config_name):
     config_file = path.join(path.dirname(configs.eval.__file__), f'{config_name}.yaml')
@@ -147,28 +146,47 @@ def main():
                           if k.startswith('target_encoder.')}
 
   # -------------------------------------------------------------------------
-  # Dataset loading (branched by dataset type)
+  # Unified dataset loading from HuggingFace datasets
+  # Data is stored channels-first: (num_channels, channel_size)
   # -------------------------------------------------------------------------
-  if is_capture24:
-    train_dump = args.dump or dataset_cfg.get('dump') or f'{data_dir}_train.npy'
-    test_dump = f'{data_dir}_test.npy'
-    for f in (train_dump, test_dump):
-      if not path.isfile(f):
-        raise ValueError(f'Failed to find .npy data file: {f}. '
-                         f'Run scripts/dump_data.py to generate split files.')
+  if is_main_process:
+    logger.debug(f'loading dataset from {data_dir} (type={dataset_type})')
 
-    if is_main_process:
-      logger.debug(f'loading labels from {data_dir}')
-    train_labels, test_labels = Capture24.load_labels(data_dir)
+  from datasets import load_dataset
+  hf_dataset = load_dataset(data_dir)
+  available_splits = list(hf_dataset.keys())
+  if is_main_process:
+    logger.debug(f'available splits: {available_splits}')
 
-    if is_main_process:
-      logger.debug(f'loading train data from {train_dump}')
-    x_train_all = np.load(train_dump)
-    if is_main_process:
-      logger.debug(f'loading test data from {test_dump}')
-    x_test = np.load(test_dump)
+  if dataset_type == 'har':
+    # HAR: single-label classification (e.g., Capture24)
+    single_label = True
+    task_name = 'har'
+    dataset_cls = Capture24
 
-    # split train into train/val with a fixed random seed
+    # Get num_classes from ClassLabel feature
+    label_feature = hf_dataset['train'].features.get('label')
+    if hasattr(label_feature, 'names'):
+      num_classes = len(label_feature.names)
+      if is_main_process:
+        logger.debug(f'ClassLabel names: {label_feature.names}')
+    else:
+      # fallback
+      train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
+      test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
+      num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
+
+    # Load train split: data is (N, num_channels, channel_size)
+    train_ds = hf_dataset['train']
+    x_train_all = np.array(train_ds['data'], dtype=np.float16)
+    train_labels = np.array(train_ds['label'], dtype=np.int64)
+
+    # Load test split
+    test_ds = hf_dataset['test']
+    x_test = np.array(test_ds['data'], dtype=np.float16)
+    test_labels = np.array(test_ds['label'], dtype=np.int64)
+
+    # Split train into train/val with a fixed random seed
     rng = np.random.RandomState(VAL_SEED)
     n_train_all = len(x_train_all)
     indices = np.arange(n_train_all)
@@ -177,23 +195,22 @@ def main():
     val_indices = indices[:num_val]
     train_indices = indices[num_val:]
 
-    num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
     if is_main_process:
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
 
-    # normalize using training statistics (apply to both splits)
-    mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-    std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
+    mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
+    std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
     transforms.normalize_(x_train_all, mean_std=(mean, std))
     x_train_all.clip(-5, 5, out=x_train_all)
     transforms.normalize_(x_test, mean_std=(mean, std))
     x_test.clip(-5, 5, out=x_test)
 
-    # ensure matching channels
-    channel_order = get_channel_order(Capture24.channels, encoder_config.channels)
-    x_train_all = x_train_all[:, :, channel_order]
-    x_test = x_test[:, :, channel_order]
+    # ensure matching channels (channels-first: index along axis 1)
+    channel_order = get_channel_order(dataset_cls.channels, encoder_config.channels)
+    x_train_all = x_train_all[:, channel_order]
+    x_test = x_test[:, channel_order]
 
     y_train_all = torch.from_numpy(train_labels).long()
     y_test = torch.from_numpy(test_labels).long()
@@ -202,63 +219,81 @@ def main():
     x_val = x_train_all[val_indices]
     y_val = y_train_all[val_indices]
 
-    task_name = 'har'
-    single_label = True
-
-  else:  # PTB-XL
-    dump_file = args.dump or dataset_cfg.get('dump') or f'{data_dir}.npy'
-    if not path.isfile(dump_file):
-      raise ValueError(f'Failed to find .npy data file. Attempted location: {dump_file}. '
-                       f'Use --dump or dataset.dump in the eval config yaml to specify location.')
-
-    ptb_xl_task = args.task
+  else:
+    # ECG: multi-label classification (e.g., PTB-XL)
+    # HF dataset stores pre-computed multi-hot labels and label_names
+    # Splits (train/val/test) are pre-computed during conversion
+    dataset_cls = PTB_XL
     single_label = False
+    task_name = args.task
+
     if args.task == 'ST-MEM':
-      ptb_xl_task = 'superdiagnostic'
       single_label = True
 
-    if is_main_process:
-      logger.debug(f'setting up labels for task `{args.task}`')
-    labels_df = PTB_XL.load_raw_labels(data_dir)
-    labels_df = PTB_XL.compute_label_aggregations(labels_df, data_dir, ptb_xl_task)
+    if 'val' not in available_splits:
+      raise ValueError('ECG dataset must have train/val/test splits. '
+                       'Use scripts/convert_to_hf_dataset.py to create the proper format.')
 
     if is_main_process:
-      logger.debug(f'loading data from {dump_file}')
-    channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
+      logger.debug('loading from HF dataset with train/val/test splits')
 
-    x = datautils.load_data_dump(
-      dump_file=dump_file,
-      transform=PreprocessECG(
-        channel_size=channel_size,
-        remove_baseline_wander=False),
-      processes=num_cpus)
+    # Load each split directly: data is (N, num_channels, channel_size)
+    def _load_ecg_split(split_ds):
+      x = np.array(split_ds['data'], dtype=np.float16)
+      y = np.array(split_ds['label'], dtype=np.float32)
+      return x, y
 
-    x, labels_df, y, _ = PTB_XL.select_data(x, labels_df, ptb_xl_task, min_samples=0)
+    x_train, y_train = _load_ecg_split(hf_dataset['train'])
+    x_val, y_val = _load_ecg_split(hf_dataset['val'])
+    x_test, y_test = _load_ecg_split(hf_dataset['test'])
+
+    # Get label_names and num_classes from the dataset
+    label_names = hf_dataset['train'][0]['label_names']
+    num_classes = len(label_names)
+    if is_main_process:
+      logger.debug(f'num_classes={num_classes}, label_names={label_names}')
+
     if single_label:
-      single_label_mask = y.sum(axis=1) == 1
-      x, labels_df, y = x[single_label_mask], labels_df[single_label_mask], y[single_label_mask]
-    y = torch.from_numpy(y).float()
-    num_classes = y.shape[1]
+      for name, (x_arr, y_arr) in [('train', (x_train, y_train)),
+                                     ('val', (x_val, y_val)),
+                                     ('test', (x_test, y_test))]:
+        mask = y_arr.sum(axis=1) == 1
+        if name == 'train':
+          x_train, y_train = x_arr[mask], y_arr[mask]
+        elif name == 'val':
+          x_val, y_val = x_arr[mask], y_arr[mask]
+        else:
+          x_test, y_test = x_arr[mask], y_arr[mask]
 
-    val_mask = (labels_df.strat_fold == args.val_fold).to_numpy()
-    test_mask = (labels_df.strat_fold == args.test_fold).to_numpy()
-    train_mask = ~(val_mask | test_mask)
+    # Preprocess: resample if needed (channels-first: shape is (N, C, T))
+    channel_size = PTB_XL.record_duration * encoder_config.sampling_frequency
+    if channel_size != x_train.shape[2]:
+      from multiprocessing import Pool
+      preprocess = PreprocessECG(channel_size=channel_size, remove_baseline_wander=False)
+      with Pool(num_cpus) as pool:
+        x_train = np.array(pool.map(preprocess, [x_train[i] for i in range(len(x_train))]))
+        x_val = np.array(pool.map(preprocess, [x_val[i] for i in range(len(x_val))]))
+        x_test = np.array(pool.map(preprocess, [x_test[i] for i in range(len(x_test))]))
 
-    # normalize data (train stats only; test not normalized separately here)
-    mean = np.mean(x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
-    std = np.std(x[train_mask], axis=(0, 1), keepdims=True, dtype=np.float32)
-    transforms.normalize_(x, mean_std=(mean, std))
-    x.clip(-5, 5, out=x)
+    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
+    mean = np.mean(x_train, axis=(0, 2), keepdims=True, dtype=np.float32)
+    std = np.std(x_train, axis=(0, 2), keepdims=True, dtype=np.float32)
+    transforms.normalize_(x_train, mean_std=(mean, std))
+    x_train.clip(-5, 5, out=x_train)
+    transforms.normalize_(x_val, mean_std=(mean, std))
+    x_val.clip(-5, 5, out=x_val)
+    transforms.normalize_(x_test, mean_std=(mean, std))
+    x_test.clip(-5, 5, out=x_test)
 
-    # ensure matching channels
+    # ensure matching channels (channels-first: index along axis 1)
     channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
-    x = x[:, :, channel_order]
+    x_train = x_train[:, channel_order]
+    x_val = x_val[:, channel_order]
+    x_test = x_test[:, channel_order]
 
-    x_train, y_train = x[train_mask], y[train_mask]
-    x_val, y_val = x[val_mask], y[val_mask]
-    x_test, y_test = x[test_mask], y[test_mask]
-
-    task_name = args.task
+    y_train = torch.from_numpy(y_train).float()
+    y_val = torch.from_numpy(y_val).float()
+    y_test = torch.from_numpy(y_test).float()
 
   if is_main_process:
     logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
@@ -363,7 +398,7 @@ def main():
     model = original_model
 
   # -------------------------------------------------------------------------
-  # Training loop (shared structure, branched on metric)
+  # Training loop (shared structure, branched on single_label for metrics)
   # -------------------------------------------------------------------------
   step_time = AverageMeter()
   train_loss = AverageMeter()
@@ -374,7 +409,7 @@ def main():
   global_step = 0
 
   def _compute_loss(logits, y):
-    if single_label or is_capture24:
+    if single_label:
       return F.cross_entropy(logits, y)
     return F.binary_cross_entropy_with_logits(logits, y)
 
@@ -391,28 +426,25 @@ def main():
         if eval_config.crop_duration is not None:
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
-        if is_capture24:
+        if single_label:
           val_logits_or_preds.append(logits.argmax(dim=1).clone())
         else:
           val_logits_or_preds.append(logits.clone())
         val_targets.append(by.clone())
     model.train()
     targets = torch.cat(val_targets).cpu().numpy()
-    if is_capture24:
+    if single_label:
       preds = torch.cat(val_logits_or_preds).cpu().numpy()
       metric = f1_score(y_true=targets, y_pred=preds, average='macro')
       acc = accuracy_score(y_true=targets, y_pred=preds)
       return preds, targets, metric, acc
     else:
-      if single_label:
-        preds = torch.cat(val_logits_or_preds).softmax(dim=1).cpu().numpy()
-      else:
-        preds = torch.cat(val_logits_or_preds).sigmoid().cpu().numpy()
+      preds = torch.cat(val_logits_or_preds).sigmoid().cpu().numpy()
       metric = roc_auc_score(y_true=targets, y_score=preds, average='macro')
       return preds, targets, metric, None
 
   def _log_val(epoch_or_step, label, preds, targets, metric, acc, new_best):
-    if is_capture24:
+    if single_label:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
                   f'val_f1: {metric:.4f} '
@@ -558,23 +590,20 @@ def main():
         if eval_config.crop_duration is not None:
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
-        if is_capture24:
+        if single_label:
           test_logits_or_preds.append(logits.argmax(dim=1).clone())
         else:
           test_logits_or_preds.append(logits.clone())
         test_targets.append(by.clone())
 
     test_targets = torch.cat(test_targets).cpu().numpy()
-    if is_capture24:
+    if single_label:
       test_predictions = torch.cat(test_logits_or_preds).cpu().numpy()
       test_f1 = f1_score(y_true=test_targets, y_pred=test_predictions, average='macro')
       test_acc = accuracy_score(y_true=test_targets, y_pred=test_predictions)
       logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}')
     else:
-      if single_label:
-        test_predictions = torch.cat(test_logits_or_preds).softmax(dim=1).cpu().numpy()
-      else:
-        test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
+      test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
       logger.info(f'test_auc {test_auc:.4f}')
 
@@ -591,8 +620,8 @@ class PreprocessECG:
     self.channel_size = channel_size
     self.remove_baseline_wander = remove_baseline_wander
 
-  def __call__(self, x):
-    channel_size, num_channels = x.shape
+  def __call__(self, x):  # x: (num_channels, channel_size)
+    num_channels, channel_size = x.shape
     if self.remove_baseline_wander:
       x = transforms.highpass_filter(x, fs=PTB_XL.sampling_frequency)
     if self.channel_size is not None and self.channel_size != channel_size:
@@ -604,10 +633,9 @@ class TrainTransform:
   def __init__(self, crop_size=None):
     self.crop_size = crop_size
 
-  def __call__(self, x):
+  def __call__(self, x):  # x: (num_channels, channel_size)
     if self.crop_size is not None:
       x = transforms.random_crop(x, self.crop_size)
-    x = x.transpose()  # channels first
     x = torch.from_numpy(x).float()
     return x
 
@@ -617,23 +645,20 @@ class EvalTransform:
     self.crop_size = crop_size
     self.crop_stride = crop_stride or crop_size
 
-  def __call__(self, x):
+  def __call__(self, x):  # x: (num_channels, channel_size)
     if self.crop_size is not None:
       x = strided_crops(x, self.crop_size, self.crop_stride)
-      x = np.swapaxes(x, 1, 2)  # channels first
-    else:
-      x = x.transpose()  # channels first
     x = torch.from_numpy(x).float()
     return x
 
 
-def strided_crops(x, size, stride):  # x: (channel_size, num_channels)
-  channel_size, num_channels = x.shape
+def strided_crops(x, size, stride):  # x: (num_channels, channel_size)
+  num_channels, channel_size = x.shape
   crop_starts = range(0, channel_size - size + 1, stride)
   num_crops = len(crop_starts)
-  x_ = np.empty((num_crops, size, num_channels), dtype=x.dtype)
+  x_ = np.empty((num_crops, num_channels, size), dtype=x.dtype)
   for i, start in enumerate(crop_starts):
-    x_[i] = x[start:start + size]
+    x_[i] = x[:, start:start + size]
   return x_
 
 

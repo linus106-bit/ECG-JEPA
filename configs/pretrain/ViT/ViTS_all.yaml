@@ -9,34 +9,47 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   mimic-iv-ecg:
-    path: /path/to/mimic-iv-ecg.npy
+    path: /path/to/mimic-iv-ecg  # HF dataset directory (or .npy/.npz file for legacy)
+    split: train
     weight: 0.7
   code-15:
-    path: /path/to/code-15.npy
+    path: /path/to/code-15
+    split: train
     weight: 0.1
   ptb-xl:
-    path: /path/to/ptb-xl.npy
+    path: /path/to/ptb-xl
+    split: train
     weight: 0.05
   ptb:
-    path: /path/to/ptb.npz
+    path: /path/to/ptb
+    split: train
+    variable_length: true
     weight: 0.01875
   cpsc:
-    path: /path/to/cpsc.npy
+    path: /path/to/cpsc
+    split: train
+    variable_length: true
     weight: 0.025
   cpsc-extra:
-    path: /path/to/cpsc-extra.npy
+    path: /path/to/cpsc-extra
+    split: train
+    variable_length: true
     weight: 0.0125
   georgia:
-    path: /path/to/georgia.npy
+    path: /path/to/georgia
+    split: train
     weight: 0.0375
   ningbo:
-    path: /path/to/ningbo.npy
+    path: /path/to/ningbo
+    split: train
     weight: 0.028125
   chapman-shaoxing:
-    path: /path/to/chapman-shaoxing.npy
+    path: /path/to/chapman-shaoxing
+    split: train
     weight: 0.009375
   st-petersburg:
-    path: /path/to/st-petersburg.npy
+    path: /path/to/st-petersburg
+    split: train
     weight: 0.01875
 # model architecture
 dim: 384

@@ -9,7 +9,8 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   ptb-xl:
-    path: /path/to/ptb-xl.npy
+    path: /path/to/ptb-xl
+    split: train
     weight: 1.
 # model architecture
 dim: 192

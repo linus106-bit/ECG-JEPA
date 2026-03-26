@@ -34,7 +34,7 @@ class VariableTensorDataset(Dataset):
   # NOTE: this class could inherit from the TensorDataset above, BUT then the dataloader becomes very slow
   def __init__(self, data, starts, sizes, labels=None, transform=None):
     assert len(starts) == len(sizes)
-    self.data = data
+    self.data = data  # (num_channels, total_time) channels first
     self.starts = starts
     self.sizes = sizes
     self.labels = labels
@@ -43,7 +43,7 @@ class VariableTensorDataset(Dataset):
   def __getitem__(self, index):
     start = self.starts[index]
     size = self.sizes[index]
-    x = self.data[start:start + size]
+    x = self.data[..., start:start + size]  # (num_channels, channel_size)
     if self.transform is not None:
       if callable(self.transform):
         x = self.transform(x)
@@ -120,6 +120,71 @@ def load_raw_variable_data(record_names, dtype=np.float16, verbose=False):
   sizes = np.array([len(x) for x in data])
   data = np.concatenate(data)
   return data, sizes
+
+
+def load_hf_dataset(dataset_path, split='train', dtype=np.float16):
+  """Load a HuggingFace dataset and return data as a numpy array.
+
+  Args:
+    dataset_path: path to HF dataset directory containing parquet files
+    split: dataset split to load ('train', 'val', 'test')
+    dtype: numpy dtype for the output array
+
+  Returns:
+    data: np.ndarray of shape (N, num_channels, channel_size), channels first
+  """
+  from datasets import load_dataset
+  ds = load_dataset(dataset_path, split=split)
+  data = np.array(ds['data'], dtype=dtype)
+  return data
+
+
+def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
+  """Load a HuggingFace dataset and return data and labels.
+
+  Args:
+    dataset_path: path to HF dataset directory containing parquet files
+    split: dataset split to load ('train', 'val', 'test')
+    dtype: numpy dtype for the output array
+
+  Returns:
+    data: np.ndarray of shape (N, num_channels, channel_size), channels first
+    labels: list of labels (int for single-label, list[int] for multi-hot)
+  """
+  from datasets import load_dataset
+  ds = load_dataset(dataset_path, split=split)
+  data = np.array(ds['data'], dtype=dtype)
+  labels = ds['label']
+  return data, labels
+
+
+def load_hf_variable_dataset(dataset_path, split='train', min_channel_size=None, dtype=np.float16):
+  """Load a HuggingFace dataset with variable-length records.
+
+  Args:
+    dataset_path: path to HF dataset directory containing parquet files
+    split: dataset split to load
+    min_channel_size: minimum channel size to keep (filter shorter records)
+    dtype: numpy dtype
+
+  Returns:
+    data: np.ndarray of shape (num_channels, total_time), channels first, concatenated along time axis
+    starts: np.ndarray of start indices along time axis
+    sizes: np.ndarray of record sizes (channel_size per record)
+  """
+  from datasets import load_dataset
+  ds = load_dataset(dataset_path, split=split)
+  records = []
+  for sample in ds:
+    x = np.array(sample['data'], dtype=dtype)  # (num_channels, channel_size)
+    channel_size = x.shape[-1]
+    if min_channel_size is not None and channel_size < min_channel_size:
+      continue
+    records.append(x)
+  sizes = np.array([x.shape[-1] for x in records])
+  starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
+  data = np.concatenate(records, axis=-1)  # (num_channels, total_time)
+  return data, starts, sizes
 
 
 def load_data_dump(dump_file, transform=None, processes=None, chunk_size=32):
