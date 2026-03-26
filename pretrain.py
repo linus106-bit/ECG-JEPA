@@ -25,7 +25,9 @@ from data.masks import MaskCollator
 from data.utils import (
   TensorDataset,
   VariableTensorDataset,
-  DatasetRouter
+  DatasetRouter,
+  load_hf_dataset,
+  load_hf_variable_dataset,
 )
 from models import JEPA
 from utils.monitoring import (
@@ -134,28 +136,59 @@ def main():
     if dataset_name not in DATASETS:
       raise ValueError(f'Unknown dataset {dataset_name}. '
                        f'Available datasets are {list(DATASETS)}')
-    dump_file = dataset_info['path']
-    if not path.isfile(dump_file):
-      raise ValueError(f'Dataset does not exist: {dump_file}')
-    _, ext = path.splitext(dump_file)
-    if ext not in ('.npy', '.npz'):
-      raise ValueError(f'Unsupported dataset format: {dump_file}')
+    dataset_path = dataset_info['path']
+    if not path.isdir(dataset_path) and not path.isfile(dataset_path):
+      raise ValueError(f'Dataset does not exist: {dataset_path}')
 
   datasets = {}
   for dataset_name, dataset_info in config.datasets.items():
-    dump_file = dataset_info['path']
+    dataset_path = dataset_info['path']
+    split = dataset_info.get('split', 'train')
     weight = dataset_info['weight']
     if is_main_process:
-      logger.debug(f'loading {dataset_name} from {dump_file}')
+      logger.debug(f'loading {dataset_name} from {dataset_path} (split={split})')
     dataset_cls = DATASETS[dataset_name]
     resample_ratio = config.sampling_frequency / dataset_cls.sampling_frequency
     channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
     mean = np.array([dataset_cls.mean], dtype=np.float16)
     std = np.array([dataset_cls.std], dtype=np.float16)
-    _, ext = path.splitext(dump_file)
-    if ext == '.npy':
+    _, ext = path.splitext(dataset_path)
+    if path.isdir(dataset_path):
+      # HuggingFace dataset directory
+      is_variable = dataset_info.get('variable_length', False)
+      if is_variable:
+        data, starts, sizes = load_hf_variable_dataset(
+          dataset_path, split=split, min_channel_size=config.channel_size)
+        # apply preprocessing to variable-length data
+        preprocessed = []
+        preprocess = PreprocessECG(
+          mean_std=(mean, std),
+          resample_ratio=resample_ratio,
+          channel_order=channel_order)
+        for i in range(len(sizes)):
+          x = data[starts[i]:starts[i] + sizes[i]]
+          preprocessed.append(preprocess(x))
+        preprocessed = [x for x in preprocessed if len(x) >= config.channel_size]
+        new_sizes = np.array([len(x) for x in preprocessed])
+        new_starts = np.concatenate([np.array([0]), np.cumsum(new_sizes[:-1])])
+        new_data = np.concatenate(preprocessed)
+        dataset = VariableTensorDataset(
+          new_data, new_starts, new_sizes,
+          transform=TransformECG(crop_size=config.channel_size))
+      else:
+        data = load_hf_dataset(dataset_path, split=split)
+        dataset = TensorDataset(
+          data=data,
+          transform=[
+            PreprocessECG(
+              mean_std=(mean, std),
+              resample_ratio=resample_ratio,
+              channel_order=channel_order),
+            TransformECG(crop_size=config.channel_size),
+          ])
+    elif ext == '.npy':
       dataset = TensorDataset(
-        data=datautils.load_data_dump(dump_file=dump_file),
+        data=datautils.load_data_dump(dump_file=dataset_path),
         transform=[
           PreprocessECG(
             mean_std=(mean, std),
@@ -166,7 +199,7 @@ def main():
     elif ext == '.npz':
       dataset = VariableTensorDataset(
         *load_variable_data_dump(
-          dump_file=dump_file,
+          dump_file=dataset_path,
           min_channel_size=config.channel_size,
           transform=PreprocessECG(
             mean_std=(mean, std),
@@ -176,7 +209,7 @@ def main():
         transform=TransformECG(
           crop_size=config.channel_size))
     else:
-      raise ValueError(f'Unsupported dataset format: {dump_file}')
+      raise ValueError(f'Unsupported dataset format: {dataset_path}')
     datasets[dataset_name] = (dataset, weight)
 
   if is_main_process:

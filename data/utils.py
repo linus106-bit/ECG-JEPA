@@ -122,6 +122,79 @@ def load_raw_variable_data(record_names, dtype=np.float16, verbose=False):
   return data, sizes
 
 
+def load_hf_dataset(dataset_path, split='train', dtype=np.float16):
+  """Load a HuggingFace dataset and return data as a numpy array.
+
+  Args:
+    dataset_path: path to HF dataset directory (saved with save_to_disk)
+    split: dataset split to load ('train', 'val', 'test')
+    dtype: numpy dtype for the output array
+
+  Returns:
+    data: np.ndarray of shape (N, channel_size, num_channels), channels last
+  """
+  from datasets import load_from_disk
+  ds = load_from_disk(dataset_path)
+  if split not in ds:
+    raise ValueError(f'Split "{split}" not found in dataset. Available: {list(ds.keys())}')
+  ds = ds[split]
+  data = np.array(ds['data'], dtype=dtype)
+  return data
+
+
+def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
+  """Load a HuggingFace dataset and return data and labels.
+
+  Args:
+    dataset_path: path to HF dataset directory (saved with save_to_disk)
+    split: dataset split to load ('train', 'val', 'test')
+    dtype: numpy dtype for the output array
+
+  Returns:
+    data: np.ndarray of shape (N, channel_size, num_channels), channels last
+    labels: list of labels (int for single-label, str/list for multi-label)
+  """
+  from datasets import load_from_disk
+  ds = load_from_disk(dataset_path)
+  if split not in ds:
+    raise ValueError(f'Split "{split}" not found in dataset. Available: {list(ds.keys())}')
+  ds = ds[split]
+  data = np.array(ds['data'], dtype=dtype)
+  labels = ds['label']
+  return data, labels
+
+
+def load_hf_variable_dataset(dataset_path, split='train', min_channel_size=None, dtype=np.float16):
+  """Load a HuggingFace dataset with variable-length records.
+
+  Args:
+    dataset_path: path to HF dataset directory
+    split: dataset split to load
+    min_channel_size: minimum channel size to keep (filter shorter records)
+    dtype: numpy dtype
+
+  Returns:
+    data: np.ndarray concatenated data
+    starts: np.ndarray of start indices
+    sizes: np.ndarray of record sizes
+  """
+  from datasets import load_from_disk
+  ds = load_from_disk(dataset_path)
+  if split not in ds:
+    raise ValueError(f'Split "{split}" not found in dataset. Available: {list(ds.keys())}')
+  ds = ds[split]
+  records = []
+  for sample in ds:
+    x = np.array(sample['data'], dtype=dtype)
+    if min_channel_size is not None and len(x) < min_channel_size:
+      continue
+    records.append(x)
+  sizes = np.array([len(x) for x in records])
+  starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
+  data = np.concatenate(records)
+  return data, starts, sizes
+
+
 def load_data_dump(dump_file, transform=None, processes=None, chunk_size=32):
   """Loads data into memory and optionally preprocesses it.
   If no transform is given, returns a memory-mapped array (instant, low RAM)."""

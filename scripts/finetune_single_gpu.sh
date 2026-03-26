@@ -33,11 +33,13 @@ TEST_FOLD=10
 # 정밀도: float32 | bfloat16
 AMP="bfloat16"
 
-# 데이터 경로 (비워두면 yaml의 dataset.data_dir / dataset.dump 사용)
-#   방법 A (권장): configs/eval/<CONFIG>.yaml 의 dataset.data_dir / dataset.dump 에서 지정
+# dataset type: ecg | har
+DATASET_TYPE="ecg"
+
+# 데이터 경로 (HF dataset 디렉토리 경로)
+#   방법 A (권장): configs/eval/<CONFIG>.yaml 의 dataset.data_dir 에서 지정
 #   방법 B: 아래 변수를 직접 채우면 yaml 설정을 덮어씀
 DATA_DIR=""
-DUMP=""
 
 # =============================================================================
 # 이 아래는 수정하지 않아도 됩니다
@@ -50,17 +52,17 @@ mkdir -p "${OUT_DIR}"
 
 CMD=(
   python finetune.py
-  --encoder   "${ENCODER}"
-  --config    "${CONFIG}"
-  --out       "${OUT_DIR}"
-  --task      "${TASK}"
-  --val-fold  "${VAL_FOLD}"
-  --test-fold "${TEST_FOLD}"
-  --amp       "${AMP}"
+  --encoder      "${ENCODER}"
+  --config       "${CONFIG}"
+  --out          "${OUT_DIR}"
+  --dataset-type "${DATASET_TYPE}"
+  --task         "${TASK}"
+  --val-fold     "${VAL_FOLD}"
+  --test-fold    "${TEST_FOLD}"
+  --amp          "${AMP}"
 )
 
 [[ -n "${DATA_DIR}" ]] && CMD+=(--data-dir "${DATA_DIR}")
-[[ -n "${DUMP}" ]] && CMD+=(--dump "${DUMP}")
 
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 LOG_FILE="${OUT_DIR}/train_${TIMESTAMP}.log"
