@@ -1,4 +1,16 @@
 # Linear evaluation config for Capture-24 HAR
+# run (execution settings — previously in the shell script)
+run:
+  out_dir: finetune/har_linear
+  amp: bfloat16
+  encoder: pretrain/ViTS_capture24/checkpoint.pt  # path to pretrain checkpoint
+  task: har
+  dataset_type: har
+
+# dataset path (set data_dir to your dataset location)
+# dataset:
+#   data_dir: /path/to/capture-24
+
 # data
 crop_duration: null
 crop_stride: null

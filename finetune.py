@@ -40,19 +40,51 @@ VAL_SEED = 42
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data-dir', default=None, help='path to HF dataset directory (overrides dataset.data_dir in config)')
-parser.add_argument('--encoder', required=True, help='path to checkpoint or config file')
-parser.add_argument('--out', default='eval', help='output directory')
+parser.add_argument('--encoder', default=None, help='path to checkpoint or config file (default: run.encoder in config yaml)')
+parser.add_argument('--out', default=None, help='output directory (default: run.out_dir in config yaml)')
 parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ecg, har_linear for har)')
-parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
+parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
 parser.add_argument('--dataset-type', choices=['ecg', 'har'], default=None,
                     help='dataset type: ecg (multi-label, ROC-AUC) or har (single-label, F1+accuracy). '
                          'Auto-detected from data_dir if not specified.')
 # ECG-specific args (PTB-XL tasks)
-parser.add_argument('--task', choices=TASKS, default='all', help='task type (ECG only)')
+parser.add_argument('--task', choices=TASKS, default=None, help='task type (ECG only, default: run.task in config yaml)')
 args = parser.parse_args()
 
 
 def main():
+  # Early config resolution: load run: section from YAML before distributed setup
+  # so that args.out, args.amp, args.encoder, etc. are available when needed
+  _config_name = args.config or 'linear'
+  if not path.isfile(_config_name):
+    _config_file = path.join(path.dirname(configs.eval.__file__), f'{_config_name}.yaml')
+    if path.isfile(_config_file):
+      if args.config is not None:
+        args.config = _config_file  # persist resolved path only if user specified config
+      _config_name = _config_file
+  if path.isfile(_config_name):
+    _early_dict = configs.load_config_file(_config_name)
+    _run = _early_dict.pop('run', {})
+    if args.encoder is None:
+      args.encoder = _run.get('encoder')
+    if args.out is None:
+      args.out = _run.get('out_dir', 'eval')
+    if args.amp is None:
+      args.amp = _run.get('amp', 'float32')
+    if args.dataset_type is None:
+      args.dataset_type = _run.get('dataset_type')
+    if args.task is None:
+      args.task = _run.get('task', 'all')
+  else:
+    if args.out is None:
+      args.out = 'eval'
+    if args.amp is None:
+      args.amp = 'float32'
+    if args.task is None:
+      args.task = 'all'
+  if not args.encoder:
+    raise ValueError('encoder must be specified via --encoder or run.encoder in the eval config yaml')
+
   # Setup distributed training
   local_rank = int(os.environ.get('LOCAL_RANK', 0))
   rank = int(os.environ.get('RANK', 0))
