@@ -1,6 +1,5 @@
 # run (execution settings — previously in the shell script)
 run:
-  num_gpus: 8
   out_dir: finetune/finetune_after_linear
   amp: bfloat16
   encoder: pretrain/ViTS_ptbxl/checkpoint.pt  # path to pretrain checkpoint

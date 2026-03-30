@@ -1,7 +1,6 @@
 # learnable encoder parameters: 14,277,888
 # run (execution settings — previously in the shell script)
 run:
-  num_gpus: 8
   out_dir: pretrain/ViTS_mimic
   amp: bfloat16
   compile: false

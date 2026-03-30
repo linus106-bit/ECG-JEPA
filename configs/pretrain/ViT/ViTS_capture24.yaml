@@ -2,7 +2,6 @@
 # learnable encoder parameters: ~14M (same architecture as ViTS_ptbxl)
 # run (execution settings — previously in the shell script)
 run:
-  num_gpus: 8
   out_dir: pretrain/ViTS_capture24
   amp: bfloat16
   compile: false
