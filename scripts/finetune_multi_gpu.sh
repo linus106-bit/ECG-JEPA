@@ -4,78 +4,39 @@ set -euo pipefail
 # =============================================================================
 # ECG-JEPA Finetune — Multi GPU (torchrun, single node)
 # =============================================================================
-
-# -----------------------------------------------------------------------------
-# 설정 (자주 수정하는 항목)
-# -----------------------------------------------------------------------------
-
-# eval config 이름 (configs/eval/ 참고)
+# Usage: bash scripts/finetune_multi_gpu.sh [CONFIG]
+#
+# All settings (num_gpus, out_dir, amp, encoder, task, dataset_type) are read
+# from the run: section of the config YAML. Edit the YAML instead of this script.
+#
+# CONFIG: eval config name (configs/eval/ 참고)
 #   linear                → linear probing (인코더 고정)
 #   finetune              → end-to-end fine-tuning
 #   finetune_after_linear → linear 학습 후 fine-tuning
-CONFIG="finetune"
-
-# 사용할 GPU 수 (서버의 실제 GPU 수 이하로 설정)
-NUM_GPUS=8
-
-# 사용할 GPU ID 지정 (전체 사용 시 주석 처리)
-# export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
-# pretrain 체크포인트 경로 또는 pretrain config yaml 경로 (필수)
-ENCODER="pretrain/ViTS_ptbxl/checkpoint.pt"
-
-# 출력 디렉토리 (체크포인트 및 예측 결과 저장 위치)
-OUT_DIR="finetune/${CONFIG}"
-
-# 평가 task: all | diagnostic | subdiagnostic | superdiagnostic | form | rhythm | ST-MEM
-TASK="all"
-
-# validation fold (1-10)
-VAL_FOLD=9
-
-# test fold (1-10)
-TEST_FOLD=10
-
-# 정밀도: float32 | bfloat16
-AMP="bfloat16"
-
-# dataset type: ecg | har
-DATASET_TYPE="ecg"
-
-# 데이터 경로 (HF dataset 디렉토리 경로)
-#   방법 A (권장): configs/eval/<CONFIG>.yaml 의 dataset.data_dir 에서 지정
-#   방법 B: 아래 변수를 직접 채우면 yaml 설정을 덮어씀
-DATA_DIR=""
-
+#   har_linear            → HAR linear evaluation
 # =============================================================================
-# 이 아래는 수정하지 않아도 됩니다
-# =============================================================================
+
+CONFIG="${1:-finetune}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}/.."
 
+# Read num_gpus and out_dir from YAML run: section
+_YAML="configs/eval/${CONFIG}.yaml"
+if [[ ! -f "${_YAML}" ]]; then
+  echo "Error: config file not found: ${_YAML}" >&2
+  exit 1
+fi
+NUM_GPUS=$(python -c "import yaml; d=yaml.safe_load(open('${_YAML}')); print(d.get('run',{}).get('num_gpus',8))")
+OUT_DIR=$(python -c "import yaml; d=yaml.safe_load(open('${_YAML}')); print(d.get('run',{}).get('out_dir','finetune/${CONFIG}'))")
+
 mkdir -p "${OUT_DIR}"
-
-CMD=(
-  torchrun
-    --standalone
-    --nproc_per_node="${NUM_GPUS}"
-  finetune.py
-  --encoder      "${ENCODER}"
-  --config       "${CONFIG}"
-  --out          "${OUT_DIR}"
-  --dataset-type "${DATASET_TYPE}"
-  --task         "${TASK}"
-  --val-fold     "${VAL_FOLD}"
-  --test-fold    "${TEST_FOLD}"
-  --amp          "${AMP}"
-)
-
-[[ -n "${DATA_DIR}" ]] && CMD+=(--data-dir "${DATA_DIR}")
-
 TIMESTAMP="$(date '+%Y%m%d_%H%M%S')"
 LOG_FILE="${OUT_DIR}/train_${TIMESTAMP}.log"
 echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
-echo "Command: ${CMD[*]}"
+echo "Config:     ${_YAML}"
 echo "Logging to: ${LOG_FILE}"
-{ echo "=== Started at: $(date '+%Y-%m-%d %H:%M:%S') ==="; "${CMD[@]}"; } 2>&1 | tee "${LOG_FILE}"
+{
+  echo "=== Started at: $(date '+%Y-%m-%d %H:%M:%S') ==="
+  torchrun --standalone --nproc_per_node="${NUM_GPUS}" finetune.py --config "${CONFIG}"
+} 2>&1 | tee "${LOG_FILE}"

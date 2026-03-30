@@ -43,11 +43,11 @@ from utils.schedules import (
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--out', default='pretrain', help='output directory')
+parser.add_argument('--out', default=None, help='output directory (default: run.out_dir in config yaml)')
 parser.add_argument('--config', default='ViTS_mimic', help='path to config file or config name')
-parser.add_argument('--chkpt', help='resume training from model checkpoint')
-parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
-parser.add_argument('--compile', action='store_true', help='compile model')
+parser.add_argument('--chkpt', default=None, help='resume training from model checkpoint (default: run.checkpoint in config yaml)')
+parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
+parser.add_argument('--compile', action='store_true', help='compile model (or set run.compile: true in config yaml)')
 args = parser.parse_args()
 
 # NOTE: we update means and standard deviations of some datasets
@@ -69,6 +69,22 @@ PTB_XL.std = [0.191, 0.166, 0.173, 0.142, 0.149, 0.147,
 
 
 def main():
+  # Resolve config file and extract run: section early (needed before distributed setup)
+  if not path.isfile(args.config):
+    config_file = path.join(path.dirname(configs.pretrain.__file__), f'{args.config}.yaml')
+    if not path.isfile(config_file):
+      raise ValueError(f'Failed to read configuration file {args.config}')
+    args.config = config_file
+  yaml_dict = configs.load_config_file(args.config)
+  run_config = yaml_dict.pop('run', {})
+  if args.out is None:
+    args.out = run_config.get('out_dir', 'pretrain')
+  if args.amp is None:
+    args.amp = run_config.get('amp', 'float32')
+  args.compile = args.compile or run_config.get('compile', False)
+  if args.chkpt is None and run_config.get('checkpoint'):
+    args.chkpt = run_config['checkpoint']
+
   # Setup distributed training
   local_rank = int(os.environ.get('LOCAL_RANK', 0))
   rank = int(os.environ.get('RANK', 0))
@@ -118,18 +134,10 @@ def main():
     chkpt = torch.load(args.chkpt, map_location=device)
     config = configs.pretrain.Config(**chkpt['config'])
   else:
-    # read config file
-    if not path.isfile(args.config):
-      # maybe config is the name of a default config file in configs/pretrain/
-      config_file = path.join(path.dirname(configs.pretrain.__file__),  f'{args.config}.yaml')
-      if not path.isfile(config_file):
-        raise ValueError(f'Failed to read configuration file {args.config}')
-      args.config = config_file
-    config_dict = configs.load_config_file(args.config)
-    config = configs.pretrain.Config(**config_dict)
+    config = configs.pretrain.Config(**yaml_dict)
     if is_main_process:
       logger.debug(f'loading configuration file from {args.config}:\n'
-                   f'{pprint.pformat(config_dict, compact=True, sort_dicts=False, width=120)}')
+                   f'{pprint.pformat(yaml_dict, compact=True, sort_dicts=False, width=120)}')
     chkpt = None
 
   for dataset_name, dataset_info in config.datasets.items():

@@ -1,4 +1,11 @@
 # learnable encoder parameters: 14,277,888
+# run (execution settings — previously in the shell script)
+run:
+  num_gpus: 8
+  out_dir: pretrain/ViTS_all
+  amp: bfloat16
+  compile: false
+  checkpoint: null  # set to a checkpoint path to resume training
 # data
 sampling_frequency: 500
 channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
