@@ -12,6 +12,11 @@ datasets:
     path: /path/to/mimic-iv-ecg  # HF dataset directory (or .npy file for legacy)
     split: train
     weight: 1.
+preprocess_mode: online  # online | offline_cached
+dataloader_num_workers: 8  # default 8 (set null for auto: cpus/world_size)
+dataloader_prefetch_factor: 4
+dataloader_persistent_workers: True
+prefetch_queue_size: 16
 # model architecture
 dim: 384
 depth: 8
