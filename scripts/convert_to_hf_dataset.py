@@ -36,6 +36,7 @@ import wfdb
 from datasets import ClassLabel, Dataset, Features, Sequence, Value
 from tqdm import tqdm
 
+from data import transforms
 from data.datasets import DATASETS
 from data.datasets.code_15 import CODE15
 from data.datasets.ptb_xl import PTB_XL
@@ -59,8 +60,35 @@ parser.add_argument('--task', choices=TASKS, default='all',
                     help='label task for PTB-XL (default: all). Ignored for non-PTB-XL datasets.')
 parser.add_argument('--shard-size', type=int, default=DEFAULT_SHARD_SIZE,
                     help=f'max records per parquet shard (default: {DEFAULT_SHARD_SIZE})')
+parser.add_argument('--normalize', action='store_true',
+                    help='apply pretrain-style normalization: NaN interpolation → per-channel '
+                         'normalize (using dataset mean/std) → clip to [-5, 5]. '
+                         'Output dtype becomes float32 instead of float16.')
 parser.add_argument('--verbose', action='store_true', help='verbose mode')
 args = parser.parse_args()
+
+
+def _normalize_ecg(x, dataset_cls):
+  """Apply pretrain-style normalization to a single ECG record.
+
+  Mirrors the PreprocessECG logic in pretrain.py (minus resampling and channel reordering):
+    1. NaN interpolation
+    2. Per-channel z-score normalization using dataset_cls.mean / .std
+    3. Clip to [-5, 5]
+
+  Args:
+    x: np.ndarray of shape (num_channels, channel_size), channels-first
+    dataset_cls: dataset class with .mean and .std class attributes
+  Returns:
+    float32 np.ndarray of the same shape
+  """
+  x = x.astype(np.float32)
+  transforms.interpolate_NaNs_(x)
+  mean = np.array(dataset_cls.mean, dtype=np.float32).reshape(-1, 1)
+  std = np.array(dataset_cls.std, dtype=np.float32).reshape(-1, 1)
+  transforms.normalize_(x, mean_std=(mean, std))
+  x.clip(-5, 5, out=x)
+  return x
 
 
 def _flush_shard(batch, out_path, features=None):
@@ -113,7 +141,8 @@ def _save_dataset_sharded(dataset, out_dir, split='train', shard_size=DEFAULT_SH
   print(f'  {split}/: {len(dataset)} samples in {num_shards} shard(s)')
 
 
-def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE, verbose=False,
+                   normalize=False):
   """Convert PTB-XL to sharded parquet with train/val/test splits and multi-hot labels."""
   from data.utils import load_raw_data
 
@@ -138,9 +167,13 @@ def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE,
   for split_name, fold_values in [('train', range(1, 9)), ('val', [9]), ('test', [10])]:
     fold_set = set(fold_values)
     indices = [i for i, fold in enumerate(strat_folds) if fold in fold_set]
+    if normalize:
+      data_list = [_normalize_ecg(all_x[i].T, PTB_XL).tolist() for i in indices]
+    else:
+      data_list = [all_x[i].T.tolist() for i in indices]
     split_data = {
       'id': [str(ecg_ids[i]) for i in indices],
-      'data': [all_x[i].T.tolist() for i in indices],
+      'data': data_list,
       'label': [y_multihot[i].tolist() for i in indices],
       'label_names': [label_names for _ in indices],
       'strat_fold': [strat_folds[i] for i in indices],
@@ -158,7 +191,8 @@ def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE,
   print(f'Saved PTB-XL sharded parquet to {out_dir}')
 
 
-def convert_capture24(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+def convert_capture24(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False,
+                      normalize=False):
   """Convert Capture-24 to sharded parquet with train/test splits and ClassLabel."""
   from datasets import load_dataset
   from data.datasets.capture24 import Capture24
@@ -188,9 +222,13 @@ def convert_capture24(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=
   for split_name in ('train', 'test'):
     mask = split_names == split_name
     indices = np.where(mask)[0]
+    if normalize:
+      data_list = [_normalize_ecg(all_data[i].T, Capture24).tolist() for i in indices]
+    else:
+      data_list = [all_data[i].T.tolist() for i in indices]
     split_data = {
       'id': [str(i) for i in indices],
-      'data': [all_data[i].T.tolist() for i in indices],
+      'data': data_list,
       'label': [int(labels[i]) for i in indices],
     }
     ds = Dataset.from_dict(split_data, features=features)
@@ -199,12 +237,13 @@ def convert_capture24(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=
   print(f'Saved Capture-24 sharded parquet to {out_dir}')
 
 
-def convert_fixed_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+def convert_fixed_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE,
+                         verbose=False, normalize=False):
   """Convert fixed-length ECG datasets with streaming + sharding to avoid OOM."""
   dataset_cls = DATASETS[dataset_name]
 
   if dataset_name == 'code-15':
-    _convert_code15(data_dir, out_dir, shard_size, verbose)
+    _convert_code15(data_dir, out_dir, shard_size, verbose, normalize=normalize)
     return
 
   record_names = dataset_cls.find_records(data_dir)
@@ -218,8 +257,11 @@ def convert_fixed_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHA
       x = wfdb.rdrecord(record_name).p_signal  # (channel_size, num_channels)
       if min_channel_size is not None and x.shape[0] < min_channel_size:
         continue
-      x = x.astype(np.float16)
-      yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
+      if normalize:
+        x_cf = _normalize_ecg(x.T, dataset_cls)
+      else:
+        x_cf = x.T.astype(np.float16)
+      yield {'id': str(idx), 'data': x_cf.tolist(), 'label': -1}
       idx += 1
 
   os.makedirs(out_dir, exist_ok=True)
@@ -227,7 +269,8 @@ def convert_fixed_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHA
   print(f'Saved {dataset_name} sharded parquet to {out_dir}')
 
 
-def _convert_code15(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+def _convert_code15(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False,
+                    normalize=False):
   """Convert CODE-15 with streaming + sharding to avoid OOM."""
   dataset_obj = CODE15(data_dir)
   num_channels = len(CODE15.channels)
@@ -249,8 +292,11 @@ def _convert_code15(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=Fa
       start, end = min(starts), max(ends)
       channel_size = end - start
       if len(set(channel_sizes)) == 1 and channel_size == max_channel_size:
-        x = x.astype(np.float16)
-        yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
+        if normalize:
+          x_cf = _normalize_ecg(x.T, CODE15)
+        else:
+          x_cf = x.astype(np.float16).T
+        yield {'id': str(idx), 'data': x_cf.tolist(), 'label': -1}
         idx += 1
 
   os.makedirs(out_dir, exist_ok=True)
@@ -258,7 +304,8 @@ def _convert_code15(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=Fa
   print(f'Saved code-15 sharded parquet to {out_dir}')
 
 
-def convert_variable_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False):
+def convert_variable_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE,
+                            verbose=False, normalize=False):
   """Convert variable-length ECG datasets with streaming + sharding to avoid OOM."""
   dataset_cls = DATASETS[dataset_name]
   record_names = dataset_cls.find_records(data_dir)
@@ -266,8 +313,11 @@ def convert_variable_length(dataset_name, data_dir, out_dir, shard_size=DEFAULT_
   def gen():
     for idx, record_name in enumerate(tqdm(record_names, desc=dataset_name, disable=not verbose)):
       x = wfdb.rdrecord(record_name).p_signal  # (channel_size, num_channels)
-      x = x.astype(np.float16)
-      yield {'id': str(idx), 'data': x.T.tolist(), 'label': -1}
+      if normalize:
+        x_cf = _normalize_ecg(x.T, dataset_cls)
+      else:
+        x_cf = x.T.astype(np.float16)
+      yield {'id': str(idx), 'data': x_cf.tolist(), 'label': -1}
 
   os.makedirs(out_dir, exist_ok=True)
   _save_sharded(gen(), out_dir, split='train', shard_size=shard_size)
@@ -284,12 +334,16 @@ VARIABLE_LENGTH_DATASETS = {'cpsc', 'cpsc-extra', 'ptb'}
 print(f'Converting {args.dataset} from {args.data_dir}')
 
 if args.dataset == 'ptb-xl':
-  convert_ptb_xl(args.data_dir, args.out, task=args.task, shard_size=args.shard_size, verbose=args.verbose)
+  convert_ptb_xl(args.data_dir, args.out, task=args.task, shard_size=args.shard_size,
+                 verbose=args.verbose, normalize=args.normalize)
 elif args.dataset == 'capture-24':
-  convert_capture24(args.data_dir, args.out, shard_size=args.shard_size, verbose=args.verbose)
+  convert_capture24(args.data_dir, args.out, shard_size=args.shard_size,
+                    verbose=args.verbose, normalize=args.normalize)
 elif args.dataset in FIXED_LENGTH_DATASETS:
-  convert_fixed_length(args.dataset, args.data_dir, args.out, shard_size=args.shard_size, verbose=args.verbose)
+  convert_fixed_length(args.dataset, args.data_dir, args.out, shard_size=args.shard_size,
+                       verbose=args.verbose, normalize=args.normalize)
 elif args.dataset in VARIABLE_LENGTH_DATASETS:
-  convert_variable_length(args.dataset, args.data_dir, args.out, shard_size=args.shard_size, verbose=args.verbose)
+  convert_variable_length(args.dataset, args.data_dir, args.out, shard_size=args.shard_size,
+                          verbose=args.verbose, normalize=args.normalize)
 else:
   raise ValueError(f'Unknown dataset type: {args.dataset}')
