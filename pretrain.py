@@ -234,7 +234,9 @@ def main():
 
   # With DDP, divide global batch size across all ranks
   local_batch_size = config.batch_size // world_size
-  num_workers = max(1, num_cpus // world_size)
+  # Cap dataloader workers so single-GPU runs on high-core-count hosts
+  # do not exhaust file descriptors while keeping good throughput.
+  num_workers = min(8, max(1, num_cpus // world_size))
 
   def worker_init_fn(worker_id):
     np.random.seed(rank * num_workers + worker_id)
@@ -250,7 +252,8 @@ def main():
       max_keep_ratio=config.max_keep_ratio,
       strategy=config.masking_strategy),
     num_workers=num_workers,
-    worker_init_fn=worker_init_fn)
+    worker_init_fn=worker_init_fn,
+    persistent_workers=(num_workers > 0))
 
   def map_to_device(data_iterator, device=None):
     for batch in data_iterator:

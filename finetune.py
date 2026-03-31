@@ -360,7 +360,10 @@ def main():
     crop_stride = None
 
   local_batch_size = eval_config.batch_size // world_size
-  num_workers = max(1, num_cpus // world_size)
+  # Cap dataloader workers to avoid exhausting file descriptors on hosts
+  # with very high CPU counts (e.g. single-GPU jobs on large machines).
+  num_workers = min(8, max(1, num_cpus // world_size))
+  eval_num_workers = min(2, num_workers)
 
   train_dataset = TensorDataset(
     data=x_train,
@@ -377,7 +380,8 @@ def main():
     sampler=train_sampler,
     shuffle=(train_sampler is None),
     drop_last=(train_sampler is None),
-    num_workers=num_workers)
+    num_workers=num_workers,
+    persistent_workers=(num_workers > 0))
 
   val_loader = DataLoader(
     dataset=TensorDataset(
@@ -387,7 +391,7 @@ def main():
         crop_size=crop_size,
         crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
-    num_workers=num_workers)
+    num_workers=eval_num_workers)
   test_loader = DataLoader(
     dataset=TensorDataset(
       data=x_test,
@@ -396,7 +400,7 @@ def main():
         crop_size=crop_size,
         crop_stride=crop_stride)),
     batch_size=eval_config.batch_size,
-    num_workers=num_workers)
+    num_workers=eval_num_workers)
 
   steps_per_epoch = len(train_loader) if eval_config.epochs > 0 else None
   total_steps = eval_config.epochs * steps_per_epoch if eval_config.epochs > 0 else eval_config.steps
