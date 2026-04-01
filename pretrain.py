@@ -4,9 +4,12 @@ import logging.config
 import os
 import pprint
 from contextlib import nullcontext
+from datetime import datetime
 from os import path, makedirs
 from pathlib import Path
 from time import time
+
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -97,9 +100,17 @@ def main():
   if is_main_process:
     makedirs(args.out, exist_ok=True)
     logging.config.fileConfig('logging.ini')
+    _timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _log_file_path = path.join(args.out, f'train_{_timestamp}.log')
+    _file_handler = logging.FileHandler(_log_file_path)
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(module)s:%(lineno)s => %(message)s'))
+    logging.getLogger('app').addHandler(_file_handler)
   logger = logging.getLogger('app')
   if not is_main_process:
     logger.setLevel(logging.CRITICAL)
+  else:
+    logger.info(f'logging to {_log_file_path}')
 
   device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
   using_cuda = device.type == 'cuda'
@@ -320,6 +331,11 @@ def main():
 
   step_time = AverageMeter()
   train_loss = AverageMeter()
+  train_start_time = time()
+  last_loss = None
+  last_lr = None
+  pbar = tqdm(total=total_steps, initial=start_step, desc='Training',
+              unit='step', disable=not is_main_process)
 
   def _train_step(train_iterator):
     step_start = time()
@@ -353,10 +369,16 @@ def main():
         global_step += 1
         if is_main_process:
           current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+          current_lr = optimizer.param_groups[0]['lr']
+          last_loss = train_loss.value
+          last_lr = current_lr
           logger.info(f'step: {global_step} '
                       f'epoch: {current_epoch:.4f} '
                       f'train_loss: {train_loss.value:.4f} '
+                      f'lr: {current_lr:.6e} '
                       f'step_time: {step_time.value:.4f}')
+          pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+          pbar.update(1)
           step_time = AverageMeter()
           train_loss = AverageMeter()
         if is_main_process and global_step % config.checkpoint_interval == 0:
@@ -376,10 +398,16 @@ def main():
       _train_step(train_iterator)
       if is_main_process:
         current_epoch = (step + 1) * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+        current_lr = optimizer.param_groups[0]['lr']
+        last_loss = train_loss.value
+        last_lr = current_lr
         logger.info(f'step: {step + 1} '
                     f'epoch: {current_epoch:.4f} '
                     f'train_loss: {train_loss.value:.4f} '
+                    f'lr: {current_lr:.6e} '
                     f'step_time: {step_time.value:.4f}')
+        pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+        pbar.update(1)
         step_time = AverageMeter()
         train_loss = AverageMeter()
       if is_main_process and (step + 1) % config.checkpoint_interval == 0:
@@ -390,6 +418,21 @@ def main():
           'config': dataclasses.asdict(config),
           'step': step + 1,
         }, new_chkpt_path)
+
+  pbar.close()
+  if is_main_process:
+    total_time = time() - train_start_time
+    h, rem = divmod(int(total_time), 3600)
+    m, s = divmod(rem, 60)
+    logger.info(
+      f'\n{"=" * 50}\n'
+      f'Training Complete\n'
+      f'  Total steps   : {global_step}\n'
+      f'  Total time    : {h:02d}h {m:02d}m {s:02d}s ({total_time:.1f}s)\n'
+      f'  Final loss    : {last_loss:.4f}\n'
+      f'  Final LR      : {last_lr:.6e}\n'
+      f'{"=" * 50}'
+    )
 
   if is_distributed:
     dist.destroy_process_group()
