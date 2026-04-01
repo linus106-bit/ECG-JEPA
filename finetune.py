@@ -1,6 +1,7 @@
 import argparse
 import copy
 import dataclasses
+import json
 import logging
 import logging.config
 import os
@@ -647,10 +648,42 @@ def main():
       test_f1 = f1_score(y_true=test_targets, y_pred=test_predictions, average='macro')
       test_acc = accuracy_score(y_true=test_targets, y_pred=test_predictions)
       logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}')
+      eval_results = {
+        'task': task_name,
+        'dataset_type': args.dataset_type,
+        'single_label': bool(single_label),
+        'best_val_metric': float(best_val_metric),
+        'best_epoch_or_step': int(best_epoch_or_step),
+        'val_f1': float(best_val_metric),
+        'test_f1': float(test_f1),
+        'test_acc': float(test_acc),
+        'timestamp': datetime.now().isoformat(),
+        'out_dir': args.out,
+        'config_path': args.config,
+        'encoder_path': args.encoder,
+      }
     else:
       test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
       logger.info(f'test_auc {test_auc:.4f}')
+      eval_results = {
+        'task': task_name,
+        'dataset_type': args.dataset_type,
+        'single_label': bool(single_label),
+        'best_val_metric': float(best_val_metric),
+        'best_epoch_or_step': int(best_epoch_or_step),
+        'val_auc': float(best_val_metric),
+        'test_auc': float(test_auc),
+        'timestamp': datetime.now().isoformat(),
+        'out_dir': args.out,
+        'config_path': args.config,
+        'encoder_path': args.encoder,
+      }
+
+    json_result_path = path.join(args.out, f'{task_name}_eval_results.json')
+    with open(json_result_path, 'w', encoding='utf-8') as f:
+      json.dump(eval_results, f, indent=2, ensure_ascii=False)
+    logger.info(f'saved eval results json to {json_result_path}')
 
     np.savez(path.join(args.out, f'{task_name}_predictions.npz'),
              val_targets=saved_val_targets, val_predictions=best_val_predictions,
