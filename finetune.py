@@ -7,6 +7,7 @@ import os
 import pprint
 from contextlib import nullcontext
 from os import path, makedirs
+from pathlib import Path
 from time import time
 
 import numpy as np
@@ -53,35 +54,23 @@ args = parser.parse_args()
 
 
 def main():
-  # Early config resolution: load run: section from YAML before distributed setup
-  # so that args.out, args.amp, args.encoder, etc. are available when needed
-  _config_name = args.config or 'linear'
-  if not path.isfile(_config_name):
-    _config_file = path.join(path.dirname(configs.eval.__file__), f'{_config_name}.yaml')
-    if path.isfile(_config_file):
-      if args.config is not None:
-        args.config = _config_file  # persist resolved path only if user specified config
-      _config_name = _config_file
-  if path.isfile(_config_name):
-    _early_dict = configs.load_config_file(_config_name)
-    _run = _early_dict.pop('run', {})
-    if args.encoder is None:
-      args.encoder = _run.get('encoder')
-    if args.out is None:
-      args.out = _run.get('out_dir', 'eval')
-    if args.amp is None:
-      args.amp = _run.get('amp', 'float32')
-    if args.dataset_type is None:
-      args.dataset_type = _run.get('dataset_type')
-    if args.task is None:
-      args.task = _run.get('task', 'all')
-  else:
-    if args.out is None:
-      args.out = 'eval'
-    if args.amp is None:
-      args.amp = 'float32'
-    if args.task is None:
-      args.task = 'all'
+  # Load config YAML and extract run: section early (needed before distributed setup)
+  if args.config is None:
+    args.config = path.join(path.dirname(configs.eval.__file__), 'linear.yaml')
+  if not path.isfile(args.config):
+    raise ValueError(f'Config file not found: {args.config}')
+  _early_dict = configs.load_config_file(args.config)
+  _run = _early_dict.pop('run', {})
+  if args.encoder is None:
+    args.encoder = _run.get('encoder')
+  if args.out is None:
+    args.out = path.join('finetune', Path(args.config).stem)
+  if args.amp is None:
+    args.amp = _run.get('amp', 'float32')
+  if args.dataset_type is None:
+    args.dataset_type = _run.get('dataset_type')
+  if args.task is None:
+    args.task = _run.get('task', 'all')
   if not args.encoder:
     raise ValueError('encoder must be specified via --encoder or run.encoder in the eval config yaml')
 
@@ -137,17 +126,9 @@ def main():
     else:
       dataset_type = 'ecg'
 
-  default_config = 'har_linear' if dataset_type == 'har' else 'linear'
-  config_name = args.config or default_config
-  if not path.isfile(config_name):
-    config_file = path.join(path.dirname(configs.eval.__file__), f'{config_name}.yaml')
-    if not path.isfile(config_file):
-      raise ValueError(f'Failed to read configuration file {config_name}')
-    config_name = config_file
-
-  eval_config_dict = configs.load_config_file(config_name)
+  eval_config_dict = configs.load_config_file(args.config)
   if is_main_process:
-    logger.debug(f'loading configuration file from {config_name}\n'
+    logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
 
   # resolve data_dir from CLI args or config yaml

@@ -12,7 +12,7 @@ set -euo pipefail
 #   NUM_GPUS — 사용할 GPU 수
 # =============================================================================
 
-CONFIG="${1:-finetune}"
+CONFIG="${1:-configs/eval/finetune.yaml}"
 NUM_GPUS=8
 
 # 사용할 GPU ID 지정 (전체 사용 시 주석 처리)

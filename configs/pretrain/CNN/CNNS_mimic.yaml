@@ -1,6 +1,5 @@
 # run (execution settings — previously in the shell script)
 run:
-  out_dir: pretrain/CNNS_mimic
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training

@@ -5,6 +5,7 @@ import os
 import pprint
 from contextlib import nullcontext
 from os import path, makedirs
+from pathlib import Path
 from time import time
 
 import numpy as np
@@ -69,16 +70,13 @@ PTB_XL.std = [0.191, 0.166, 0.173, 0.142, 0.149, 0.147,
 
 
 def main():
-  # Resolve config file and extract run: section early (needed before distributed setup)
+  # Load config YAML and extract run: section early (needed before distributed setup)
   if not path.isfile(args.config):
-    config_file = path.join(path.dirname(configs.pretrain.__file__), f'{args.config}.yaml')
-    if not path.isfile(config_file):
-      raise ValueError(f'Failed to read configuration file {args.config}')
-    args.config = config_file
+    raise ValueError(f'Config file not found: {args.config}')
   yaml_dict = configs.load_config_file(args.config)
   run_config = yaml_dict.pop('run', {})
   if args.out is None:
-    args.out = run_config.get('out_dir', 'pretrain')
+    args.out = path.join('pretrain', Path(args.config).stem)
   if args.amp is None:
     args.amp = run_config.get('amp', 'float32')
   args.compile = args.compile or run_config.get('compile', False)
