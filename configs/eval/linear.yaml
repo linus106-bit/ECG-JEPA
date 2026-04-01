@@ -1,6 +1,5 @@
 # run (execution settings — previously in the shell script)
 run:
-  out_dir: finetune/linear
   amp: bfloat16
   encoder: pretrain/ViTS_ptbxl/checkpoint.pt  # path to pretrain checkpoint
   task: all

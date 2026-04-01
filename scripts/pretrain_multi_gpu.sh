@@ -12,7 +12,7 @@ set -euo pipefail
 #   NUM_GPUS — 사용할 GPU 수
 # =============================================================================
 
-CONFIG="${1:-ViTS_ptbxl}"
+CONFIG="${1:-configs/pretrain/ViT/ViTS_ptbxl.yaml}"
 NUM_GPUS=8
 
 # 사용할 GPU ID 지정 (전체 사용 시 주석 처리)
