@@ -79,7 +79,7 @@ def main():
   yaml_dict = configs.load_config_file(args.config)
   run_config = yaml_dict.pop('run', {})
   if args.out is None:
-    args.out = path.join('pretrain', Path(args.config).stem)
+    args.out = run_config.get('out_dir', path.join('pretrain', Path(args.config).stem))
   if args.amp is None:
     args.amp = run_config.get('amp', 'float32')
   args.compile = args.compile or run_config.get('compile', False)
