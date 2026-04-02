@@ -68,7 +68,7 @@ def main():
   if args.encoder is None:
     args.encoder = _run.get('encoder')
   if args.out is None:
-    args.out = path.join('finetune', Path(args.config).stem)
+    args.out = _run.get('out_dir', path.join('finetune', Path(args.config).stem))
   if args.amp is None:
     args.amp = _run.get('amp', 'float32')
   if args.dataset_type is None:
