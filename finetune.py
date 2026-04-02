@@ -57,6 +57,39 @@ parser.add_argument('--task', choices=TASKS, default=None, help='task type (ECG 
 args = parser.parse_args()
 
 
+def _find_capture24_legacy_prefix(data_dir):
+  """Return prefix for legacy Capture24 dumps if available, else None."""
+  candidates = [data_dir]
+  if path.isdir(data_dir):
+    dirname = path.basename(path.normpath(data_dir))
+    candidates.extend([
+      path.join(data_dir, 'capture24'),
+      path.join(data_dir, dirname),
+    ])
+
+  required_suffixes = (
+    '_train.npy',
+    '_test.npy',
+    '_train_labels.npz',
+    '_test_labels.npz',
+  )
+  for prefix in candidates:
+    if all(path.isfile(f'{prefix}{suffix}') for suffix in required_suffixes):
+      return prefix
+  return None
+
+
+def _load_capture24_legacy(prefix):
+  """Load legacy Capture24 dumps from a resolved prefix."""
+  x_train_all = np.load(f'{prefix}_train.npy', mmap_mode='r')  # (N, T, C), channels-last
+  x_test = np.load(f'{prefix}_test.npy', mmap_mode='r')
+  with np.load(f'{prefix}_train_labels.npz') as archive:
+    train_labels = archive['labels'].copy()
+  with np.load(f'{prefix}_test_labels.npz') as archive:
+    test_labels = archive['labels'].copy()
+  return x_train_all, train_labels, x_test, test_labels
+
+
 def main():
   # Load config YAML and extract run: section early (needed before distributed setup)
   if args.config is None:
@@ -177,11 +210,20 @@ def main():
   if is_main_process:
     logger.debug(f'loading dataset from {data_dir} (type={dataset_type})')
 
-  from datasets import load_dataset
-  hf_dataset = load_dataset(data_dir)
-  available_splits = list(hf_dataset.keys())
-  if is_main_process:
-    logger.debug(f'available splits: {available_splits}')
+  legacy_prefix = _find_capture24_legacy_prefix(data_dir)
+  hf_dataset = None
+  available_splits = []
+  if legacy_prefix is not None:
+    if is_main_process:
+      logger.debug(f'found legacy Capture24 dump prefix: {legacy_prefix}')
+  elif path.isdir(data_dir):
+    from datasets import load_dataset
+    hf_dataset = load_dataset(data_dir)
+    available_splits = list(hf_dataset.keys())
+    if is_main_process:
+      logger.debug(f'available splits: {available_splits}')
+  elif is_main_process:
+    logger.debug(f'data_dir is not a directory: {data_dir}')
 
   if dataset_type == 'har':
     # HAR: single-label classification (e.g., Capture24)
@@ -189,27 +231,39 @@ def main():
     task_name = 'har'
     dataset_cls = Capture24
 
-    # Get num_classes from ClassLabel feature
-    label_feature = hf_dataset['train'].features.get('label')
-    if hasattr(label_feature, 'names'):
-      num_classes = len(label_feature.names)
+    har_transpose_input = legacy_prefix is not None
+    if legacy_prefix is not None:
+      x_train_all, train_labels, x_test, test_labels = _load_capture24_legacy(legacy_prefix)
+      train_labels = np.asarray(train_labels, dtype=np.int64)
+      test_labels = np.asarray(test_labels, dtype=np.int64)
+      num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
       if is_main_process:
-        logger.debug(f'ClassLabel names: {label_feature.names}')
+        logger.debug('loaded HAR data from legacy dump files')
+    elif hf_dataset is not None:
+      # Get num_classes from ClassLabel feature
+      label_feature = hf_dataset['train'].features.get('label')
+      if hasattr(label_feature, 'names'):
+        num_classes = len(label_feature.names)
+        if is_main_process:
+          logger.debug(f'ClassLabel names: {label_feature.names}')
+      else:
+        # fallback
+        train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
+        test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
+        num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
+
+      # Load train split: data is (N, num_channels, channel_size)
+      train_ds = hf_dataset['train']
+      x_train_all = np.array(train_ds['data'], dtype=np.float16)
+      train_labels = np.array(train_ds['label'], dtype=np.int64)
+
+      # Load test split
+      test_ds = hf_dataset['test']
+      x_test = np.array(test_ds['data'], dtype=np.float16)
+      test_labels = np.array(test_ds['label'], dtype=np.int64)
     else:
-      # fallback
-      train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
-      test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
-      num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
-
-    # Load train split: data is (N, num_channels, channel_size)
-    train_ds = hf_dataset['train']
-    x_train_all = np.array(train_ds['data'], dtype=np.float16)
-    train_labels = np.array(train_ds['label'], dtype=np.int64)
-
-    # Load test split
-    test_ds = hf_dataset['test']
-    x_test = np.array(test_ds['data'], dtype=np.float16)
-    test_labels = np.array(test_ds['label'], dtype=np.int64)
+      raise ValueError(f'Could not load HAR dataset from {data_dir}. '
+                       f'Expected HF dataset directory or legacy Capture24 dump prefix.')
 
     # Split train into train/val with a fixed random seed
     rng = np.random.RandomState(VAL_SEED)
@@ -224,18 +278,14 @@ def main():
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
 
-    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
-    mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
-    std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
-    transforms.normalize_(x_train_all, mean_std=(mean, std))
-    x_train_all.clip(-5, 5, out=x_train_all)
-    transforms.normalize_(x_test, mean_std=(mean, std))
-    x_test.clip(-5, 5, out=x_test)
-
-    # ensure matching channels (channels-first: index along axis 1)
-    channel_order = get_channel_order(dataset_cls.channels, encoder_config.channels)
-    x_train_all = x_train_all[:, channel_order]
-    x_test = x_test[:, channel_order]
+    # compute training statistics; preprocessing is done lazily in transforms
+    # legacy dumps are channels-last (N, T, C), HF is channels-first (N, C, T)
+    if har_transpose_input:
+      mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+      std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+    else:
+      mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
+      std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
 
     y_train_all = torch.from_numpy(train_labels).long()
     y_test = torch.from_numpy(test_labels).long()
@@ -358,10 +408,21 @@ def main():
   num_workers = min(8, max(1, num_cpus // world_size))
   eval_num_workers = min(2, num_workers)
 
+  if dataset_type == 'har':
+    har_preprocess = PreprocessHAR(
+      mean_std=(mean, std),
+      channel_order=get_channel_order(Capture24.channels, encoder_config.channels),
+      transpose_input=har_transpose_input)
+    train_transform = [har_preprocess, TrainTransform(crop_size=crop_size)]
+    eval_transform = [har_preprocess, EvalTransform(crop_size=crop_size, crop_stride=crop_stride)]
+  else:
+    train_transform = TrainTransform(crop_size=crop_size)
+    eval_transform = EvalTransform(crop_size=crop_size, crop_stride=crop_stride)
+
   train_dataset = TensorDataset(
     data=x_train,
     labels=y_train,
-    transform=TrainTransform(crop_size=crop_size))
+    transform=train_transform)
 
   train_sampler = DistributedSampler(
     train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
@@ -380,18 +441,14 @@ def main():
     dataset=TensorDataset(
       data=x_val,
       labels=y_val,
-      transform=EvalTransform(
-        crop_size=crop_size,
-        crop_stride=crop_stride)),
+      transform=eval_transform),
     batch_size=eval_config.batch_size,
     num_workers=eval_num_workers)
   test_loader = DataLoader(
     dataset=TensorDataset(
       data=x_test,
       labels=y_test,
-      transform=EvalTransform(
-        crop_size=crop_size,
-        crop_stride=crop_stride)),
+      transform=eval_transform),
     batch_size=eval_config.batch_size,
     num_workers=eval_num_workers)
 
@@ -724,6 +781,27 @@ class PreprocessECG:
       x = transforms.highpass_filter(x, fs=PTB_XL.sampling_frequency)
     if self.channel_size is not None and self.channel_size != channel_size:
       x = transforms.resample(x, self.channel_size)
+    return x
+
+
+class PreprocessHAR:
+  def __init__(self, *, mean_std, channel_order, transpose_input=False):
+    self.mean, self.std = mean_std
+    self.channel_order = channel_order
+    self.transpose_input = transpose_input
+
+  def __call__(self, x):
+    if self.transpose_input:
+      x = x.T  # (T, C) -> (C, T)
+      mean = self.mean.reshape(-1, 1)
+      std = self.std.reshape(-1, 1)
+    else:
+      mean = self.mean
+      std = self.std
+    x = np.array(x, dtype=np.float32, copy=True)
+    x = (x - mean) / (std + 1e-8)
+    x.clip(-5, 5, out=x)
+    x = x[self.channel_order]
     return x
 
 
