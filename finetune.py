@@ -172,6 +172,7 @@ def main():
       dataset_type = 'ecg'
 
   eval_config_dict = configs.load_config_file(args.config)
+  eval_config_dict.pop('run', None)
   if is_main_process:
     logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
