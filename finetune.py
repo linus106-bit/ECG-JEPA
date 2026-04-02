@@ -155,6 +155,7 @@ def main():
     if is_main_process:
       logger.debug(f'loading encoder config from {args.encoder}')
     encoder_config_dict = configs.load_config_file(args.encoder)
+    encoder_config_dict.pop('run', None)
     encoder_config = configs.pretrain.Config(**encoder_config_dict)
     model_state_dict = None
   else:
@@ -162,6 +163,7 @@ def main():
       logger.debug(f'loading encoder checkpoint from {args.encoder}')
     chkpt = torch.load(args.encoder, map_location='cpu')
     encoder_config_dict = chkpt['config']
+    encoder_config_dict.pop('run', None)
     encoder_config = configs.pretrain.Config(**encoder_config_dict)
     if 'eval_config' in chkpt:  # continue fine-tuning the weights
       model_state_dict = chkpt['model']
