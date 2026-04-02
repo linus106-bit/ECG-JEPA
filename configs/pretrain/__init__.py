@@ -56,6 +56,10 @@ class Config:
   # DMT-JEPA: discriminative masked targets (0 = disabled)
   dmt_window_size: int = 0
   dmt_num_neighbors: int = 4
+  # JEPA mode: 'ijepa' (EMA + stop-grad) or 'lejepa' (SIGReg, no EMA)
+  jepa_mode: str = 'ijepa'
+  sigreg_lambda: float = 0.05
+  sigreg_num_slices: int = 1024
 
   @property
   def num_channels(self):
