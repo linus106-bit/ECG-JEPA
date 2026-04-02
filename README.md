@@ -133,14 +133,15 @@ Here is the list of all ECG datasets that we use for pre-training.
 | Ningbo                      | 34,905        | 349,050        | https://doi.org/10.13026/34va-7q14     |
 | PTB                         | 516           | 57,150         | https://doi.org/10.13026/34va-7q14     |
 | St-Petersburg               | 74            | 133,200        | https://doi.org/10.13026/34va-7q14     |
-| **Total**                   | **1,011,849** | **10,394,994** |
+| SDB (Sleep Disorder Breathing) | variable      | variable       | internal / user-provided               |
+| **Total**                   | **1,011,849 + SDB** | **10,394,994 + SDB** |
 
 Below we outline how to preprocess and dump every dataset. 
 Generally, we dump the datasets in their original form.
 However, we removed the baseline wander from CODE-15 and St-Petersburg to facilitate stable pre-training.
 
 ```shell
-# datasets: MIMIC-IV-ECG, Chapman-Shaoxing, CPSC, CPSC-Extra, Georgia, Ningbo, PTB
+# datasets: MIMIC-IV-ECG, Chapman-Shaoxing, CPSC, CPSC-Extra, Georgia, Ningbo, PTB, SDB
 python -m scripts.dump_data --data-dir "/path/to/data" --verbose
 ```
 ```shell
