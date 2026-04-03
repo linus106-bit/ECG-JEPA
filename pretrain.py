@@ -259,7 +259,8 @@ def main():
       min_block_size=config.min_block_size,
       min_keep_ratio=config.min_keep_ratio,
       max_keep_ratio=config.max_keep_ratio,
-      strategy=config.masking_strategy),
+      strategy=config.masking_strategy,
+      channel_independent=config.per_channel_patching),
     num_workers=num_workers,
     worker_init_fn=worker_init_fn,
     persistent_workers=(num_workers > 0))

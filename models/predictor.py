@@ -13,7 +13,7 @@ class Predictor(nn.Module):
     super().__init__()
     self.config = config
     assert config.channel_size % config.patch_size == 0
-    num_patches = config.channel_size // config.patch_size
+    num_patches = config.num_patches
     self.embed = nn.Linear(config.dim, config.pred_dim, bias=config.bias)
     self.mask_token = nn.Parameter(torch.zeros(1, 1, config.pred_dim))
     self.register_buffer(

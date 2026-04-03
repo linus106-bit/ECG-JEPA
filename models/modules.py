@@ -246,18 +246,26 @@ class PatchEmbedding(nn.Module):
       dim,
       in_channels,
       patch_size,
+      channel_independent=True,
       bias=True
   ):
     super().__init__()
+    self.channel_independent = channel_independent
     self.proj = nn.Conv1d(
-      in_channels,
+      1 if channel_independent else in_channels,
       dim,
       kernel_size=patch_size,
       stride=patch_size,
       bias=bias)
 
   def forward(self, x):
-    x = self.proj(x).transpose(1, 2)
+    if self.channel_independent:
+      B, C, T = x.shape
+      x = x.reshape(B * C, 1, T)
+      x = self.proj(x).transpose(1, 2)  # (B*C, N, D)
+      x = x.reshape(B, C, x.size(1), x.size(2)).flatten(1, 2)  # (B, C*N, D)
+    else:
+      x = self.proj(x).transpose(1, 2)  # (B, N, D)
     return x
 
 

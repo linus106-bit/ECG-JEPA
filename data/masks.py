@@ -6,11 +6,19 @@ import torch.utils.data
 
 
 class MaskCollator:
-  def __init__(self, patch_size, min_block_size, min_keep_ratio, max_keep_ratio, strategy='block'):
+  def __init__(
+      self,
+      patch_size,
+      min_block_size,
+      min_keep_ratio,
+      max_keep_ratio,
+      strategy='block',
+      channel_independent=True):
     self.patch_size = patch_size
     self.min_block_size = min_block_size
     self.min_keep_ratio = min_keep_ratio
     self.max_keep_ratio = max_keep_ratio
+    self.channel_independent = channel_independent
     assert strategy in ('block', 'random'), f"Unknown masking strategy: {strategy}"
     self.strategy = strategy
 
@@ -19,6 +27,8 @@ class MaskCollator:
     batch_size, num_channels, channel_size = batch.size()
     assert channel_size % self.patch_size == 0
     num_patches = channel_size // self.patch_size
+    if self.channel_independent:
+      num_patches *= num_channels
     keep_ratio = np.random.uniform(self.min_keep_ratio, self.max_keep_ratio)
     num_keep = math.ceil(keep_ratio * num_patches)
     mask_encoder, mask_predictor = [], []
