@@ -1,6 +1,7 @@
 # learnable encoder parameters: 3,600,000
 # run (execution settings — previously in the shell script)
 run:
+  out_dir: results/pretrain/ViTXS_mimic
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training
