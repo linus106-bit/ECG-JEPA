@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import configs
 from data import transforms, utils as datautils
-from data.datasets import DATASETS, PTB_XL, Capture24
+from data.datasets import DATASETS, PTB_XL, Capture24, SDB
 from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
@@ -49,8 +49,8 @@ parser.add_argument('--encoder', default=None, help='path to checkpoint or confi
 parser.add_argument('--out', default=None, help='output directory (default: run.out_dir in config yaml)')
 parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ecg, har_linear for har)')
 parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
-parser.add_argument('--dataset-type', choices=['ecg', 'har'], default=None,
-                    help='dataset type: ecg (multi-label, ROC-AUC) or har (single-label, F1+accuracy). '
+parser.add_argument('--dataset-type', choices=['ecg', 'har', 'ppg'], default=None,
+                    help='dataset type: ecg (multi-label, ROC-AUC), har (single-label), or ppg (single-label). '
                          'Auto-detected from data_dir if not specified.')
 # ECG-specific args (PTB-XL tasks)
 parser.add_argument('--task', choices=TASKS, default=None, help='task type (ECG only, default: run.task in config yaml)')
@@ -88,6 +88,8 @@ def _load_capture24_legacy(prefix):
   with np.load(f'{prefix}_test_labels.npz') as archive:
     test_labels = archive['labels'].copy()
   return x_train_all, train_labels, x_test, test_labels
+
+
 
 
 def main():
@@ -168,6 +170,8 @@ def main():
     data_dir_lower = (args.data_dir or '').lower()
     if 'capture24' in data_dir_lower or 'capture-24' in data_dir_lower:
       dataset_type = 'har'
+    elif 'sdb' in data_dir_lower:
+      dataset_type = 'ppg'
     else:
       dataset_type = 'ecg'
 
@@ -228,11 +232,11 @@ def main():
   elif is_main_process:
     logger.debug(f'data_dir is not a directory: {data_dir}')
 
-  if dataset_type == 'har':
-    # HAR: single-label classification (e.g., Capture24)
+  if dataset_type in ('har', 'ppg'):
+    # Single-label classification for HAR/PPG datasets
     single_label = True
-    task_name = 'har'
-    dataset_cls = Capture24
+    task_name = dataset_type
+    dataset_cls = Capture24 if dataset_type == 'har' else SDB
 
     har_transpose_input = legacy_prefix is not None
     if legacy_prefix is not None:
@@ -265,7 +269,7 @@ def main():
       x_test = np.array(test_ds['data'], dtype=np.float16)
       test_labels = np.array(test_ds['label'], dtype=np.int64)
     else:
-      raise ValueError(f'Could not load HAR dataset from {data_dir}. '
+      raise ValueError(f'Could not load single-label HAR/PPG dataset from {data_dir}. '
                        f'Expected HF dataset directory or legacy Capture24 dump prefix.')
 
     # Split train into train/val with a fixed random seed
@@ -411,10 +415,10 @@ def main():
   num_workers = min(8, max(1, num_cpus // world_size))
   eval_num_workers = min(2, num_workers)
 
-  if dataset_type == 'har':
+  if dataset_type in ('har', 'ppg'):
     har_preprocess = PreprocessHAR(
       mean_std=(mean, std),
-      channel_order=get_channel_order(Capture24.channels, encoder_config.channels),
+      channel_order=get_channel_order(dataset_cls.channels, encoder_config.channels),
       transpose_input=har_transpose_input)
     train_transform = [har_preprocess, TrainTransform(crop_size=crop_size)]
     eval_transform = [har_preprocess, EvalTransform(crop_size=crop_size, crop_stride=crop_stride)]
