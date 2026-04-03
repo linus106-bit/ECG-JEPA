@@ -55,6 +55,8 @@ class Config:
   masking_strategy: str = 'block'
   # target representation normalization for loss: 'none', 'layer_norm', 'instance_norm'
   target_norm: str = 'none'
+  # loss function: 'l1' or 'l2'
+  loss_type: str = 'l1'
   # DMT-JEPA: discriminative masked targets (0 = disabled)
   dmt_window_size: int = 0
   dmt_num_neighbors: int = 4

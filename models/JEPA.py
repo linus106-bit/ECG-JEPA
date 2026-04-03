@@ -145,7 +145,10 @@ class JEPA(nn.Module):
     elif self.config.target_norm == 'instance_norm':
       h = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-6)
       z = (z - z.mean(dim=-1, keepdim=True)) / (z.std(dim=-1, keepdim=True) + 1e-6)
-    loss = torch.mean(torch.abs(z - h))
+    if self.config.loss_type == 'l2':
+      loss = torch.mean((z - h) ** 2)
+    else:
+      loss = torch.mean(torch.abs(z - h))
     return loss
 
   def get_optimizer(self, fused=False):
