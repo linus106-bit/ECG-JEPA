@@ -8,6 +8,8 @@ class Config:
   channels: tuple[str, ...] = ('I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
   channel_size: int = 5000
   patch_size: int = 25
+  # if True, split patches independently per channel (tokens = num_channels * channel_size // patch_size)
+  per_channel_patching: bool = True
   min_block_size: int = 10
   min_keep_ratio: float = 0.15
   max_keep_ratio: float = 0.25
@@ -64,3 +66,10 @@ class Config:
   @property
   def num_channels(self):
     return len(self.channels)
+
+  @property
+  def num_patches(self):
+    patches_per_channel = self.channel_size // self.patch_size
+    if self.per_channel_patching:
+      return self.num_channels * patches_per_channel
+    return patches_per_channel

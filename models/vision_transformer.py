@@ -14,11 +14,12 @@ class VisionTransformer(nn.Module):
     self.config = config
     self.keep_registers = keep_registers
     assert config.channel_size % config.patch_size == 0
-    num_patches = config.channel_size // config.patch_size
+    num_patches = config.num_patches
     self.patch_embed = PatchEmbedding(
       dim=config.dim,
       in_channels=config.num_channels,
       patch_size=config.patch_size,
+      channel_independent=config.per_channel_patching,
       bias=config.bias)
     self.register_buffer(
       'pos_embed',
