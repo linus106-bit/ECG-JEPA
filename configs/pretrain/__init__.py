@@ -53,6 +53,8 @@ class Config:
   mamba_expand: int = 2
   # masking strategy: 'block' (multi-block) or 'random' (random patch, MAE-style)
   masking_strategy: str = 'block'
+  # target representation normalization for loss: 'none', 'layer_norm', 'instance_norm'
+  target_norm: str = 'none'
   # DMT-JEPA: discriminative masked targets (0 = disabled)
   dmt_window_size: int = 0
   dmt_num_neighbors: int = 4

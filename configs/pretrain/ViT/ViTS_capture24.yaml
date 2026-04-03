@@ -48,3 +48,4 @@ opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
 checkpoint_interval: 30
+target_norm: layer_norm
