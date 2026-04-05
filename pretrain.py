@@ -385,11 +385,41 @@ def main():
   gpu_util_meter = MinMaxAverageMeter() if using_cuda else None
 
   global_step = start_step
-  if config.epochs > 0:
-    for epoch in range(start_epoch, config.epochs):
-      for _ in range(steps_per_epoch):
+  try:
+    if config.epochs > 0:
+      for epoch in range(start_epoch, config.epochs):
+        for _ in range(steps_per_epoch):
+          _train_step(train_prefetcher)
+          global_step += 1
+          if using_cuda:
+            gpu_util = get_gpu_utilization(local_rank)
+            if gpu_util is not None:
+              gpu_util_meter.update(gpu_util)
+          if is_main_process:
+            last_loss = train_loss.value
+            last_lr = log_training_stats(
+              global_step=global_step,
+              total_dataset_size=total_dataset_size,
+              gpu_util_meter=gpu_util_meter,
+              queue_empty_count=train_prefetcher.queue_empty_count,
+              queue_get_wait_time=train_prefetcher.queue_wait_time)
+            step_time = AverageMeter()
+            train_loss = AverageMeter()
+            train_prefetcher.reset_metrics()
+            if gpu_util_meter is not None:
+              gpu_util_meter.reset()
+          if is_main_process and global_step % config.checkpoint_interval == 0:
+            new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
+            torch.save({
+              'model': original_model.state_dict(),
+              'optimizer': optimizer.state_dict(),
+              'config': dataclasses.asdict(config),
+              'epoch': epoch + 1,
+              'step': global_step,
+            }, new_chkpt_path)
+    else:
+      for step in range(start_step, config.steps):
         _train_step(train_prefetcher)
-        global_step += 1
         if using_cuda:
           gpu_util = get_gpu_utilization(local_rank)
           if gpu_util is not None:
@@ -397,7 +427,7 @@ def main():
         if is_main_process:
           last_loss = train_loss.value
           last_lr = log_training_stats(
-            global_step=global_step,
+            global_step=step + 1,
             total_dataset_size=total_dataset_size,
             gpu_util_meter=gpu_util_meter,
             queue_empty_count=train_prefetcher.queue_empty_count,
@@ -407,46 +437,18 @@ def main():
           train_prefetcher.reset_metrics()
           if gpu_util_meter is not None:
             gpu_util_meter.reset()
-        if is_main_process and global_step % config.checkpoint_interval == 0:
-          new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
+        if is_main_process and (step + 1) % config.checkpoint_interval == 0:
+          new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
           torch.save({
             'model': original_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'config': dataclasses.asdict(config),
-            'epoch': epoch + 1,
-            'step': global_step,
+            'step': step + 1,
           }, new_chkpt_path)
-  else:
-    for step in range(start_step, config.steps):
-      _train_step(train_prefetcher)
-      if using_cuda:
-        gpu_util = get_gpu_utilization(local_rank)
-        if gpu_util is not None:
-          gpu_util_meter.update(gpu_util)
-      if is_main_process:
-        last_loss = train_loss.value
-        last_lr = log_training_stats(
-          global_step=step + 1,
-          total_dataset_size=total_dataset_size,
-          gpu_util_meter=gpu_util_meter,
-          queue_empty_count=train_prefetcher.queue_empty_count,
-          queue_get_wait_time=train_prefetcher.queue_wait_time)
-        step_time = AverageMeter()
-        train_loss = AverageMeter()
-        train_prefetcher.reset_metrics()
-        if gpu_util_meter is not None:
-          gpu_util_meter.reset()
-      if is_main_process and (step + 1) % config.checkpoint_interval == 0:
-        new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
-        torch.save({
-          'model': original_model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'config': dataclasses.asdict(config),
-          'step': step + 1,
-        }, new_chkpt_path)
+  finally:
+    train_prefetcher.close()
+    pbar.close()
 
-  train_prefetcher.close()
-  pbar.close()
   if is_main_process:
     total_time = time() - train_start_time
     h, rem = divmod(int(total_time), 3600)
@@ -467,6 +469,13 @@ def main():
 
 def load_variable_data_dump(dump_file, min_channel_size, transform=None, processes=None):
   data = datautils.load_variable_data_dump(dump_file, transform=transform, processes=processes)
+  normalized_data = []
+  for x in data:
+    # Legacy variable-length dumps are channels-last: (channel_size, num_channels).
+    if x.ndim == 2 and x.shape[-1] < min_channel_size <= x.shape[0]:
+      x = x.T
+    normalized_data.append(x)
+  data = normalized_data
   data = [x for x in data if x.shape[-1] >= min_channel_size]
   sizes = np.array([x.shape[-1] for x in data])
   starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
@@ -547,11 +556,21 @@ class AsyncBatchPrefetcher:
         if self.using_cuda:
           with torch.cuda.stream(self.stream):
             batch = tuple(x.to(self.device, non_blocking=True) for x in batch)
-        self.queue.put(batch)
-      self.queue.put(self._SENTINEL)
+        if not self._put_queue_item(batch):
+          return
+      self._put_queue_item(self._SENTINEL)
     except Exception as exc:
       self.exception = exc
-      self.queue.put(self._SENTINEL)
+      self._put_queue_item(self._SENTINEL)
+
+  def _put_queue_item(self, item):
+    while True:
+      try:
+        self.queue.put(item, timeout=0.1)
+        return True
+      except queue.Full:
+        if self.stop_event.is_set():
+          return False
 
   def _preload_next(self):
     wait_start = time()
