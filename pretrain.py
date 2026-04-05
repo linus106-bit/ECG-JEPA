@@ -3,6 +3,9 @@ import dataclasses
 import logging.config
 import os
 import pprint
+import queue
+import subprocess
+import threading
 from contextlib import nullcontext
 from datetime import datetime
 from os import path, makedirs
@@ -157,6 +160,10 @@ def main():
     if not path.isdir(dataset_path) and not path.isfile(dataset_path):
       raise ValueError(f'Dataset does not exist: {dataset_path}')
 
+  if config.preprocess_mode not in {'online', 'offline_cached'}:
+    raise ValueError(f'preprocess_mode must be "online" or "offline_cached", got {config.preprocess_mode}')
+  online_mode = config.preprocess_mode == 'online'
+
   datasets = {}
   for dataset_name, dataset_info in config.datasets.items():
     dataset_path = dataset_info['path']
@@ -169,6 +176,15 @@ def main():
     channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
     mean = np.array(dataset_cls.mean, dtype=np.float16).reshape(-1, 1)
     std = np.array(dataset_cls.std, dtype=np.float16).reshape(-1, 1)
+    preprocess = ECGPreprocessor(
+      mean_std=(mean, std),
+      resample_ratio=resample_ratio,
+      channel_order=channel_order)
+    legacy_preprocess = ECGPreprocessor(
+      mean_std=(mean, std),
+      resample_ratio=resample_ratio,
+      channel_order=channel_order,
+      transpose_input=True)
     _, ext = path.splitext(dataset_path)
     if path.isdir(dataset_path):
       # HuggingFace dataset directory
@@ -176,58 +192,38 @@ def main():
       if is_variable:
         data, starts, sizes = load_hf_variable_dataset(
           dataset_path, split=split, min_channel_size=config.channel_size)
-        # apply preprocessing to variable-length data
-        preprocessed = []
-        preprocess = PreprocessECG(
-          mean_std=(mean, std),
-          resample_ratio=resample_ratio,
-          channel_order=channel_order)
+        processed_records = []
         for i in range(len(sizes)):
           x = data[..., starts[i]:starts[i] + sizes[i]]  # (num_channels, channel_size)
-          preprocessed.append(preprocess(x))
-        preprocessed = [x for x in preprocessed if x.shape[-1] >= config.channel_size]
-        new_sizes = np.array([x.shape[-1] for x in preprocessed])
+          processed_records.append(preprocess(x) if online_mode else x)
+        processed_records = [x for x in processed_records if x.shape[-1] >= config.channel_size]
+        new_sizes = np.array([x.shape[-1] for x in processed_records])
         new_starts = np.concatenate([np.array([0]), np.cumsum(new_sizes[:-1])])
-        new_data = np.concatenate(preprocessed, axis=-1)  # (num_channels, total_time)
+        new_data = np.concatenate(processed_records, axis=-1)  # (num_channels, total_time)
         dataset = VariableTensorDataset(
           new_data, new_starts, new_sizes,
           transform=TransformECG(crop_size=config.channel_size))
       else:
         data = load_hf_dataset(dataset_path, split=split)
+        transform = [TransformECG(crop_size=config.channel_size)]
+        if online_mode:
+          transform.insert(0, preprocess)
         dataset = TensorDataset(
           data=data,
-          transform=[
-            PreprocessECG(
-              mean_std=(mean, std),
-              resample_ratio=resample_ratio,
-              channel_order=channel_order),
-            TransformECG(crop_size=config.channel_size),
-          ])
+          transform=transform)
     elif ext == '.npy':
+      transform = [TransformECG(crop_size=config.channel_size)]
+      if online_mode:
+        transform.insert(0, legacy_preprocess)
       dataset = TensorDataset(
         data=datautils.load_data_dump(dump_file=dataset_path),
-        transform=[
-          PreprocessECG(
-            mean_std=(mean, std),
-            resample_ratio=resample_ratio,
-            channel_order=channel_order,
-            transpose_input=True),  # legacy .npy is channels-last
-          TransformECG(crop_size=config.channel_size),
-        ])
+        transform=transform)
     elif ext == '.npz':
-      records = load_variable_data_dump(
+      var_data, var_starts, var_sizes = load_variable_data_dump(
         dump_file=dataset_path,
-        transform=PreprocessECG(
-          mean_std=(mean, std),
-          resample_ratio=resample_ratio,
-          channel_order=channel_order,
-          transpose_input=True),  # legacy .npz is channels-last
+        min_channel_size=config.channel_size,
+        transform=legacy_preprocess if online_mode else None,
         processes=num_cpus)
-      # filter short records and build concatenated variable-length dataset
-      records = [x for x in records if x.shape[-1] >= config.channel_size]
-      var_sizes = np.array([x.shape[-1] for x in records])
-      var_starts = np.concatenate([np.array([0]), np.cumsum(var_sizes[:-1])])
-      var_data = np.concatenate(records, axis=-1)  # (num_channels, total_time)
       dataset = VariableTensorDataset(
         var_data, var_starts, var_sizes,
         transform=TransformECG(crop_size=config.channel_size))
@@ -243,9 +239,12 @@ def main():
 
   # With DDP, divide global batch size across all ranks
   local_batch_size = config.batch_size // world_size
-  # Cap dataloader workers so single-GPU runs on high-core-count hosts
-  # do not exhaust file descriptors while keeping good throughput.
-  num_workers = min(8, max(1, num_cpus // world_size))
+  num_workers = config.dataloader_num_workers
+  if num_workers is None:
+    # Cap auto-selected workers so single-GPU jobs do not overrun file descriptors.
+    num_workers = min(8, max(1, num_cpus // world_size))
+  if num_workers < 1:
+    raise ValueError(f'dataloader_num_workers must be >= 1, got {num_workers}')
 
   def worker_init_fn(worker_id):
     np.random.seed(rank * num_workers + worker_id)
@@ -262,19 +261,15 @@ def main():
       strategy=config.masking_strategy,
       channel_independent=config.per_channel_patching),
     num_workers=num_workers,
-    worker_init_fn=worker_init_fn,
-    persistent_workers=(num_workers > 0))
+    persistent_workers=bool(config.dataloader_persistent_workers and num_workers > 0),
+    prefetch_factor=config.dataloader_prefetch_factor if num_workers > 0 else None,
+    worker_init_fn=worker_init_fn)
 
-  def map_to_device(data_iterator, device=None):
-    for batch in data_iterator:
-      yield tuple(x.to(device, non_blocking=using_cuda) for x in batch)
-
-  def prefetch_batch(data_iterator):
-    prefetched_batch = next(data_iterator)
-    for next_batch in data_iterator:
-      yield prefetched_batch
-      prefetched_batch = next_batch
-    yield prefetched_batch
+  if is_main_process:
+    logger.debug(f'dataloader settings: num_workers={num_workers} '
+                 f'persistent_workers={bool(config.dataloader_persistent_workers and num_workers > 0)} '
+                 f'prefetch_factor={config.dataloader_prefetch_factor} '
+                 f'prefetch_queue_size={config.prefetch_queue_size}')
 
   # if device is CUDA, batch data will be asynchronously transferred to the GPU,
   #  so we should perform as many CPU operations as possible between loading and using a batch
@@ -344,7 +339,7 @@ def main():
     update_weight_decay_(optimizer, next(wd_schedule))
     batch_loss = 0.
     for i in range(config.gradient_accumulation_steps):
-      x, mask_encoder, mask_predictor = next(train_iterator)
+      x, mask_encoder, mask_predictor = train_iterator.next_batch()
       sync_ctx = (nullcontext() if not is_distributed or i == config.gradient_accumulation_steps - 1
                   else model.no_sync())
       with sync_ctx, auto_mixed_precision:
@@ -359,68 +354,101 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     step_time.update(time() - step_start)
 
+  def log_training_stats(global_step, total_dataset_size, gpu_util_meter, queue_empty_count, queue_get_wait_time):
+    current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+    current_lr = optimizer.param_groups[0]['lr']
+    message = (f'step: {global_step} '
+               f'epoch: {current_epoch:.4f} '
+               f'train_loss: {train_loss.value:.4f} '
+               f'lr: {current_lr:.6e} '
+               f'step_time: {step_time.value:.4f}')
+    if train_prefetcher.step_times:
+      p50, p95 = np.percentile(np.array(train_prefetcher.step_times), [50, 95]).tolist()
+      message += f' step_time_p50: {p50:.4f} step_time_p95: {p95:.4f}'
+    message += (f' queue_empty_count: {queue_empty_count}'
+                f' queue_get_wait_s: {queue_get_wait_time:.4f}')
+    if gpu_util_meter is not None and gpu_util_meter.value is not None:
+      message += (f' gpu_util_avg: {gpu_util_meter.value:.1f}'
+                  f' gpu_util_min: {gpu_util_meter.min_value:.1f}')
+    logger.info(message)
+    pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+    pbar.update(1)
+    return current_lr
+
+  train_prefetcher = AsyncBatchPrefetcher(
+    loader=train_loader,
+    device=device,
+    using_cuda=using_cuda,
+    queue_size=config.prefetch_queue_size)
+  train_prefetcher.reset()
+
+  gpu_util_meter = MinMaxAverageMeter() if using_cuda else None
+
   global_step = start_step
-  if config.epochs > 0:
-    for epoch in range(start_epoch, config.epochs):
-      train_iterator = iter(train_loader)
-      train_iterator = map_to_device(train_iterator, device=device)
-      train_iterator = prefetch_batch(train_iterator)
-      for _ in range(steps_per_epoch):
-        _train_step(train_iterator)
-        global_step += 1
+  try:
+    if config.epochs > 0:
+      for epoch in range(start_epoch, config.epochs):
+        for _ in range(steps_per_epoch):
+          _train_step(train_prefetcher)
+          global_step += 1
+          if using_cuda:
+            gpu_util = get_gpu_utilization(local_rank)
+            if gpu_util is not None:
+              gpu_util_meter.update(gpu_util)
+          if is_main_process:
+            last_loss = train_loss.value
+            last_lr = log_training_stats(
+              global_step=global_step,
+              total_dataset_size=total_dataset_size,
+              gpu_util_meter=gpu_util_meter,
+              queue_empty_count=train_prefetcher.queue_empty_count,
+              queue_get_wait_time=train_prefetcher.queue_wait_time)
+            step_time = AverageMeter()
+            train_loss = AverageMeter()
+            train_prefetcher.reset_metrics()
+            if gpu_util_meter is not None:
+              gpu_util_meter.reset()
+          if is_main_process and global_step % config.checkpoint_interval == 0:
+            new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
+            torch.save({
+              'model': original_model.state_dict(),
+              'optimizer': optimizer.state_dict(),
+              'config': dataclasses.asdict(config),
+              'epoch': epoch + 1,
+              'step': global_step,
+            }, new_chkpt_path)
+    else:
+      for step in range(start_step, config.steps):
+        _train_step(train_prefetcher)
+        if using_cuda:
+          gpu_util = get_gpu_utilization(local_rank)
+          if gpu_util is not None:
+            gpu_util_meter.update(gpu_util)
         if is_main_process:
-          current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
-          current_lr = optimizer.param_groups[0]['lr']
           last_loss = train_loss.value
-          last_lr = current_lr
-          logger.info(f'step: {global_step} '
-                      f'epoch: {current_epoch:.4f} '
-                      f'train_loss: {train_loss.value:.4f} '
-                      f'lr: {current_lr:.6e} '
-                      f'step_time: {step_time.value:.4f}')
-          pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
-          pbar.update(1)
+          last_lr = log_training_stats(
+            global_step=step + 1,
+            total_dataset_size=total_dataset_size,
+            gpu_util_meter=gpu_util_meter,
+            queue_empty_count=train_prefetcher.queue_empty_count,
+            queue_get_wait_time=train_prefetcher.queue_wait_time)
           step_time = AverageMeter()
           train_loss = AverageMeter()
-        if is_main_process and global_step % config.checkpoint_interval == 0:
-          new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
+          train_prefetcher.reset_metrics()
+          if gpu_util_meter is not None:
+            gpu_util_meter.reset()
+        if is_main_process and (step + 1) % config.checkpoint_interval == 0:
+          new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
           torch.save({
             'model': original_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'config': dataclasses.asdict(config),
-            'epoch': epoch + 1,
-            'step': global_step,
+            'step': step + 1,
           }, new_chkpt_path)
-  else:
-    train_iterator = iter(train_loader)
-    train_iterator = map_to_device(train_iterator, device=device)
-    train_iterator = prefetch_batch(train_iterator)
-    for step in range(start_step, config.steps):
-      _train_step(train_iterator)
-      if is_main_process:
-        current_epoch = (step + 1) * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
-        current_lr = optimizer.param_groups[0]['lr']
-        last_loss = train_loss.value
-        last_lr = current_lr
-        logger.info(f'step: {step + 1} '
-                    f'epoch: {current_epoch:.4f} '
-                    f'train_loss: {train_loss.value:.4f} '
-                    f'lr: {current_lr:.6e} '
-                    f'step_time: {step_time.value:.4f}')
-        pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
-        pbar.update(1)
-        step_time = AverageMeter()
-        train_loss = AverageMeter()
-      if is_main_process and (step + 1) % config.checkpoint_interval == 0:
-        new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
-        torch.save({
-          'model': original_model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'config': dataclasses.asdict(config),
-          'step': step + 1,
-        }, new_chkpt_path)
+  finally:
+    train_prefetcher.close()
+    pbar.close()
 
-  pbar.close()
   if is_main_process:
     total_time = time() - train_start_time
     h, rem = divmod(int(total_time), 3600)
@@ -441,14 +469,141 @@ def main():
 
 def load_variable_data_dump(dump_file, min_channel_size, transform=None, processes=None):
   data = datautils.load_variable_data_dump(dump_file, transform=transform, processes=processes)
-  data = [x for x in data if len(x) >= min_channel_size]
-  sizes = np.array([len(x) for x in data])
+  normalized_data = []
+  for x in data:
+    # Legacy variable-length dumps are channels-last: (channel_size, num_channels).
+    if x.ndim == 2 and x.shape[-1] < min_channel_size <= x.shape[0]:
+      x = x.T
+    normalized_data.append(x)
+  data = normalized_data
+  data = [x for x in data if x.shape[-1] >= min_channel_size]
+  sizes = np.array([x.shape[-1] for x in data])
   starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
-  data = np.concatenate(data)
+  data = np.concatenate(data, axis=-1)
   return data, starts, sizes
 
 
-class PreprocessECG:  # called per sample in dataloader workers
+class MinMaxAverageMeter:
+  def __init__(self):
+    self.reset()
+
+  def reset(self):
+    self.value = None
+    self.min_value = None
+    self._sum = 0.
+    self._count = 0
+
+  def update(self, value):
+    self._sum += value
+    self._count += 1
+    self.value = self._sum / self._count
+    self.min_value = value if self.min_value is None else min(self.min_value, value)
+
+
+def get_gpu_utilization(device_index):
+  try:
+    output = subprocess.check_output(
+      ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
+      stderr=subprocess.DEVNULL, text=True)
+    values = [line.strip() for line in output.splitlines() if line.strip()]
+    if device_index >= len(values):
+      return None
+    return float(values[device_index])
+  except Exception:
+    return None
+
+
+class AsyncBatchPrefetcher:
+  _SENTINEL = object()
+
+  def __init__(self, loader, device, using_cuda, queue_size=16):
+    if queue_size < 1:
+      raise ValueError(f'prefetch_queue_size must be >= 1, got {queue_size}')
+    self.loader = loader
+    self.device = device
+    self.using_cuda = using_cuda
+    self.queue_size = queue_size
+    self.stream = torch.cuda.Stream(device=device) if using_cuda else None
+    self.queue = None
+    self.thread = None
+    self.stop_event = threading.Event()
+    self.exception = None
+    self.next_gpu_batch = None
+    self.queue_empty_count = 0
+    self.queue_wait_time = 0.
+    self.step_times = []
+
+  def reset_metrics(self):
+    self.queue_empty_count = 0
+    self.queue_wait_time = 0.
+    self.step_times = []
+
+  def reset(self):
+    self.close()
+    self.queue = queue.Queue(maxsize=self.queue_size)
+    self.stop_event.clear()
+    self.exception = None
+    self.next_gpu_batch = None
+    self.thread = threading.Thread(target=self._producer_loop, daemon=True)
+    self.thread.start()
+    self._preload_next()
+
+  def _producer_loop(self):
+    try:
+      for batch in self.loader:
+        if self.stop_event.is_set():
+          break
+        if self.using_cuda:
+          with torch.cuda.stream(self.stream):
+            batch = tuple(x.to(self.device, non_blocking=True) for x in batch)
+        if not self._put_queue_item(batch):
+          return
+      self._put_queue_item(self._SENTINEL)
+    except Exception as exc:
+      self.exception = exc
+      self._put_queue_item(self._SENTINEL)
+
+  def _put_queue_item(self, item):
+    while True:
+      try:
+        self.queue.put(item, timeout=0.1)
+        return True
+      except queue.Full:
+        if self.stop_event.is_set():
+          return False
+
+  def _preload_next(self):
+    wait_start = time()
+    if self.queue.empty():
+      self.queue_empty_count += 1
+    item = self.queue.get()
+    self.queue_wait_time += time() - wait_start
+    if item is self._SENTINEL:
+      self.next_gpu_batch = None
+    else:
+      self.next_gpu_batch = item
+
+  def next_batch(self):
+    if self.exception is not None:
+      raise self.exception
+    if self.next_gpu_batch is None:
+      raise StopIteration('Prefetcher reached end of loader')
+    if self.using_cuda:
+      torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+    batch = self.next_gpu_batch
+    step_start = time()
+    self._preload_next()
+    self.step_times.append(time() - step_start)
+    return batch
+
+  def close(self):
+    self.stop_event.set()
+    if self.thread is not None and self.thread.is_alive():
+      self.thread.join(timeout=1.0)
+    self.thread = None
+
+
+class ECGPreprocessor:  # called per sample in dataloader workers
   def __init__(self, *, mean_std, resample_ratio, channel_order, transpose_input=False):
     self.mean, self.std = mean_std
     self.resample_ratio = resample_ratio

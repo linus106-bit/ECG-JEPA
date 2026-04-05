@@ -14,6 +14,11 @@ class Config:
   min_keep_ratio: float = 0.15
   max_keep_ratio: float = 0.25
   datasets: dict = field(default_factory=dict)  # {name: {path: str, weight: float}}
+  preprocess_mode: str = 'online'  # 'online' or 'offline_cached'
+  dataloader_num_workers: int | None = 8  # default 8, None -> auto (cpu/world_size)
+  dataloader_prefetch_factor: int = 4
+  dataloader_persistent_workers: bool = True
+  prefetch_queue_size: int = 16
   # model architecture
   dim: int = 384
   depth: int = 8
