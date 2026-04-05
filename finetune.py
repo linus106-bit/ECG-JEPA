@@ -1,13 +1,18 @@
 import argparse
 import copy
 import dataclasses
+import json
 import logging
 import logging.config
 import os
 import pprint
 from contextlib import nullcontext
+from datetime import datetime
 from os import path, makedirs
+from pathlib import Path
 from time import time
+
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -19,7 +24,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import configs
 from data import transforms, utils as datautils
-from data.datasets import DATASETS, PTB_XL, Capture24
+from data.datasets import DATASETS, PTB_XL, Capture24, SDB
 from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
@@ -40,19 +45,74 @@ VAL_SEED = 42
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--data-dir', default=None, help='path to HF dataset directory (overrides dataset.data_dir in config)')
-parser.add_argument('--encoder', required=True, help='path to checkpoint or config file')
-parser.add_argument('--out', default='eval', help='output directory')
+parser.add_argument('--encoder', default=None, help='path to checkpoint or config file (default: run.encoder in config yaml)')
+parser.add_argument('--out', default=None, help='output directory (default: run.out_dir in config yaml)')
 parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ecg, har_linear for har)')
-parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
-parser.add_argument('--dataset-type', choices=['ecg', 'har'], default=None,
-                    help='dataset type: ecg (multi-label, ROC-AUC) or har (single-label, F1+accuracy). '
+parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
+parser.add_argument('--dataset-type', choices=['ecg', 'har', 'ppg'], default=None,
+                    help='dataset type: ecg (multi-label, ROC-AUC), har (single-label), or ppg (single-label). '
                          'Auto-detected from data_dir if not specified.')
 # ECG-specific args (PTB-XL tasks)
-parser.add_argument('--task', choices=TASKS, default='all', help='task type (ECG only)')
+parser.add_argument('--task', choices=TASKS, default=None, help='task type (ECG only, default: run.task in config yaml)')
 args = parser.parse_args()
 
 
+def _find_capture24_legacy_prefix(data_dir):
+  """Return prefix for legacy Capture24 dumps if available, else None."""
+  candidates = [data_dir]
+  if path.isdir(data_dir):
+    dirname = path.basename(path.normpath(data_dir))
+    candidates.extend([
+      path.join(data_dir, 'capture24'),
+      path.join(data_dir, dirname),
+    ])
+
+  required_suffixes = (
+    '_train.npy',
+    '_test.npy',
+    '_train_labels.npz',
+    '_test_labels.npz',
+  )
+  for prefix in candidates:
+    if all(path.isfile(f'{prefix}{suffix}') for suffix in required_suffixes):
+      return prefix
+  return None
+
+
+def _load_capture24_legacy(prefix):
+  """Load legacy Capture24 dumps from a resolved prefix."""
+  x_train_all = np.load(f'{prefix}_train.npy', mmap_mode='r')  # (N, T, C), channels-last
+  x_test = np.load(f'{prefix}_test.npy', mmap_mode='r')
+  with np.load(f'{prefix}_train_labels.npz') as archive:
+    train_labels = archive['labels'].copy()
+  with np.load(f'{prefix}_test_labels.npz') as archive:
+    test_labels = archive['labels'].copy()
+  return x_train_all, train_labels, x_test, test_labels
+
+
+
+
 def main():
+  # Load config YAML and extract run: section early (needed before distributed setup)
+  if args.config is None:
+    args.config = path.join(path.dirname(configs.eval.__file__), 'linear.yaml')
+  if not path.isfile(args.config):
+    raise ValueError(f'Config file not found: {args.config}')
+  _early_dict = configs.load_config_file(args.config)
+  _run = _early_dict.pop('run', {})
+  if args.encoder is None:
+    args.encoder = _run.get('encoder')
+  if args.out is None:
+    args.out = _run.get('out_dir', path.join('finetune', Path(args.config).stem))
+  if args.amp is None:
+    args.amp = _run.get('amp', 'float32')
+  if args.dataset_type is None:
+    args.dataset_type = _run.get('dataset_type')
+  if args.task is None:
+    args.task = _run.get('task', 'all')
+  if not args.encoder:
+    raise ValueError('encoder must be specified via --encoder or run.encoder in the eval config yaml')
+
   # Setup distributed training
   local_rank = int(os.environ.get('LOCAL_RANK', 0))
   rank = int(os.environ.get('RANK', 0))
@@ -67,9 +127,17 @@ def main():
   if is_main_process:
     makedirs(args.out, exist_ok=True)
     logging.config.fileConfig('logging.ini')
+    _timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _log_file_path = path.join(args.out, f'train_{_timestamp}.log')
+    _file_handler = logging.FileHandler(_log_file_path)
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(module)s:%(lineno)s => %(message)s'))
+    logging.getLogger('app').addHandler(_file_handler)
   logger = logging.getLogger('app')
   if not is_main_process:
     logger.setLevel(logging.CRITICAL)
+  else:
+    logger.info(f'logging to {_log_file_path}')
 
   device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
   using_cuda = device.type == 'cuda'
@@ -102,20 +170,15 @@ def main():
     data_dir_lower = (args.data_dir or '').lower()
     if 'capture24' in data_dir_lower or 'capture-24' in data_dir_lower:
       dataset_type = 'har'
+    elif 'sdb' in data_dir_lower:
+      dataset_type = 'ppg'
     else:
       dataset_type = 'ecg'
 
-  default_config = 'har_linear' if dataset_type == 'har' else 'linear'
-  config_name = args.config or default_config
-  if not path.isfile(config_name):
-    config_file = path.join(path.dirname(configs.eval.__file__), f'{config_name}.yaml')
-    if not path.isfile(config_file):
-      raise ValueError(f'Failed to read configuration file {config_name}')
-    config_name = config_file
-
-  eval_config_dict = configs.load_config_file(config_name)
+  eval_config_dict = configs.load_config_file(args.config)
+  eval_config_dict.pop('run', None)
   if is_main_process:
-    logger.debug(f'loading configuration file from {config_name}\n'
+    logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
 
   # resolve data_dir from CLI args or config yaml
@@ -130,6 +193,7 @@ def main():
     if is_main_process:
       logger.debug(f'loading encoder config from {args.encoder}')
     encoder_config_dict = configs.load_config_file(args.encoder)
+    encoder_config_dict.pop('run', None)
     encoder_config = configs.pretrain.Config(**encoder_config_dict)
     model_state_dict = None
   else:
@@ -137,6 +201,7 @@ def main():
       logger.debug(f'loading encoder checkpoint from {args.encoder}')
     chkpt = torch.load(args.encoder, map_location='cpu')
     encoder_config_dict = chkpt['config']
+    encoder_config_dict.pop('run', None)
     encoder_config = configs.pretrain.Config(**encoder_config_dict)
     if 'eval_config' in chkpt:  # continue fine-tuning the weights
       model_state_dict = chkpt['model']
@@ -152,39 +217,60 @@ def main():
   if is_main_process:
     logger.debug(f'loading dataset from {data_dir} (type={dataset_type})')
 
-  from datasets import load_dataset
-  hf_dataset = load_dataset(data_dir)
-  available_splits = list(hf_dataset.keys())
-  if is_main_process:
-    logger.debug(f'available splits: {available_splits}')
+  legacy_prefix = _find_capture24_legacy_prefix(data_dir)
+  hf_dataset = None
+  available_splits = []
+  if legacy_prefix is not None:
+    if is_main_process:
+      logger.debug(f'found legacy Capture24 dump prefix: {legacy_prefix}')
+  elif path.isdir(data_dir):
+    from datasets import load_dataset
+    hf_dataset = load_dataset(data_dir)
+    available_splits = list(hf_dataset.keys())
+    if is_main_process:
+      logger.debug(f'available splits: {available_splits}')
+  elif is_main_process:
+    logger.debug(f'data_dir is not a directory: {data_dir}')
 
-  if dataset_type == 'har':
-    # HAR: single-label classification (e.g., Capture24)
+  if dataset_type in ('har', 'ppg'):
+    # Single-label classification for HAR/PPG datasets
     single_label = True
-    task_name = 'har'
-    dataset_cls = Capture24
+    task_name = dataset_type
+    dataset_cls = Capture24 if dataset_type == 'har' else SDB
 
-    # Get num_classes from ClassLabel feature
-    label_feature = hf_dataset['train'].features.get('label')
-    if hasattr(label_feature, 'names'):
-      num_classes = len(label_feature.names)
+    har_transpose_input = legacy_prefix is not None
+    if legacy_prefix is not None:
+      x_train_all, train_labels, x_test, test_labels = _load_capture24_legacy(legacy_prefix)
+      train_labels = np.asarray(train_labels, dtype=np.int64)
+      test_labels = np.asarray(test_labels, dtype=np.int64)
+      num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
       if is_main_process:
-        logger.debug(f'ClassLabel names: {label_feature.names}')
+        logger.debug('loaded HAR data from legacy dump files')
+    elif hf_dataset is not None:
+      # Get num_classes from ClassLabel feature
+      label_feature = hf_dataset['train'].features.get('label')
+      if hasattr(label_feature, 'names'):
+        num_classes = len(label_feature.names)
+        if is_main_process:
+          logger.debug(f'ClassLabel names: {label_feature.names}')
+      else:
+        # fallback
+        train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
+        test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
+        num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
+
+      # Load train split: data is (N, num_channels, channel_size)
+      train_ds = hf_dataset['train']
+      x_train_all = np.array(train_ds['data'], dtype=np.float16)
+      train_labels = np.array(train_ds['label'], dtype=np.int64)
+
+      # Load test split
+      test_ds = hf_dataset['test']
+      x_test = np.array(test_ds['data'], dtype=np.float16)
+      test_labels = np.array(test_ds['label'], dtype=np.int64)
     else:
-      # fallback
-      train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
-      test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
-      num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
-
-    # Load train split: data is (N, num_channels, channel_size)
-    train_ds = hf_dataset['train']
-    x_train_all = np.array(train_ds['data'], dtype=np.float16)
-    train_labels = np.array(train_ds['label'], dtype=np.int64)
-
-    # Load test split
-    test_ds = hf_dataset['test']
-    x_test = np.array(test_ds['data'], dtype=np.float16)
-    test_labels = np.array(test_ds['label'], dtype=np.int64)
+      raise ValueError(f'Could not load single-label HAR/PPG dataset from {data_dir}. '
+                       f'Expected HF dataset directory or legacy Capture24 dump prefix.')
 
     # Split train into train/val with a fixed random seed
     rng = np.random.RandomState(VAL_SEED)
@@ -199,18 +285,14 @@ def main():
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
 
-    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
-    mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
-    std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
-    transforms.normalize_(x_train_all, mean_std=(mean, std))
-    x_train_all.clip(-5, 5, out=x_train_all)
-    transforms.normalize_(x_test, mean_std=(mean, std))
-    x_test.clip(-5, 5, out=x_test)
-
-    # ensure matching channels (channels-first: index along axis 1)
-    channel_order = get_channel_order(dataset_cls.channels, encoder_config.channels)
-    x_train_all = x_train_all[:, channel_order]
-    x_test = x_test[:, channel_order]
+    # compute training statistics; preprocessing is done lazily in transforms
+    # legacy dumps are channels-last (N, T, C), HF is channels-first (N, C, T)
+    if har_transpose_input:
+      mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+      std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
+    else:
+      mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
+      std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
 
     y_train_all = torch.from_numpy(train_labels).long()
     y_test = torch.from_numpy(test_labels).long()
@@ -328,12 +410,26 @@ def main():
     crop_stride = None
 
   local_batch_size = eval_config.batch_size // world_size
-  num_workers = max(1, num_cpus // world_size)
+  # Cap dataloader workers to avoid exhausting file descriptors on hosts
+  # with very high CPU counts (e.g. single-GPU jobs on large machines).
+  num_workers = min(8, max(1, num_cpus // world_size))
+  eval_num_workers = min(2, num_workers)
+
+  if dataset_type in ('har', 'ppg'):
+    har_preprocess = PreprocessHAR(
+      mean_std=(mean, std),
+      channel_order=get_channel_order(dataset_cls.channels, encoder_config.channels),
+      transpose_input=har_transpose_input)
+    train_transform = [har_preprocess, TrainTransform(crop_size=crop_size)]
+    eval_transform = [har_preprocess, EvalTransform(crop_size=crop_size, crop_stride=crop_stride)]
+  else:
+    train_transform = TrainTransform(crop_size=crop_size)
+    eval_transform = EvalTransform(crop_size=crop_size, crop_stride=crop_stride)
 
   train_dataset = TensorDataset(
     data=x_train,
     labels=y_train,
-    transform=TrainTransform(crop_size=crop_size))
+    transform=train_transform)
 
   train_sampler = DistributedSampler(
     train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
@@ -345,26 +441,23 @@ def main():
     sampler=train_sampler,
     shuffle=(train_sampler is None),
     drop_last=(train_sampler is None),
-    num_workers=num_workers)
+    num_workers=num_workers,
+    persistent_workers=(num_workers > 0))
 
   val_loader = DataLoader(
     dataset=TensorDataset(
       data=x_val,
       labels=y_val,
-      transform=EvalTransform(
-        crop_size=crop_size,
-        crop_stride=crop_stride)),
+      transform=eval_transform),
     batch_size=eval_config.batch_size,
-    num_workers=num_workers)
+    num_workers=eval_num_workers)
   test_loader = DataLoader(
     dataset=TensorDataset(
       data=x_test,
       labels=y_test,
-      transform=EvalTransform(
-        crop_size=crop_size,
-        crop_stride=crop_stride)),
+      transform=eval_transform),
     batch_size=eval_config.batch_size,
-    num_workers=num_workers)
+    num_workers=eval_num_workers)
 
   steps_per_epoch = len(train_loader) if eval_config.epochs > 0 else None
   total_steps = eval_config.epochs * steps_per_epoch if eval_config.epochs > 0 else eval_config.steps
@@ -407,6 +500,11 @@ def main():
   best_epoch_or_step = None
   best_chkpt = None
   global_step = 0
+  train_start_time = time()
+  last_loss = None
+  last_lr = None
+  pbar = tqdm(total=total_steps, initial=0, desc='Training',
+              unit='step', disable=not is_main_process)
 
   def _compute_loss(logits, y):
     if single_label:
@@ -475,10 +573,16 @@ def main():
         train_loss.update(loss.item())
         if is_main_process:
           current_epoch = global_step / steps_per_epoch
+          current_lr = optimizer.param_groups[0]['lr']
+          last_loss = train_loss.value
+          last_lr = current_lr
           logger.info(f'step: {global_step} '
                       f'epoch: {current_epoch:.4f} '
                       f'train_loss: {train_loss.value:.4f} '
+                      f'lr: {current_lr:.6e} '
                       f'step_time: {step_time.value:.4f}')
+          pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+          pbar.update(1)
           step_time = AverageMeter()
           train_loss = AverageMeter()
         if is_main_process and global_step % eval_config.checkpoint_interval == 0:
@@ -530,10 +634,16 @@ def main():
       train_loss.update(loss.item())
       if is_main_process:
         current_epoch = (step + 1) * eval_config.batch_size / train_dataset_size
+        current_lr = optimizer.param_groups[0]['lr']
+        last_loss = train_loss.value
+        last_lr = current_lr
         logger.info(f'step: {step + 1} '
                     f'epoch: {current_epoch:.4f} '
                     f'train_loss: {train_loss.value:.4f} '
+                    f'lr: {current_lr:.6e} '
                     f'step_time: {step_time.value:.4f}')
+        pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+        pbar.update(1)
         step_time = AverageMeter()
         train_loss = AverageMeter()
       if (step + 1) % eval_config.checkpoint_interval == 0:
@@ -602,14 +712,66 @@ def main():
       test_f1 = f1_score(y_true=test_targets, y_pred=test_predictions, average='macro')
       test_acc = accuracy_score(y_true=test_targets, y_pred=test_predictions)
       logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}')
+      eval_results = {
+        'task': task_name,
+        'dataset_type': args.dataset_type,
+        'single_label': bool(single_label),
+        'best_val_metric': float(best_val_metric),
+        'best_epoch_or_step': int(best_epoch_or_step),
+        'val_f1': float(best_val_metric),
+        'test_f1': float(test_f1),
+        'test_acc': float(test_acc),
+        'timestamp': datetime.now().isoformat(),
+        'out_dir': args.out,
+        'config_path': args.config,
+        'encoder_path': args.encoder,
+      }
     else:
       test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
       logger.info(f'test_auc {test_auc:.4f}')
+      eval_results = {
+        'task': task_name,
+        'dataset_type': args.dataset_type,
+        'single_label': bool(single_label),
+        'best_val_metric': float(best_val_metric),
+        'best_epoch_or_step': int(best_epoch_or_step),
+        'val_auc': float(best_val_metric),
+        'test_auc': float(test_auc),
+        'timestamp': datetime.now().isoformat(),
+        'out_dir': args.out,
+        'config_path': args.config,
+        'encoder_path': args.encoder,
+      }
+
+    json_result_path = path.join(args.out, f'{task_name}_eval_results.json')
+    with open(json_result_path, 'w', encoding='utf-8') as f:
+      json.dump(eval_results, f, indent=2, ensure_ascii=False)
+    logger.info(f'saved eval results json to {json_result_path}')
 
     np.savez(path.join(args.out, f'{task_name}_predictions.npz'),
              val_targets=saved_val_targets, val_predictions=best_val_predictions,
              test_targets=test_targets, test_predictions=test_predictions)
+
+  pbar.close()
+  if is_main_process:
+    total_time = time() - train_start_time
+    h, rem = divmod(int(total_time), 3600)
+    m, s = divmod(rem, 60)
+    lines = [
+      '=' * 50,
+      'Training Complete',
+      f'  Total steps   : {global_step}',
+      f'  Total time    : {h:02d}h {m:02d}m {s:02d}s ({total_time:.1f}s)',
+      f'  Best val step/epoch: {best_epoch_or_step}',
+      f'  Best val metric : {best_val_metric:.4f}',
+    ]
+    if single_label:
+      lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}')
+    else:
+      lines.append(f'  Test AUC      : {test_auc:.4f}')
+    lines.append('=' * 50)
+    logger.info('\n' + '\n'.join(lines))
 
   if is_distributed:
     dist.destroy_process_group()
@@ -626,6 +788,27 @@ class PreprocessECG:
       x = transforms.highpass_filter(x, fs=PTB_XL.sampling_frequency)
     if self.channel_size is not None and self.channel_size != channel_size:
       x = transforms.resample(x, self.channel_size)
+    return x
+
+
+class PreprocessHAR:
+  def __init__(self, *, mean_std, channel_order, transpose_input=False):
+    self.mean, self.std = mean_std
+    self.channel_order = channel_order
+    self.transpose_input = transpose_input
+
+  def __call__(self, x):
+    if self.transpose_input:
+      x = x.T  # (T, C) -> (C, T)
+      mean = self.mean.reshape(-1, 1)
+      std = self.std.reshape(-1, 1)
+    else:
+      mean = self.mean
+      std = self.std
+    x = np.array(x, dtype=np.float32, copy=True)
+    x = (x - mean) / (std + 1e-8)
+    x.clip(-5, 5, out=x)
+    x = x[self.channel_order]
     return x
 
 

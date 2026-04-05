@@ -7,8 +7,12 @@ import queue
 import subprocess
 import threading
 from contextlib import nullcontext
+from datetime import datetime
 from os import path, makedirs
+from pathlib import Path
 from time import time
+
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -46,11 +50,11 @@ from utils.schedules import (
 )
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--out', default='pretrain', help='output directory')
+parser.add_argument('--out', default=None, help='output directory (default: run.out_dir in config yaml)')
 parser.add_argument('--config', default='ViTS_mimic', help='path to config file or config name')
-parser.add_argument('--chkpt', help='resume training from model checkpoint')
-parser.add_argument('--amp', default='float32', choices=['bfloat16', 'float32'], help='automated mixed precision')
-parser.add_argument('--compile', action='store_true', help='compile model')
+parser.add_argument('--chkpt', default=None, help='resume training from model checkpoint (default: run.checkpoint in config yaml)')
+parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
+parser.add_argument('--compile', action='store_true', help='compile model (or set run.compile: true in config yaml)')
 args = parser.parse_args()
 
 # NOTE: we update means and standard deviations of some datasets
@@ -72,6 +76,19 @@ PTB_XL.std = [0.191, 0.166, 0.173, 0.142, 0.149, 0.147,
 
 
 def main():
+  # Load config YAML and extract run: section early (needed before distributed setup)
+  if not path.isfile(args.config):
+    raise ValueError(f'Config file not found: {args.config}')
+  yaml_dict = configs.load_config_file(args.config)
+  run_config = yaml_dict.pop('run', {})
+  if args.out is None:
+    args.out = run_config.get('out_dir', path.join('pretrain', Path(args.config).stem))
+  if args.amp is None:
+    args.amp = run_config.get('amp', 'float32')
+  args.compile = args.compile or run_config.get('compile', False)
+  if args.chkpt is None and run_config.get('checkpoint'):
+    args.chkpt = run_config['checkpoint']
+
   # Setup distributed training
   local_rank = int(os.environ.get('LOCAL_RANK', 0))
   rank = int(os.environ.get('RANK', 0))
@@ -86,9 +103,17 @@ def main():
   if is_main_process:
     makedirs(args.out, exist_ok=True)
     logging.config.fileConfig('logging.ini')
+    _timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    _log_file_path = path.join(args.out, f'train_{_timestamp}.log')
+    _file_handler = logging.FileHandler(_log_file_path)
+    _file_handler.setLevel(logging.DEBUG)
+    _file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(module)s:%(lineno)s => %(message)s'))
+    logging.getLogger('app').addHandler(_file_handler)
   logger = logging.getLogger('app')
   if not is_main_process:
     logger.setLevel(logging.CRITICAL)
+  else:
+    logger.info(f'logging to {_log_file_path}')
 
   device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
   using_cuda = device.type == 'cuda'
@@ -121,18 +146,10 @@ def main():
     chkpt = torch.load(args.chkpt, map_location=device)
     config = configs.pretrain.Config(**chkpt['config'])
   else:
-    # read config file
-    if not path.isfile(args.config):
-      # maybe config is the name of a default config file in configs/pretrain/
-      config_file = path.join(path.dirname(configs.pretrain.__file__),  f'{args.config}.yaml')
-      if not path.isfile(config_file):
-        raise ValueError(f'Failed to read configuration file {args.config}')
-      args.config = config_file
-    config_dict = configs.load_config_file(args.config)
-    config = configs.pretrain.Config(**config_dict)
+    config = configs.pretrain.Config(**yaml_dict)
     if is_main_process:
       logger.debug(f'loading configuration file from {args.config}:\n'
-                   f'{pprint.pformat(config_dict, compact=True, sort_dicts=False, width=120)}')
+                   f'{pprint.pformat(yaml_dict, compact=True, sort_dicts=False, width=120)}')
     chkpt = None
 
   for dataset_name, dataset_info in config.datasets.items():
@@ -224,7 +241,8 @@ def main():
   local_batch_size = config.batch_size // world_size
   num_workers = config.dataloader_num_workers
   if num_workers is None:
-    num_workers = max(1, num_cpus // world_size)
+    # Cap auto-selected workers so single-GPU jobs do not overrun file descriptors.
+    num_workers = min(8, max(1, num_cpus // world_size))
   if num_workers < 1:
     raise ValueError(f'dataloader_num_workers must be >= 1, got {num_workers}')
 
@@ -240,7 +258,8 @@ def main():
       min_block_size=config.min_block_size,
       min_keep_ratio=config.min_keep_ratio,
       max_keep_ratio=config.max_keep_ratio,
-      strategy=config.masking_strategy),
+      strategy=config.masking_strategy,
+      channel_independent=config.per_channel_patching),
     num_workers=num_workers,
     persistent_workers=bool(config.dataloader_persistent_workers and num_workers > 0),
     prefetch_factor=config.dataloader_prefetch_factor if num_workers > 0 else None,
@@ -308,6 +327,11 @@ def main():
 
   step_time = AverageMeter()
   train_loss = AverageMeter()
+  train_start_time = time()
+  last_loss = None
+  last_lr = None
+  pbar = tqdm(total=total_steps, initial=start_step, desc='Training',
+              unit='step', disable=not is_main_process)
 
   def _train_step(train_iterator):
     step_start = time()
@@ -332,9 +356,11 @@ def main():
 
   def log_training_stats(global_step, total_dataset_size, gpu_util_meter, queue_empty_count, queue_get_wait_time):
     current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+    current_lr = optimizer.param_groups[0]['lr']
     message = (f'step: {global_step} '
                f'epoch: {current_epoch:.4f} '
                f'train_loss: {train_loss.value:.4f} '
+               f'lr: {current_lr:.6e} '
                f'step_time: {step_time.value:.4f}')
     if train_prefetcher.step_times:
       p50, p95 = np.percentile(np.array(train_prefetcher.step_times), [50, 95]).tolist()
@@ -345,6 +371,9 @@ def main():
       message += (f' gpu_util_avg: {gpu_util_meter.value:.1f}'
                   f' gpu_util_min: {gpu_util_meter.min_value:.1f}')
     logger.info(message)
+    pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+    pbar.update(1)
+    return current_lr
 
   train_prefetcher = AsyncBatchPrefetcher(
     loader=train_loader,
@@ -366,7 +395,8 @@ def main():
           if gpu_util is not None:
             gpu_util_meter.update(gpu_util)
         if is_main_process:
-          log_training_stats(
+          last_loss = train_loss.value
+          last_lr = log_training_stats(
             global_step=global_step,
             total_dataset_size=total_dataset_size,
             gpu_util_meter=gpu_util_meter,
@@ -394,7 +424,8 @@ def main():
         if gpu_util is not None:
           gpu_util_meter.update(gpu_util)
       if is_main_process:
-        log_training_stats(
+        last_loss = train_loss.value
+        last_lr = log_training_stats(
           global_step=step + 1,
           total_dataset_size=total_dataset_size,
           gpu_util_meter=gpu_util_meter,
@@ -415,6 +446,20 @@ def main():
         }, new_chkpt_path)
 
   train_prefetcher.close()
+  pbar.close()
+  if is_main_process:
+    total_time = time() - train_start_time
+    h, rem = divmod(int(total_time), 3600)
+    m, s = divmod(rem, 60)
+    logger.info(
+      f'\n{"=" * 50}\n'
+      f'Training Complete\n'
+      f'  Total steps   : {global_step}\n'
+      f'  Total time    : {h:02d}h {m:02d}m {s:02d}s ({total_time:.1f}s)\n'
+      f'  Final loss    : {last_loss:.4f}\n'
+      f'  Final LR      : {last_lr:.6e}\n'
+      f'{"=" * 50}'
+    )
 
   if is_distributed:
     dist.destroy_process_group()

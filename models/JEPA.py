@@ -138,7 +138,17 @@ class JEPA(nn.Module):
     z = self.encoder(x, mask_encoder)
     # predict masked patches
     z = self.predictor(z, mask_encoder, mask_predictor)
-    loss = torch.mean(torch.abs(z - h))
+    # target representation normalization (collapse 방지)
+    if self.config.target_norm == 'layer_norm':
+      h = F.layer_norm(h, (h.size(-1),))
+      z = F.layer_norm(z, (z.size(-1),))
+    elif self.config.target_norm == 'instance_norm':
+      h = (h - h.mean(dim=-1, keepdim=True)) / (h.std(dim=-1, keepdim=True) + 1e-6)
+      z = (z - z.mean(dim=-1, keepdim=True)) / (z.std(dim=-1, keepdim=True) + 1e-6)
+    if self.config.loss_type == 'l2':
+      loss = torch.mean((z - h) ** 2)
+    else:
+      loss = torch.mean(torch.abs(z - h))
     return loss
 
   def get_optimizer(self, fused=False):

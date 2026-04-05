@@ -1,3 +1,9 @@
+# run (execution settings — previously in the shell script)
+run:
+  out_dir: results/pretrain/CNNXS_mimic
+  amp: bfloat16
+  compile: false
+  checkpoint: null  # set to a checkpoint path to resume training
 # data
 sampling_frequency: 500
 channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
