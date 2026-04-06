@@ -113,6 +113,13 @@ def main() -> None:
             f"_b{_format_value(min_block_size)}"
             f"_p{_format_value(patch_size)}.yaml"
         )
+        yaml_name = Path(filename).stem
+        run_config = config.get("run")
+        if not isinstance(run_config, dict):
+            run_config = {}
+        run_config["out_dir"] = f"results/pretrain/{yaml_name}"
+        config["run"] = run_config
+
         output_path = args.output_dir / filename
 
         if output_path.exists() and not args.overwrite:
