@@ -7,8 +7,8 @@ run:
   dataset_type: ecg
 
 # dataset path (set data_dir to your dataset location)
-# dataset:
-#   data_dir: /path/to/ptb-xl
+dataset:
+  data_dir: /path/to/ptb-xl
 
 # data
 crop_duration: 2.5

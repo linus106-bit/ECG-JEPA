@@ -35,8 +35,8 @@ bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
 # training
-epochs: 300
-batch_size: 2048
+epochs: 50
+batch_size: 1024
 encoder_momentum: 0.998
 final_encoder_momentum: 0.9995
 learning_rate: 1.0e-3
@@ -49,4 +49,3 @@ opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
 checkpoint_interval: 1000
-target_norm: layer_norm
