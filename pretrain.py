@@ -528,7 +528,7 @@ class AsyncBatchPrefetcher:
     self.thread = None
     self.stop_event = threading.Event()
     self.exception = None
-    self.next_gpu_batch = None
+    self.next_device_batch = None
     self.queue_empty_count = 0
     self.queue_wait_time = 0.
     self.step_times = []
@@ -543,7 +543,7 @@ class AsyncBatchPrefetcher:
     self.queue = queue.Queue(maxsize=self.queue_size)
     self.stop_event.clear()
     self.exception = None
-    self.next_gpu_batch = None
+    self.next_device_batch = None
     self.thread = threading.Thread(target=self._producer_loop, daemon=True)
     self.thread.start()
     self._preload_next()
@@ -553,9 +553,6 @@ class AsyncBatchPrefetcher:
       for batch in self.loader:
         if self.stop_event.is_set():
           break
-        if self.using_cuda:
-          with torch.cuda.stream(self.stream):
-            batch = tuple(x.to(self.device, non_blocking=True) for x in batch)
         if not self._put_queue_item(batch):
           return
       self._put_queue_item(self._SENTINEL)
@@ -579,18 +576,21 @@ class AsyncBatchPrefetcher:
     item = self.queue.get()
     self.queue_wait_time += time() - wait_start
     if item is self._SENTINEL:
-      self.next_gpu_batch = None
+      self.next_device_batch = None
     else:
-      self.next_gpu_batch = item
+      if self.using_cuda:
+        with torch.cuda.stream(self.stream):
+          item = tuple(x.to(self.device, non_blocking=True) for x in item)
+      self.next_device_batch = item
 
   def next_batch(self):
     if self.exception is not None:
       raise self.exception
-    if self.next_gpu_batch is None:
+    if self.next_device_batch is None:
       raise StopIteration('Prefetcher reached end of loader')
     if self.using_cuda:
       torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
-    batch = self.next_gpu_batch
+    batch = self.next_device_batch
     step_start = time()
     self._preload_next()
     self.step_times.append(time() - step_start)
