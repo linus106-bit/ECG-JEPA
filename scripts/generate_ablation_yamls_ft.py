@@ -2,9 +2,9 @@
 """Generate ablation YAML configs from value lists.
 
 Example:
-    python scripts/generate_ablation_yamls.py \
-        --template configs/pretrain/ViT/ViTS_mimic.yaml \
-        --output-dir configs/pretrain/ViT/ablation \
+    python scripts/generate_ablation_yamls_ft.py \
+        --template configs/eval/har_linear.yaml \
+        --output-dir configs/eval/ablation \
         --min-keep-ratios 0.15 \
         --max-keep-ratios 0.25 0.35 0.45 \
         --min-block-sizes 5 10 12 \
@@ -97,7 +97,7 @@ def main() -> None:
 
     count = 0
     for min_keep_ratio, max_keep_ratio, min_block_size, patch_size in itertools.product(
-        args.min_keep_ratios,
+        args.min_keep_ratios
         args.max_keep_ratios,
         args.min_block_sizes,
         args.patch_sizes,
