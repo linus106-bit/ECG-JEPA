@@ -4,7 +4,6 @@ import logging.config
 import os
 import pprint
 import queue
-import subprocess
 import threading
 from contextlib import nullcontext
 from datetime import datetime
@@ -354,23 +353,9 @@ def main():
     optimizer.zero_grad(set_to_none=True)
     step_time.update(time() - step_start)
 
-  def log_training_stats(global_step, total_dataset_size, gpu_util_meter, queue_empty_count, queue_get_wait_time):
+  def log_training_stats(global_step, total_dataset_size):
     current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
     current_lr = optimizer.param_groups[0]['lr']
-    message = (f'step: {global_step} '
-               f'epoch: {current_epoch:.4f} '
-               f'train_loss: {train_loss.value:.4f} '
-               f'lr: {current_lr:.6e} '
-               f'step_time: {step_time.value:.4f}')
-    if train_prefetcher.step_times:
-      p50, p95 = np.percentile(np.array(train_prefetcher.step_times), [50, 95]).tolist()
-      message += f' step_time_p50: {p50:.4f} step_time_p95: {p95:.4f}'
-    message += (f' queue_empty_count: {queue_empty_count}'
-                f' queue_get_wait_s: {queue_get_wait_time:.4f}')
-    if gpu_util_meter is not None and gpu_util_meter.value is not None:
-      message += (f' gpu_util_avg: {gpu_util_meter.value:.1f}'
-                  f' gpu_util_min: {gpu_util_meter.min_value:.1f}')
-    logger.info(message)
     pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
     pbar.update(1)
     return current_lr
@@ -382,8 +367,6 @@ def main():
     queue_size=config.prefetch_queue_size)
   train_prefetcher.reset()
 
-  gpu_util_meter = MinMaxAverageMeter() if using_cuda else None
-
   global_step = start_step
   try:
     if config.epochs > 0:
@@ -391,23 +374,14 @@ def main():
         for _ in range(steps_per_epoch):
           _train_step(train_prefetcher)
           global_step += 1
-          if using_cuda:
-            gpu_util = get_gpu_utilization(local_rank)
-            if gpu_util is not None:
-              gpu_util_meter.update(gpu_util)
           if is_main_process:
             last_loss = train_loss.value
             last_lr = log_training_stats(
               global_step=global_step,
-              total_dataset_size=total_dataset_size,
-              gpu_util_meter=gpu_util_meter,
-              queue_empty_count=train_prefetcher.queue_empty_count,
-              queue_get_wait_time=train_prefetcher.queue_wait_time)
+              total_dataset_size=total_dataset_size)
             step_time = AverageMeter()
             train_loss = AverageMeter()
             train_prefetcher.reset_metrics()
-            if gpu_util_meter is not None:
-              gpu_util_meter.reset()
           if is_main_process and global_step % config.checkpoint_interval == 0:
             new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
             torch.save({
@@ -420,23 +394,14 @@ def main():
     else:
       for step in range(start_step, config.steps):
         _train_step(train_prefetcher)
-        if using_cuda:
-          gpu_util = get_gpu_utilization(local_rank)
-          if gpu_util is not None:
-            gpu_util_meter.update(gpu_util)
         if is_main_process:
           last_loss = train_loss.value
           last_lr = log_training_stats(
             global_step=step + 1,
-            total_dataset_size=total_dataset_size,
-            gpu_util_meter=gpu_util_meter,
-            queue_empty_count=train_prefetcher.queue_empty_count,
-            queue_get_wait_time=train_prefetcher.queue_wait_time)
+            total_dataset_size=total_dataset_size)
           step_time = AverageMeter()
           train_loss = AverageMeter()
           train_prefetcher.reset_metrics()
-          if gpu_util_meter is not None:
-            gpu_util_meter.reset()
         if is_main_process and (step + 1) % config.checkpoint_interval == 0:
           new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
           torch.save({
@@ -481,37 +446,6 @@ def load_variable_data_dump(dump_file, min_channel_size, transform=None, process
   starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
   data = np.concatenate(data, axis=-1)
   return data, starts, sizes
-
-
-class MinMaxAverageMeter:
-  def __init__(self):
-    self.reset()
-
-  def reset(self):
-    self.value = None
-    self.min_value = None
-    self._sum = 0.
-    self._count = 0
-
-  def update(self, value):
-    self._sum += value
-    self._count += 1
-    self.value = self._sum / self._count
-    self.min_value = value if self.min_value is None else min(self.min_value, value)
-
-
-def get_gpu_utilization(device_index):
-  try:
-    output = subprocess.check_output(
-      ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
-      stderr=subprocess.DEVNULL, text=True)
-    values = [line.strip() for line in output.splitlines() if line.strip()]
-    if device_index >= len(values):
-      return None
-    return float(values[device_index])
-  except Exception:
-    return None
-
 
 class AsyncBatchPrefetcher:
   _SENTINEL = object()
