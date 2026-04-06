@@ -9,7 +9,7 @@ class Config:
   channel_size: int = 5000
   patch_size: int = 25
   # if True, split patches independently per channel (tokens = num_channels * channel_size // patch_size)
-  per_channel_patching: bool = True
+  per_channel_patching: bool = False
   min_block_size: int = 10
   min_keep_ratio: float = 0.15
   max_keep_ratio: float = 0.25

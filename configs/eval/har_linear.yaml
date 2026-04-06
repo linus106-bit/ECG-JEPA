@@ -8,8 +8,8 @@ run:
   dataset_type: har
 
 # dataset path (set data_dir to your dataset location)
-# dataset:
-#   data_dir: /path/to/capture-24
+dataset:
+  data_dir: /path/to/capture-24
 
 # data
 crop_duration: null
@@ -22,8 +22,8 @@ bias: False
 dropout: 0.
 frozen: True
 # training
-epochs: 50
-batch_size: 256
+epochs: 25
+batch_size: 1024
 learning_rate: 1.0e-3
 final_learning_rate: 1.0e-3
 learning_rate_warmup_ratio: 0.0
