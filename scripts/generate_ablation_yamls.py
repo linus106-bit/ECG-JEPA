@@ -5,9 +5,10 @@ Example:
     python scripts/generate_ablation_yamls.py \
         --template configs/pretrain/ViT/ViTS_mimic.yaml \
         --output-dir configs/pretrain/ViT/ablation \
-        --max-keep-ratios 0.2 0.25 0.3 \
-        --min-block-sizes 8 10 12 \
-        --patch-sizes 20 25
+        --min-keep-ratios 0.15 \
+        --max-keep-ratios 0.25 0.35 0.45 \
+        --min-block-sizes 5 10 12 \
+        --patch-sizes 5 10 20 25
 """
 
 from __future__ import annotations
@@ -51,6 +52,13 @@ def parse_args() -> argparse.Namespace:
         help="Directory where generated YAML files will be written.",
     )
     parser.add_argument(
+        "--min-keep-ratios",
+        type=float,
+        nargs="+",
+        required=True,
+        help="List of max_keep_ratio values.",
+    )
+    parser.add_argument(
         "--max-keep-ratios",
         type=float,
         nargs="+",
@@ -88,18 +96,20 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     count = 0
-    for max_keep_ratio, min_block_size, patch_size in itertools.product(
+    for min_keep_ratio, max_keep_ratio, min_block_size, patch_size in itertools.product(
+        args.min_keep_ratios
         args.max_keep_ratios,
         args.min_block_sizes,
         args.patch_sizes,
     ):
         config = deepcopy(template)
+        config["min_keep_ratio"] = min_keep_ratio
         config["max_keep_ratio"] = max_keep_ratio
         config["min_block_size"] = min_block_size
         config["patch_size"] = patch_size
 
         filename = (
-            f"m{_format_value(max_keep_ratio)}"
+            f"m{_format_value(min_keep_ratio)}_{_format_value(max_keep_ratio)}"
             f"_b{_format_value(min_block_size)}"
             f"_p{_format_value(patch_size)}.yaml"
         )
