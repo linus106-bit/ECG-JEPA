@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite output files if they already exist.",
     )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to generated filenames before .yaml.",
+    )
     return parser.parse_args()
 
 
@@ -108,11 +114,19 @@ def main() -> None:
         config["min_block_size"] = min_block_size
         config["patch_size"] = patch_size
 
+        suffix = f"_{args.suffix}" if args.suffix else ""
         filename = (
             f"m{_format_value(min_keep_ratio)}_{_format_value(max_keep_ratio)}"
             f"_b{_format_value(min_block_size)}"
-            f"_p{_format_value(patch_size)}.yaml"
+            f"_p{_format_value(patch_size)}{suffix}.yaml"
         )
+        yaml_name = Path(filename).stem
+        run_config = config.get("run")
+        if not isinstance(run_config, dict):
+            run_config = {}
+        run_config["out_dir"] = f"results/pretrain/{yaml_name}"
+        config["run"] = run_config
+
         output_path = args.output_dir / filename
 
         if output_path.exists() and not args.overwrite:
