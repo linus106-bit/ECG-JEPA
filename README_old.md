@@ -10,6 +10,50 @@ The current codebase supports:
 - Hugging Face dataset directories as the primary data format
 - Legacy `.npy` / `.npz` dumps for backward compatibility in pre-training
 
+## Results
+
+We pre-train models with the [JEPA](https://arxiv.org/abs/2301.08243) framework and evaluate them on PTB-XL. The table below reports average test AUC over 10 runs, with standard deviation in brackets.
+
+| Model         | Method                    | All \[Fine-tune\] | All \[Linear\] | Source                                                                          |
+|---------------|---------------------------|-------------------|----------------|---------------------------------------------------------------------------------|
+| inception1d   | Random Init               | 0.925(08)         | —              | [helme/ecg_ptbxl_benchmarking](https://github.com/helme/ecg_ptbxl_benchmarking) |
+| xresnet1d50   | Random Init               | 0.924(05)         | 0.721(16)      | [hhi-aml/ecg-selfsupervised](https://github.com/hhi-aml/ecg-selfsupervised)     |
+| 4FC+2LSTM+2FC | Random Init               | 0.932(03)         | 0.711(07)      | [hhi-aml/ecg-selfsupervised](https://github.com/hhi-aml/ecg-selfsupervised)     |
+| ViT-B         | Random Init               | 0.837(17)         | 0.867(05)      | This repository                                                                 |
+| ViT-S         | Random Init               | 0.883(04)         | 0.833(06)      | This repository                                                                 |
+| ViT-XS        | Random Init               | 0.911(04)         | 0.815(10)      | This repository                                                                 |
+| xresnet1d50   | SimCLR                    | 0.927(03)         | 0.883(03)      | [hhi-aml/ecg-selfsupervised](https://github.com/hhi-aml/ecg-selfsupervised)     |
+| xresnet1d50   | BYOL                      | 0.929(02)         | 0.878(02)      | [hhi-aml/ecg-selfsupervised](https://github.com/hhi-aml/ecg-selfsupervised)     |
+| 4FC+2LSTM+2FC | CPC (CinC2020)            | 0.942(01)         | 0.927(01)      | [hhi-aml/ecg-selfsupervised](https://github.com/hhi-aml/ecg-selfsupervised)     |
+| 4FC+2LSTM+2FC | CPC (CinC2020 w/o PTB-XL) | 0.940(02)         | 0.919(01)      | [hhi-aml/ecg-selfsupervised](https://github.com/hhi-aml/ecg-selfsupervised)     |
+| S4            | CPC (CinC2021)            | **0.945(02)**     | -              | [tmehari/ssm_ecg](https://github.com/tmehari/ssm_ecg)                           |
+| ViT-B         | JEPA (All)                | 0.940(01)         | 0.935(01)      | This repository                                                                 |
+| ViT-S         | JEPA (All)                | **0.945(01)**     | 0.938(02)      | This repository                                                                 |
+| ViT-S         | JEPA (MIMIC-IV-ECG)       | 0.944(01)         | **0.940(02)**  | This repository                                                                 |
+| ViT-S         | JEPA (PTB-XL)             | 0.930(01)         | 0.926(02)      | This repository                                                                 |
+| ViT-XS        | JEPA (All)                | 0.939(00)         | 0.933(02)      | This repository                                                                 |
+| ViT-XS        | JEPA (MIMIC-IV-ECG)       | 0.943(01)         | 0.933(03)      | This repository                                                                 |
+| ViT-XS        | JEPA (PTB-XL)             | 0.940(01)         | 0.931(02)      | This repository                                                                 |
+
+The next table compares against [ST-MEM](https://arxiv.org/abs/2402.09450) on the PTB-XL superdiagnostic single-label setup.
+
+| Model         | Method                 | Superdiagnostic<br>(Single Label) \[Fine-tune\] | Superdiagnostic<br>(Single Label) \[Linear\] | Source                           |
+|---------------|------------------------|-------------------------------------------------|----------------------------------------------|----------------------------------|
+| ViT-B         | MoCo v3                | 0.913(02)                                       | 0.739(06)                                    | https://arxiv.org/abs/2402.09450 |
+| ViT-B         | CMSC                   | 0.877(03)                                       | 0.797(38)                                    | https://arxiv.org/abs/2402.09450 |
+| ViT-B         | MTAE                   | 0.910(01)                                       | 0.807(06)                                    | https://arxiv.org/abs/2402.09450 |
+| ViT-B         | MTAE+RLM               | 0.911(04)                                       | 0.806(05)                                    | https://arxiv.org/abs/2402.09450 |
+| ViT-B         | MLAE                   | 0.915(01)                                       | 0.779(08)                                    | https://arxiv.org/abs/2402.09450 |
+| ViT-B         | ST-MEM                 | 0.933(03)                                       | 0.838(11)                                    | https://arxiv.org/abs/2402.09450 |
+| 4FC+2LSTM+2FC | CPC (w/ entire PTB-XL) | 0.934(02)                                       | —                                            | https://arxiv.org/abs/2402.09450 |
+| ViT-B         | JEPA (All)             | 0.928(03)                                       | 0.920(02)                                    | This repository                  |
+| ViT-S         | JEPA (All)             | **0.935(02)**                                   | **0.928(03)**                                | This repository                  |
+| ViT-S         | JEPA (MIMIC-IV-ECG)    | 0.932(02)                                       | 0.921(03)                                    | This repository                  |
+| ViT-S         | JEPA (PTB-XL)          | 0.929(02)                                       | 0.917(01)                                    | This repository                  |
+| ViT-XS        | JEPA (All)             | 0.930(01)                                       | 0.924(02)                                    | This repository                  |
+| ViT-XS        | JEPA (MIMIC-IV-ECG)    | 0.928(02)                                       | 0.920(02)                                    | This repository                  |
+| ViT-XS        | JEPA (PTB-XL)          | 0.928(02)                                       | 0.919(02)                                    | This repository                  |
+
 ## Installation
 
 ```bash
