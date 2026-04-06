@@ -114,10 +114,11 @@ def main() -> None:
         config["min_block_size"] = min_block_size
         config["patch_size"] = patch_size
 
+        suffix = f"_{args.suffix}" if args.suffix else ""
         filename = (
             f"m{_format_value(min_keep_ratio)}_{_format_value(max_keep_ratio)}"
             f"_b{_format_value(min_block_size)}"
-            f"_p{_format_value(patch_size)}{args.suffix}.yaml"
+            f"_p{_format_value(patch_size)}{suffix}.yaml"
         )
         yaml_name = Path(filename).stem
         run_config = config.get("run")
