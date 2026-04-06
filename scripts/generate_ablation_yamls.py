@@ -84,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite output files if they already exist.",
     )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="",
+        help="Optional suffix appended to generated filenames before .yaml.",
+    )
     return parser.parse_args()
 
 
@@ -111,7 +117,7 @@ def main() -> None:
         filename = (
             f"m{_format_value(min_keep_ratio)}_{_format_value(max_keep_ratio)}"
             f"_b{_format_value(min_block_size)}"
-            f"_p{_format_value(patch_size)}.yaml"
+            f"_p{_format_value(patch_size)}{args.suffix}.yaml"
         )
         yaml_name = Path(filename).stem
         run_config = config.get("run")
