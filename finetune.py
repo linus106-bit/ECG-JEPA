@@ -583,16 +583,37 @@ def main():
       'specificity_macro': float(np.nanmean(specificity_per_class)),
     }
 
+  def _safe_macro_ovr_auroc(y_true, y_score):
+    classes = np.arange(y_score.shape[1])
+    class_aurocs = []
+    skipped_classes = []
+    for cls in classes:
+      y_true_binary = (y_true == cls).astype(np.int32)
+      # AUC is undefined when a class is all-positive or all-negative.
+      if y_true_binary.min() == y_true_binary.max():
+        skipped_classes.append(int(cls))
+        continue
+      class_aurocs.append(roc_auc_score(y_true_binary, y_score[:, cls]))
+    if len(class_aurocs) == 0:
+      return float('nan'), skipped_classes
+    return float(np.mean(class_aurocs)), skipped_classes
+
+  def _metric_semantics_text():
+    if single_label:
+      return ('Sensitivity=TPR(recall), positive=the class itself in one-vs-rest; '
+              'Specificity=TNR, negative=all other classes in one-vs-rest.')
+    return ('Sensitivity=TPR(recall), positive=label 1; '
+            'Specificity=TNR, negative=label 0.')
+
   def _compute_single_label_metrics(targets, logits):
     probs = torch.softmax(logits, dim=1).cpu().numpy()
     preds = logits.argmax(dim=1).cpu().numpy()
     f1 = f1_score(y_true=targets, y_pred=preds, average='macro')
     acc = accuracy_score(y_true=targets, y_pred=preds)
     metric_stats = _compute_macro_sensitivity_specificity(targets, preds)
-    try:
-      auroc = roc_auc_score(y_true=targets, y_score=probs, average='macro', multi_class='ovr')
-    except ValueError:
-      auroc = float('nan')
+    auroc, skipped_classes = _safe_macro_ovr_auroc(targets, probs)
+    if is_main_process and skipped_classes:
+      logger.warning(f'AUROC skipped classes without both positive/negative samples: {skipped_classes}')
     return preds, probs, f1, acc, auroc, metric_stats
 
   def _eval_val():
@@ -635,14 +656,16 @@ def main():
                   f'val_f1: {metric:.4f} '
                   f'val_acc: {acc:.4f} '
                   f'val_auroc: {auroc:.4f} '
-                  f'val_sensitivity: {sensitivity:.4f} '
-                  f'val_specificity: {specificity:.4f}')
+                  f'val_sensitivity(TPR): {sensitivity:.4f} '
+                  f'val_specificity(TNR): {specificity:.4f} '
+                  f'[{_metric_semantics_text()}]')
     else:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
                   f'val_auc: {metric:.4f} '
-                  f'val_sensitivity: {sensitivity:.4f} '
-                  f'val_specificity: {specificity:.4f}')
+                  f'val_sensitivity(TPR): {sensitivity:.4f} '
+                  f'val_specificity(TNR): {specificity:.4f} '
+                  f'[{_metric_semantics_text()}]')
 
   if eval_config.epochs > 0:
     for epoch in range(eval_config.epochs):
@@ -812,12 +835,15 @@ def main():
       test_sensitivity = test_metric_stats['sensitivity_macro']
       test_specificity = test_metric_stats['specificity_macro']
       try:
-        val_auroc = roc_auc_score(y_true=saved_val_targets, y_score=val_probabilities, average='macro',
-                                  multi_class='ovr')
+        val_auroc, skipped_classes = _safe_macro_ovr_auroc(saved_val_targets, val_probabilities)
+        if skipped_classes:
+          logger.warning(f'Best-val AUROC skipped classes without both positive/negative samples: {skipped_classes}')
       except ValueError:
         val_auroc = float('nan')
       logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}  test_auroc {test_auroc:.4f}  '
-                  f'test_sensitivity {test_sensitivity:.4f}  test_specificity {test_specificity:.4f}')
+                  f'test_sensitivity(TPR) {test_sensitivity:.4f}  '
+                  f'test_specificity(TNR) {test_specificity:.4f}  '
+                  f'[{_metric_semantics_text()}]')
       eval_results = {
         'task': task_name,
         'dataset_type': args.dataset_type,
@@ -828,8 +854,12 @@ def main():
         'val_auroc': float(val_auroc),
         'val_sensitivity': float(val_sensitivity),
         'val_specificity': float(val_specificity),
+        'val_sensitivity_positive': float(val_sensitivity),
+        'val_specificity_negative': float(val_specificity),
         'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
         'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_sensitivity_per_class_positive': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class_negative': best_val_metric_stats['specificity_per_class'].tolist(),
         'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
         'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
         'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
@@ -841,8 +871,12 @@ def main():
         'test_auroc': float(test_auroc),
         'test_sensitivity': float(test_sensitivity),
         'test_specificity': float(test_specificity),
+        'test_sensitivity_positive': float(test_sensitivity),
+        'test_specificity_negative': float(test_specificity),
         'test_sensitivity_per_class': test_metric_stats['sensitivity_per_class'].tolist(),
         'test_specificity_per_class': test_metric_stats['specificity_per_class'].tolist(),
+        'test_sensitivity_per_class_positive': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class_negative': test_metric_stats['specificity_per_class'].tolist(),
         'test_positive_per_class': test_metric_stats['positive_per_class'].tolist(),
         'test_negative_per_class': test_metric_stats['negative_per_class'].tolist(),
         'test_tp_per_class': test_metric_stats['tp_per_class'].tolist(),
@@ -864,7 +898,7 @@ def main():
       test_sensitivity = test_metric_stats['sensitivity_macro']
       test_specificity = test_metric_stats['specificity_macro']
       logger.info(f'test_auc {test_auc:.4f}  test_sensitivity {test_sensitivity:.4f}  '
-                  f'test_specificity {test_specificity:.4f}')
+                  f'test_specificity {test_specificity:.4f}  [{_metric_semantics_text()}]')
       eval_results = {
         'task': task_name,
         'dataset_type': args.dataset_type,
@@ -874,8 +908,12 @@ def main():
         'val_auc': float(best_val_metric),
         'val_sensitivity': float(val_sensitivity),
         'val_specificity': float(val_specificity),
+        'val_sensitivity_positive': float(val_sensitivity),
+        'val_specificity_negative': float(val_specificity),
         'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
         'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_sensitivity_per_class_positive': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class_negative': best_val_metric_stats['specificity_per_class'].tolist(),
         'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
         'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
         'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
@@ -885,8 +923,12 @@ def main():
         'test_auc': float(test_auc),
         'test_sensitivity': float(test_sensitivity),
         'test_specificity': float(test_specificity),
+        'test_sensitivity_positive': float(test_sensitivity),
+        'test_specificity_negative': float(test_specificity),
         'test_sensitivity_per_class': test_metric_stats['sensitivity_per_class'].tolist(),
         'test_specificity_per_class': test_metric_stats['specificity_per_class'].tolist(),
+        'test_sensitivity_per_class_positive': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class_negative': test_metric_stats['specificity_per_class'].tolist(),
         'test_positive_per_class': test_metric_stats['positive_per_class'].tolist(),
         'test_negative_per_class': test_metric_stats['negative_per_class'].tolist(),
         'test_tp_per_class': test_metric_stats['tp_per_class'].tolist(),
@@ -935,10 +977,12 @@ def main():
     ]
     if single_label:
       lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}  Test AUROC: {test_auroc:.4f}')
-      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f}')
+      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f} '
+                   f'({ _metric_semantics_text() })')
     else:
       lines.append(f'  Test AUC      : {test_auc:.4f}')
-      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f}')
+      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f} '
+                   f'({ _metric_semantics_text() })')
     lines.append('=' * 50)
     logger.info('\n' + '\n'.join(lines))
 
