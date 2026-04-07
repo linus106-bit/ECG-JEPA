@@ -92,6 +92,41 @@ def _load_capture24_legacy(prefix):
 
 
 
+
+
+def _canonicalize_single_label_array(x, num_channels):
+  """Convert single-label input arrays to (N, C, T)."""
+  x = np.asarray(x, dtype=np.float16)
+
+  # Remove singleton dimensions except batch when possible
+  while x.ndim > 3:
+    squeeze_axes = tuple(i for i in range(1, x.ndim) if x.shape[i] == 1)
+    if not squeeze_axes:
+      break
+    x = np.squeeze(x, axis=squeeze_axes)
+
+  if x.ndim == 2:
+    # (N, T) -> (N, 1, T)
+    x = x[:, None, :]
+  elif x.ndim != 3:
+    raise ValueError(f'Expected single-label array with 2D/3D shape, got {x.shape}')
+
+  # Normalize layout to (N, C, T)
+  if x.shape[1] == num_channels:
+    return x
+  if x.shape[2] == num_channels:
+    return np.transpose(x, (0, 2, 1))
+
+  # Fallback for one-channel signals with ambiguous axes
+  if num_channels == 1:
+    if x.shape[1] == 1:
+      return x
+    if x.shape[2] == 1:
+      return np.transpose(x, (0, 2, 1))
+
+  raise ValueError(f'Could not infer (N, C, T) layout for shape {x.shape} with num_channels={num_channels}')
+
+
 def main():
   # Load config YAML and extract run: section early (needed before distributed setup)
   if args.config is None:
@@ -285,14 +320,14 @@ def main():
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
 
-    # compute training statistics; preprocessing is done lazily in transforms
-    # legacy dumps are channels-last (N, T, C), HF is channels-first (N, C, T)
-    if har_transpose_input:
-      mean = np.mean(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-      std = np.std(x_train_all[train_indices], axis=(0, 1), keepdims=True, dtype=np.float32)
-    else:
-      mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
-      std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
+    # Canonicalize to channels-first (N, C, T), then compute per-channel stats.
+    num_channels = len(dataset_cls.channels)
+    x_train_all = _canonicalize_single_label_array(x_train_all, num_channels=num_channels)
+    x_test = _canonicalize_single_label_array(x_test, num_channels=num_channels)
+    har_transpose_input = False
+
+    mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
+    std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
 
     y_train_all = torch.from_numpy(train_labels).long()
     y_test = torch.from_numpy(test_labels).long()
@@ -880,14 +915,19 @@ class PreprocessHAR:
     self.transpose_input = transpose_input
 
   def __call__(self, x):
-    if self.transpose_input:
-      x = x.T  # (T, C) -> (C, T)
-      mean = self.mean.reshape(-1, 1)
-      std = self.std.reshape(-1, 1)
-    else:
-      mean = self.mean
-      std = self.std
     x = np.array(x, dtype=np.float32, copy=True)
+    x = np.squeeze(x)
+    if x.ndim == 1:
+      x = x[None, :]
+    elif x.ndim != 2:
+      raise ValueError(f'Expected (C, T) or (T, C) sample, got {x.shape}')
+
+    expected_channels = len(self.channel_order)
+    if self.transpose_input or (x.shape[0] != expected_channels and x.shape[1] == expected_channels):
+      x = x.T
+
+    mean = np.asarray(self.mean, dtype=np.float32).reshape(-1, 1)
+    std = np.asarray(self.std, dtype=np.float32).reshape(-1, 1)
     x = (x - mean) / (std + 1e-8)
     x.clip(-5, 5, out=x)
     x = x[self.channel_order]
