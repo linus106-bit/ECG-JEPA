@@ -6,7 +6,7 @@ from os import path
 
 import numpy as np
 import torch
-from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
+from sklearn.metrics import f1_score, accuracy_score, roc_auc_score, confusion_matrix
 from torch.utils.data import DataLoader
 
 import configs
@@ -120,16 +120,14 @@ def main():
   test_targets = torch.cat(test_targets).cpu().numpy()
   test_f1 = f1_score(y_true=test_targets, y_pred=test_preds, average='macro')
   test_acc = accuracy_score(y_true=test_targets, y_pred=test_preds)
-  sensitivities, specificities = [], []
-  for class_id in np.unique(np.concatenate([test_targets, test_preds])):
-    y_true_class = test_targets == class_id
-    y_pred_class = test_preds == class_id
-    tp = np.logical_and(y_true_class, y_pred_class).sum()
-    tn = np.logical_and(~y_true_class, ~y_pred_class).sum()
-    fp = np.logical_and(~y_true_class, y_pred_class).sum()
-    fn = np.logical_and(y_true_class, ~y_pred_class).sum()
-    sensitivities.append(tp / (tp + fn) if (tp + fn) > 0 else np.nan)
-    specificities.append(tn / (tn + fp) if (tn + fp) > 0 else np.nan)
+  classes = np.unique(np.concatenate([test_targets, test_preds]))
+  cm = confusion_matrix(test_targets, test_preds, labels=classes)
+  tp = np.diag(cm).astype(np.float64)
+  fn = cm.sum(axis=1) - tp
+  fp = cm.sum(axis=0) - tp
+  tn = cm.sum() - (tp + fn + fp)
+  sensitivities = np.divide(tp, tp + fn, out=np.full_like(tp, np.nan, dtype=np.float64), where=(tp + fn) > 0)
+  specificities = np.divide(tn, tn + fp, out=np.full_like(tn, np.nan, dtype=np.float64), where=(tn + fp) > 0)
   test_sensitivity = float(np.nanmean(sensitivities))
   test_specificity = float(np.nanmean(specificities))
   try:

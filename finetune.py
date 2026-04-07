@@ -17,7 +17,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix, multilabel_confusion_matrix
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -546,32 +546,27 @@ def main():
       return F.cross_entropy(logits, y)
     return F.binary_cross_entropy_with_logits(logits, y)
 
-  def _binary_sensitivity_specificity(y_true_bin, y_pred_bin):
-    y_true_bin = y_true_bin.astype(bool)
-    y_pred_bin = y_pred_bin.astype(bool)
-    tp = np.logical_and(y_true_bin, y_pred_bin).sum()
-    tn = np.logical_and(~y_true_bin, ~y_pred_bin).sum()
-    fp = np.logical_and(~y_true_bin, y_pred_bin).sum()
-    fn = np.logical_and(y_true_bin, ~y_pred_bin).sum()
-    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else np.nan
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-    return sensitivity, specificity
+  def _safe_ratio(numerator, denominator):
+    return np.divide(numerator, denominator, out=np.full_like(numerator, np.nan, dtype=np.float64), where=denominator > 0)
 
   def _compute_macro_sensitivity_specificity(y_true, y_pred):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
-    sensitivities, specificities = [], []
     if y_true.ndim == 1:
       classes = np.unique(np.concatenate([y_true, y_pred]))
-      for class_id in classes:
-        sens, spec = _binary_sensitivity_specificity(y_true == class_id, y_pred == class_id)
-        sensitivities.append(sens)
-        specificities.append(spec)
+      cm = confusion_matrix(y_true, y_pred, labels=classes)
+      tp = np.diag(cm).astype(np.float64)
+      fn = cm.sum(axis=1) - tp
+      fp = cm.sum(axis=0) - tp
+      tn = cm.sum() - (tp + fn + fp)
     else:
-      for class_idx in range(y_true.shape[1]):
-        sens, spec = _binary_sensitivity_specificity(y_true[:, class_idx], y_pred[:, class_idx])
-        sensitivities.append(sens)
-        specificities.append(spec)
+      mcm = multilabel_confusion_matrix(y_true, y_pred)
+      tn = mcm[:, 0, 0].astype(np.float64)
+      fp = mcm[:, 0, 1].astype(np.float64)
+      fn = mcm[:, 1, 0].astype(np.float64)
+      tp = mcm[:, 1, 1].astype(np.float64)
+    sensitivities = _safe_ratio(tp, tp + fn)
+    specificities = _safe_ratio(tn, tn + fp)
     return float(np.nanmean(sensitivities)), float(np.nanmean(specificities))
 
   def _compute_single_label_metrics(targets, logits):
