@@ -267,6 +267,9 @@ def main():
   elif is_main_process:
     logger.debug(f'data_dir is not a directory: {data_dir}')
 
+
+  val_split_name = 'val' if 'val' in available_splits else ('validation' if 'validation' in available_splits else None)
+
   if dataset_type in ('har', 'ppg'):
     # Single-label classification for HAR/PPG datasets
     single_label = True
@@ -347,7 +350,7 @@ def main():
     if args.task == 'ST-MEM':
       single_label = True
 
-    if 'val' not in available_splits:
+    if val_split_name is None:
       raise ValueError('ECG dataset must have train/val/test splits. '
                        'Use scripts/convert_to_hf_dataset.py to create the proper format.')
 
@@ -361,7 +364,7 @@ def main():
       return x, y
 
     x_train, y_train = _load_ecg_split(hf_dataset['train'])
-    x_val, y_val = _load_ecg_split(hf_dataset['val'])
+    x_val, y_val = _load_ecg_split(hf_dataset[val_split_name])
     x_test, y_test = _load_ecg_split(hf_dataset['test'])
 
     # Get label_names and num_classes from the dataset
