@@ -17,7 +17,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix, multilabel_confusion_matrix
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -497,6 +497,7 @@ def main():
   train_loss = AverageMeter()
   best_val_metric = float('-inf')
   best_val_predictions, saved_val_targets = None, None
+  best_val_metric_stats = None
   best_epoch_or_step = None
   best_chkpt = None
   global_step = 0
@@ -510,6 +511,54 @@ def main():
     if single_label:
       return F.cross_entropy(logits, y)
     return F.binary_cross_entropy_with_logits(logits, y)
+
+  def _safe_ratio(numerator, denominator):
+    return np.divide(numerator, denominator, out=np.full_like(numerator, np.nan, dtype=np.float64), where=denominator > 0)
+
+  def _compute_macro_sensitivity_specificity(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.ndim == 1:
+      classes = np.unique(np.concatenate([y_true, y_pred]))
+      cm = confusion_matrix(y_true, y_pred, labels=classes)
+      tp = np.diag(cm).astype(np.float64)
+      fn = cm.sum(axis=1) - tp
+      fp = cm.sum(axis=0) - tp
+      tn = cm.sum() - (tp + fn + fp)
+    else:
+      mcm = multilabel_confusion_matrix(y_true, y_pred)
+      tn = mcm[:, 0, 0].astype(np.float64)
+      fp = mcm[:, 0, 1].astype(np.float64)
+      fn = mcm[:, 1, 0].astype(np.float64)
+      tp = mcm[:, 1, 1].astype(np.float64)
+    sensitivity_per_class = _safe_ratio(tp, tp + fn)
+    specificity_per_class = _safe_ratio(tn, tn + fp)
+    positive_per_class = tp + fn
+    negative_per_class = tn + fp
+    return {
+      'sensitivity_per_class': sensitivity_per_class,
+      'specificity_per_class': specificity_per_class,
+      'positive_per_class': positive_per_class,
+      'negative_per_class': negative_per_class,
+      'tp_per_class': tp,
+      'tn_per_class': tn,
+      'fp_per_class': fp,
+      'fn_per_class': fn,
+      'sensitivity_macro': float(np.nanmean(sensitivity_per_class)),
+      'specificity_macro': float(np.nanmean(specificity_per_class)),
+    }
+
+  def _compute_single_label_metrics(targets, logits):
+    probs = torch.softmax(logits, dim=1).cpu().numpy()
+    preds = logits.argmax(dim=1).cpu().numpy()
+    f1 = f1_score(y_true=targets, y_pred=preds, average='macro')
+    acc = accuracy_score(y_true=targets, y_pred=preds)
+    metric_stats = _compute_macro_sensitivity_specificity(targets, preds)
+    try:
+      auroc = roc_auc_score(y_true=targets, y_score=probs, average='macro', multi_class='ovr')
+    except ValueError:
+      auroc = float('nan')
+    return preds, probs, f1, acc, auroc, metric_stats
 
   def _eval_val():
     val_logits_or_preds, val_targets = [], []
@@ -525,32 +574,40 @@ def main():
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
         if single_label:
-          val_logits_or_preds.append(logits.argmax(dim=1).clone())
+          val_logits_or_preds.append(logits.clone())
         else:
           val_logits_or_preds.append(logits.clone())
         val_targets.append(by.clone())
     model.train()
     targets = torch.cat(val_targets).cpu().numpy()
     if single_label:
-      preds = torch.cat(val_logits_or_preds).cpu().numpy()
-      metric = f1_score(y_true=targets, y_pred=preds, average='macro')
-      acc = accuracy_score(y_true=targets, y_pred=preds)
-      return preds, targets, metric, acc
+      logits = torch.cat(val_logits_or_preds)
+      preds, probs, metric, acc, auroc, metric_stats = _compute_single_label_metrics(targets, logits)
+      return {'preds': preds, 'probs': probs}, targets, metric, acc, auroc, metric_stats
     else:
       preds = torch.cat(val_logits_or_preds).sigmoid().cpu().numpy()
       metric = roc_auc_score(y_true=targets, y_score=preds, average='macro')
-      return preds, targets, metric, None
+      binary_preds = (preds >= 0.5).astype(np.int32)
+      metric_stats = _compute_macro_sensitivity_specificity(targets, binary_preds)
+      return preds, targets, metric, None, None, metric_stats
 
-  def _log_val(epoch_or_step, label, preds, targets, metric, acc, new_best):
+  def _log_val(epoch_or_step, label, preds, targets, metric, acc, auroc, metric_stats, new_best):
+    sensitivity = metric_stats['sensitivity_macro']
+    specificity = metric_stats['specificity_macro']
     if single_label:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
                   f'val_f1: {metric:.4f} '
-                  f'val_acc: {acc:.4f}')
+                  f'val_acc: {acc:.4f} '
+                  f'val_auroc: {auroc:.4f} '
+                  f'val_sensitivity: {sensitivity:.4f} '
+                  f'val_specificity: {specificity:.4f}')
     else:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
-                  f'val_auc: {metric:.4f}')
+                  f'val_auc: {metric:.4f} '
+                  f'val_sensitivity: {sensitivity:.4f} '
+                  f'val_specificity: {specificity:.4f}')
 
   if eval_config.epochs > 0:
     for epoch in range(eval_config.epochs):
@@ -594,16 +651,18 @@ def main():
             'eval_config': dataclasses.asdict(eval_config),
             'step': global_step,
           }, new_chkpt_path)
-      val_predictions, val_targets, val_metric, val_acc = _eval_val()
+      val_predictions, val_targets, val_metric, val_acc, val_auroc, val_metric_stats = _eval_val()
       new_best = val_metric > best_val_metric
       if new_best:
         best_val_metric = val_metric
         best_val_predictions = val_predictions
         saved_val_targets = val_targets
+        best_val_metric_stats = val_metric_stats
         best_epoch_or_step = epoch
         best_chkpt = copy.deepcopy(original_model.state_dict())
       if is_main_process:
-        _log_val(epoch + 1, 'epoch', val_predictions, val_targets, val_metric, val_acc, new_best)
+        _log_val(epoch + 1, 'epoch', val_predictions, val_targets, val_metric, val_acc, val_auroc,
+                 val_metric_stats, new_best)
       if epoch - best_epoch_or_step >= eval_config.early_stopping_patience:
         if is_main_process:
           logging.info(f'stopping training early because validation metric does not improve')
@@ -656,16 +715,18 @@ def main():
             'eval_config': dataclasses.asdict(eval_config),
             'step': step + 1,
           }, new_chkpt_path)
-        val_predictions, val_targets, val_metric, val_acc = _eval_val()
+        val_predictions, val_targets, val_metric, val_acc, val_auroc, val_metric_stats = _eval_val()
         new_best = val_metric > best_val_metric
         if new_best:
           best_val_metric = val_metric
           best_val_predictions = val_predictions
           saved_val_targets = val_targets
+          best_val_metric_stats = val_metric_stats
           best_epoch_or_step = step
           best_chkpt = copy.deepcopy(original_model.state_dict())
         if is_main_process:
-          _log_val(step + 1, 'step', val_predictions, val_targets, val_metric, val_acc, new_best)
+          _log_val(step + 1, 'step', val_predictions, val_targets, val_metric, val_acc, val_auroc,
+                   val_metric_stats, new_best)
         if step - best_epoch_or_step >= eval_config.early_stopping_patience:
           if is_main_process:
             logging.info('stopping training early because validation metric does not improve')
@@ -686,6 +747,8 @@ def main():
 
   if is_main_process:
     logger.info('loading best model checkpoint')
+    if best_val_metric_stats is None:
+      raise RuntimeError('best_val_metric_stats is not available; validation did not run')
     original_model.load_state_dict(best_chkpt)
 
     test_logits_or_preds, test_targets = [], []
@@ -700,18 +763,26 @@ def main():
         if eval_config.crop_duration is not None:
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
-        if single_label:
-          test_logits_or_preds.append(logits.argmax(dim=1).clone())
-        else:
-          test_logits_or_preds.append(logits.clone())
+        test_logits_or_preds.append(logits.clone())
         test_targets.append(by.clone())
 
     test_targets = torch.cat(test_targets).cpu().numpy()
     if single_label:
-      test_predictions = torch.cat(test_logits_or_preds).cpu().numpy()
-      test_f1 = f1_score(y_true=test_targets, y_pred=test_predictions, average='macro')
-      test_acc = accuracy_score(y_true=test_targets, y_pred=test_predictions)
-      logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}')
+      test_logits = torch.cat(test_logits_or_preds)
+      test_predictions, test_probabilities, test_f1, test_acc, test_auroc, test_metric_stats = _compute_single_label_metrics(
+        targets=test_targets, logits=test_logits)
+      val_probabilities = best_val_predictions['probs']
+      val_sensitivity = best_val_metric_stats['sensitivity_macro']
+      val_specificity = best_val_metric_stats['specificity_macro']
+      test_sensitivity = test_metric_stats['sensitivity_macro']
+      test_specificity = test_metric_stats['specificity_macro']
+      try:
+        val_auroc = roc_auc_score(y_true=saved_val_targets, y_score=val_probabilities, average='macro',
+                                  multi_class='ovr')
+      except ValueError:
+        val_auroc = float('nan')
+      logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}  test_auroc {test_auroc:.4f}  '
+                  f'test_sensitivity {test_sensitivity:.4f}  test_specificity {test_specificity:.4f}')
       eval_results = {
         'task': task_name,
         'dataset_type': args.dataset_type,
@@ -719,8 +790,30 @@ def main():
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
         'val_f1': float(best_val_metric),
+        'val_auroc': float(val_auroc),
+        'val_sensitivity': float(val_sensitivity),
+        'val_specificity': float(val_specificity),
+        'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
+        'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
+        'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
+        'val_tn_per_class': best_val_metric_stats['tn_per_class'].tolist(),
+        'val_fp_per_class': best_val_metric_stats['fp_per_class'].tolist(),
+        'val_fn_per_class': best_val_metric_stats['fn_per_class'].tolist(),
         'test_f1': float(test_f1),
         'test_acc': float(test_acc),
+        'test_auroc': float(test_auroc),
+        'test_sensitivity': float(test_sensitivity),
+        'test_specificity': float(test_specificity),
+        'test_sensitivity_per_class': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class': test_metric_stats['specificity_per_class'].tolist(),
+        'test_positive_per_class': test_metric_stats['positive_per_class'].tolist(),
+        'test_negative_per_class': test_metric_stats['negative_per_class'].tolist(),
+        'test_tp_per_class': test_metric_stats['tp_per_class'].tolist(),
+        'test_tn_per_class': test_metric_stats['tn_per_class'].tolist(),
+        'test_fp_per_class': test_metric_stats['fp_per_class'].tolist(),
+        'test_fn_per_class': test_metric_stats['fn_per_class'].tolist(),
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
@@ -729,7 +822,14 @@ def main():
     else:
       test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
-      logger.info(f'test_auc {test_auc:.4f}')
+      test_binary_predictions = (test_predictions >= 0.5).astype(np.int32)
+      test_metric_stats = _compute_macro_sensitivity_specificity(test_targets, test_binary_predictions)
+      val_sensitivity = best_val_metric_stats['sensitivity_macro']
+      val_specificity = best_val_metric_stats['specificity_macro']
+      test_sensitivity = test_metric_stats['sensitivity_macro']
+      test_specificity = test_metric_stats['specificity_macro']
+      logger.info(f'test_auc {test_auc:.4f}  test_sensitivity {test_sensitivity:.4f}  '
+                  f'test_specificity {test_specificity:.4f}')
       eval_results = {
         'task': task_name,
         'dataset_type': args.dataset_type,
@@ -737,7 +837,27 @@ def main():
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
         'val_auc': float(best_val_metric),
+        'val_sensitivity': float(val_sensitivity),
+        'val_specificity': float(val_specificity),
+        'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
+        'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
+        'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
+        'val_tn_per_class': best_val_metric_stats['tn_per_class'].tolist(),
+        'val_fp_per_class': best_val_metric_stats['fp_per_class'].tolist(),
+        'val_fn_per_class': best_val_metric_stats['fn_per_class'].tolist(),
         'test_auc': float(test_auc),
+        'test_sensitivity': float(test_sensitivity),
+        'test_specificity': float(test_specificity),
+        'test_sensitivity_per_class': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class': test_metric_stats['specificity_per_class'].tolist(),
+        'test_positive_per_class': test_metric_stats['positive_per_class'].tolist(),
+        'test_negative_per_class': test_metric_stats['negative_per_class'].tolist(),
+        'test_tp_per_class': test_metric_stats['tp_per_class'].tolist(),
+        'test_tn_per_class': test_metric_stats['tn_per_class'].tolist(),
+        'test_fp_per_class': test_metric_stats['fp_per_class'].tolist(),
+        'test_fn_per_class': test_metric_stats['fn_per_class'].tolist(),
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
@@ -749,9 +869,21 @@ def main():
       json.dump(eval_results, f, indent=2, ensure_ascii=False)
     logger.info(f'saved eval results json to {json_result_path}')
 
-    np.savez(path.join(args.out, f'{task_name}_predictions.npz'),
-             val_targets=saved_val_targets, val_predictions=best_val_predictions,
-             test_targets=test_targets, test_predictions=test_predictions)
+    prediction_dump_path = path.join(args.out, f'{task_name}_predictions.npz')
+    if single_label:
+      np.savez(prediction_dump_path,
+               val_targets=saved_val_targets,
+               val_predictions=best_val_predictions['preds'],
+               val_probabilities=best_val_predictions['probs'],
+               test_targets=test_targets,
+               test_predictions=test_predictions,
+               test_probabilities=test_probabilities)
+    else:
+      np.savez(prediction_dump_path,
+               val_targets=saved_val_targets,
+               val_predictions=best_val_predictions,
+               test_targets=test_targets,
+               test_predictions=test_predictions)
 
   pbar.close()
   if is_main_process:
@@ -767,9 +899,11 @@ def main():
       f'  Best val metric : {best_val_metric:.4f}',
     ]
     if single_label:
-      lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}')
+      lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}  Test AUROC: {test_auroc:.4f}')
+      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f}')
     else:
       lines.append(f'  Test AUC      : {test_auc:.4f}')
+      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f}')
     lines.append('=' * 50)
     logger.info('\n' + '\n'.join(lines))
 
