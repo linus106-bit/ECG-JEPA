@@ -528,7 +528,6 @@ def main():
   # -------------------------------------------------------------------------
   # Training loop (shared structure, branched on single_label for metrics)
   # -------------------------------------------------------------------------
-  step_time = AverageMeter()
   train_loss = AverageMeter()
   best_val_metric = float('-inf')
   best_val_predictions, saved_val_targets = None, None
@@ -672,7 +671,6 @@ def main():
       if is_distributed:
         train_sampler.set_epoch(epoch)
       for x, y in train_loader:
-        step_start = time()
         update_learning_rate_(optimizer, next(lr_schedule))
         x, y = x.to(device), y.to(device)
         with auto_mixed_precision:
@@ -684,21 +682,14 @@ def main():
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
-        step_time.update(time() - step_start)
         train_loss.update(loss.item())
         if is_main_process:
           current_epoch = global_step / steps_per_epoch
           current_lr = optimizer.param_groups[0]['lr']
           last_loss = train_loss.value
           last_lr = current_lr
-          logger.info(f'step: {global_step} '
-                      f'epoch: {current_epoch:.4f} '
-                      f'train_loss: {train_loss.value:.4f} '
-                      f'lr: {current_lr:.6e} '
-                      f'step_time: {step_time.value:.4f}')
           pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
           pbar.update(1)
-          step_time = AverageMeter()
           train_loss = AverageMeter()
         if is_main_process and global_step % eval_config.checkpoint_interval == 0:
           new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
@@ -736,7 +727,6 @@ def main():
     train_dataset_size = len(train_dataset)
     train_iterator = _cycle(train_loader)
     for step in range(eval_config.steps):
-      step_start = time()
       update_learning_rate_(optimizer, next(lr_schedule))
       x, y = (tensor.to(device) for tensor in next(train_iterator))
       with auto_mixed_precision:
@@ -747,21 +737,14 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
       optimizer.step()
       optimizer.zero_grad(set_to_none=True)
-      step_time.update(time() - step_start)
       train_loss.update(loss.item())
       if is_main_process:
         current_epoch = (step + 1) * eval_config.batch_size / train_dataset_size
         current_lr = optimizer.param_groups[0]['lr']
         last_loss = train_loss.value
         last_lr = current_lr
-        logger.info(f'step: {step + 1} '
-                    f'epoch: {current_epoch:.4f} '
-                    f'train_loss: {train_loss.value:.4f} '
-                    f'lr: {current_lr:.6e} '
-                    f'step_time: {step_time.value:.4f}')
         pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
         pbar.update(1)
-        step_time = AverageMeter()
         train_loss = AverageMeter()
       if (step + 1) % eval_config.checkpoint_interval == 0:
         if is_main_process:
