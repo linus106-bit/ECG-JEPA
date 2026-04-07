@@ -569,16 +569,36 @@ def main():
     specificities = _safe_ratio(tn, tn + fp)
     return float(np.nanmean(sensitivities)), float(np.nanmean(specificities))
 
+  def _compute_single_label_auroc(targets, probs):
+    # Robust macro AUROC for single-label tasks where some classes may be absent in a split.
+    # sklearn multiclass AUROC can raise when y_true does not contain all classes.
+    per_class_aurocs = []
+    skipped_classes = []
+    for class_index in range(num_classes):
+      y_binary = (targets == class_index).astype(np.int32)
+      if np.unique(y_binary).size < 2:
+        skipped_classes.append(class_index)
+        continue
+      per_class_aurocs.append(roc_auc_score(y_true=y_binary, y_score=probs[:, class_index]))
+
+    if is_main_process and skipped_classes:
+      logger.warning('AUROC skipped classes with missing positives/negatives in this split: '
+                     f'{skipped_classes}')
+
+    if not per_class_aurocs:
+      if is_main_process:
+        logger.warning('AUROC is undefined for this split (all classes missing positives or negatives); '
+                       'returning 0.5 as chance-level fallback.')
+      return 0.5
+    return float(np.mean(per_class_aurocs))
+
   def _compute_single_label_metrics(targets, logits):
     probs = torch.softmax(logits, dim=1).cpu().numpy()
     preds = logits.argmax(dim=1).cpu().numpy()
     f1 = f1_score(y_true=targets, y_pred=preds, average='macro')
     acc = accuracy_score(y_true=targets, y_pred=preds)
     sensitivity, specificity = _compute_macro_sensitivity_specificity(targets, preds)
-    try:
-      auroc = roc_auc_score(y_true=targets, y_score=probs, average='macro', multi_class='ovr')
-    except ValueError:
-      auroc = float('nan')
+    auroc = _compute_single_label_auroc(targets=targets, probs=probs)
     return preds, probs, f1, acc, auroc, sensitivity, specificity
 
   def _eval_val():
@@ -789,11 +809,7 @@ def main():
       val_probabilities = best_val_predictions['probs']
       val_sensitivity, val_specificity = _compute_macro_sensitivity_specificity(
         saved_val_targets, best_val_predictions['preds'])
-      try:
-        val_auroc = roc_auc_score(y_true=saved_val_targets, y_score=val_probabilities, average='macro',
-                                  multi_class='ovr')
-      except ValueError:
-        val_auroc = float('nan')
+      val_auroc = _compute_single_label_auroc(targets=saved_val_targets, probs=val_probabilities)
       logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}  test_auroc {test_auroc:.4f}  '
                   f'test_sensitivity {test_sensitivity:.4f}  test_specificity {test_specificity:.4f}')
       eval_results = {
