@@ -365,9 +365,26 @@ def main():
   train_prefetcher.reset()
 
   global_step = start_step
+  last_completed_epoch = start_epoch
+
+  def _save_checkpoint(step, epoch=None):
+    chkpt = {
+      'model': original_model.state_dict(),
+      'optimizer': optimizer.state_dict(),
+      'config': dataclasses.asdict(config),
+      'step': step,
+    }
+    if epoch is not None:
+      chkpt['epoch'] = epoch
+    new_chkpt_path = path.join(args.out, f'chkpt_{step}.pt')
+    torch.save(chkpt, new_chkpt_path)
+    latest_chkpt_path = path.join(args.out, 'last_chkpt.pt')
+    torch.save(chkpt, latest_chkpt_path)
+
   try:
     if config.epochs > 0:
       for epoch in range(start_epoch, config.epochs):
+        last_completed_epoch = epoch + 1
         for _ in range(steps_per_epoch):
           _train_step(train_prefetcher)
           global_step += 1
@@ -379,17 +396,11 @@ def main():
             train_loss = AverageMeter()
             train_prefetcher.reset_metrics()
           if is_main_process and global_step % config.checkpoint_interval == 0:
-            new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
-            torch.save({
-              'model': original_model.state_dict(),
-              'optimizer': optimizer.state_dict(),
-              'config': dataclasses.asdict(config),
-              'epoch': epoch + 1,
-              'step': global_step,
-            }, new_chkpt_path)
+            _save_checkpoint(step=global_step, epoch=epoch + 1)
     else:
       for step in range(start_step, config.steps):
         _train_step(train_prefetcher)
+        global_step = step + 1
         if is_main_process:
           last_loss = train_loss.value
           last_lr = log_training_stats(
@@ -398,13 +409,11 @@ def main():
           train_loss = AverageMeter()
           train_prefetcher.reset_metrics()
         if is_main_process and (step + 1) % config.checkpoint_interval == 0:
-          new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
-          torch.save({
-            'model': original_model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'config': dataclasses.asdict(config),
-            'step': step + 1,
-          }, new_chkpt_path)
+          _save_checkpoint(step=step + 1)
+
+    if is_main_process and global_step > start_step and global_step % config.checkpoint_interval != 0:
+      final_epoch = last_completed_epoch if config.epochs > 0 else None
+      _save_checkpoint(step=global_step, epoch=final_epoch)
   finally:
     train_prefetcher.close()
     pbar.close()
