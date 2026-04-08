@@ -324,7 +324,6 @@ def main():
   if args.compile:
     model = torch.compile(model)
 
-  step_time = AverageMeter()
   train_loss = AverageMeter()
   train_start_time = time()
   last_loss = None
@@ -333,7 +332,6 @@ def main():
               unit='step', disable=not is_main_process)
 
   def _train_step(train_iterator):
-    step_start = time()
     update_learning_rate_(optimizer, next(lr_schedule))
     update_weight_decay_(optimizer, next(wd_schedule))
     batch_loss = 0.
@@ -351,7 +349,6 @@ def main():
     optimizer.step()
     train_loss.update(batch_loss)
     optimizer.zero_grad(set_to_none=True)
-    step_time.update(time() - step_start)
 
   def log_training_stats(global_step, total_dataset_size):
     current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
@@ -379,7 +376,6 @@ def main():
             last_lr = log_training_stats(
               global_step=global_step,
               total_dataset_size=total_dataset_size)
-            step_time = AverageMeter()
             train_loss = AverageMeter()
             train_prefetcher.reset_metrics()
           if is_main_process and global_step % config.checkpoint_interval == 0:
@@ -399,7 +395,6 @@ def main():
           last_lr = log_training_stats(
             global_step=step + 1,
             total_dataset_size=total_dataset_size)
-          step_time = AverageMeter()
           train_loss = AverageMeter()
           train_prefetcher.reset_metrics()
         if is_main_process and (step + 1) % config.checkpoint_interval == 0:
