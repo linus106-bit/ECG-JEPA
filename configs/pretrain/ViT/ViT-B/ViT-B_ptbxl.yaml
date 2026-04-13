@@ -1,6 +1,7 @@
+# learnable encoder parameters: 85,185,024
 # run (execution settings — previously in the shell script)
 run:
-  out_dir: results/pretrain/MambaS_mimic
+  out_dir: results/pretrain/ViTB_ptbxl
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training
@@ -13,18 +14,17 @@ min_block_size: 10
 min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
-  mimic-iv-ecg:
-    path: /path/to/mimic-iv-ecg
+  ptb-xl:
+    path: /path/to/ptb-xl
     split: train
     weight: 1.
 # model architecture
-model_type: mamba
-dim: 384
-depth: 8
-num_heads: 6
-pred_dim: 192
-pred_depth: 8
-pred_num_heads: 6
+dim: 768
+depth: 12
+num_heads: 12
+pred_dim: 384
+pred_depth: 12
+pred_num_heads: 12
 mlp_ratio: 4.
 qkv_bias: False
 dropout: 0.
@@ -33,11 +33,8 @@ num_registers: 1
 bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
-mamba_d_state: 16
-mamba_d_conv: 4
-mamba_expand: 2
 # training
-epochs: 200
+epochs: 2000
 batch_size: 2048
 encoder_momentum: 0.998
 final_encoder_momentum: 0.9995

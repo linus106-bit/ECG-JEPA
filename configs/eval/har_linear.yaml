@@ -1,6 +1,7 @@
 # Linear evaluation config for Capture-24 HAR
 # run (execution settings — previously in the shell script)
 run:
+  out_dir: results/finetune/har_linear
   amp: bfloat16
   encoder: pretrain/ViTS_capture24/checkpoint.pt  # path to pretrain checkpoint
   task: har
@@ -8,7 +9,7 @@ run:
 
 # dataset path (set data_dir to your dataset location)
 dataset:
-  data_dir: /group-volume/datasets/openDB/Capture24
+  data_dir: /path/to/capture-24
 
 # data
 crop_duration: null
@@ -21,8 +22,8 @@ bias: False
 dropout: 0.
 frozen: True
 # training
-epochs: 50
-batch_size: 256
+epochs: 25
+batch_size: 1024
 learning_rate: 1.0e-3
 final_learning_rate: 1.0e-3
 learning_rate_warmup_ratio: 0.0
@@ -30,4 +31,4 @@ weight_decay: 1.0e-1
 opt_betas: [0.9, 0.999]
 gradient_clip: 1.
 early_stopping_patience: 10
-checkpoint_interval: 500
+checkpoint_interval: 1000

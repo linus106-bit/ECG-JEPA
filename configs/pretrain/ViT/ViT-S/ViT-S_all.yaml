@@ -1,6 +1,7 @@
+# learnable encoder parameters: 14,277,888
 # run (execution settings — previously in the shell script)
 run:
-  out_dir: results/pretrain/MambaS_mimic
+  out_dir: results/pretrain/ViTS_all
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training
@@ -14,11 +15,49 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   mimic-iv-ecg:
-    path: /path/to/mimic-iv-ecg
+    path: /path/to/mimic-iv-ecg  # HF dataset directory (or .npy/.npz file for legacy)
     split: train
-    weight: 1.
+    weight: 0.7
+  code-15:
+    path: /path/to/code-15
+    split: train
+    weight: 0.1
+  ptb-xl:
+    path: /path/to/ptb-xl
+    split: train
+    weight: 0.05
+  ptb:
+    path: /path/to/ptb
+    split: train
+    variable_length: true
+    weight: 0.01875
+  cpsc:
+    path: /path/to/cpsc
+    split: train
+    variable_length: true
+    weight: 0.025
+  cpsc-extra:
+    path: /path/to/cpsc-extra
+    split: train
+    variable_length: true
+    weight: 0.0125
+  georgia:
+    path: /path/to/georgia
+    split: train
+    weight: 0.0375
+  ningbo:
+    path: /path/to/ningbo
+    split: train
+    weight: 0.028125
+  chapman-shaoxing:
+    path: /path/to/chapman-shaoxing
+    split: train
+    weight: 0.009375
+  st-petersburg:
+    path: /path/to/st-petersburg
+    split: train
+    weight: 0.01875
 # model architecture
-model_type: mamba
 dim: 384
 depth: 8
 num_heads: 6
@@ -33,9 +72,6 @@ num_registers: 1
 bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
-mamba_d_state: 16
-mamba_d_conv: 4
-mamba_expand: 2
 # training
 epochs: 200
 batch_size: 2048

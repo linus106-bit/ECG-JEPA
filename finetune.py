@@ -17,14 +17,14 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix, multilabel_confusion_matrix
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 
 import configs
 from data import transforms, utils as datautils
-from data.datasets import DATASETS, PTB_XL, Capture24
+from data.datasets import DATASETS, PTB_XL, Capture24, SDB
 from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
@@ -49,12 +49,82 @@ parser.add_argument('--encoder', default=None, help='path to checkpoint or confi
 parser.add_argument('--out', default=None, help='output directory (default: run.out_dir in config yaml)')
 parser.add_argument('--config', default=None, help='path to config file or config name (default: linear for ecg, har_linear for har)')
 parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
-parser.add_argument('--dataset-type', choices=['ecg', 'har'], default=None,
-                    help='dataset type: ecg (multi-label, ROC-AUC) or har (single-label, F1+accuracy). '
+parser.add_argument('--dataset-type', choices=['ecg', 'har', 'ppg'], default=None,
+                    help='dataset type: ecg (multi-label, ROC-AUC), har (single-label), or ppg (single-label). '
                          'Auto-detected from data_dir if not specified.')
 # ECG-specific args (PTB-XL tasks)
 parser.add_argument('--task', choices=TASKS, default=None, help='task type (ECG only, default: run.task in config yaml)')
 args = parser.parse_args()
+
+
+def _find_capture24_legacy_prefix(data_dir):
+  """Return prefix for legacy Capture24 dumps if available, else None."""
+  candidates = [data_dir]
+  if path.isdir(data_dir):
+    dirname = path.basename(path.normpath(data_dir))
+    candidates.extend([
+      path.join(data_dir, 'capture24'),
+      path.join(data_dir, dirname),
+    ])
+
+  required_suffixes = (
+    '_train.npy',
+    '_test.npy',
+    '_train_labels.npz',
+    '_test_labels.npz',
+  )
+  for prefix in candidates:
+    if all(path.isfile(f'{prefix}{suffix}') for suffix in required_suffixes):
+      return prefix
+  return None
+
+
+def _load_capture24_legacy(prefix):
+  """Load legacy Capture24 dumps from a resolved prefix."""
+  x_train_all = np.load(f'{prefix}_train.npy', mmap_mode='r')  # (N, T, C), channels-last
+  x_test = np.load(f'{prefix}_test.npy', mmap_mode='r')
+  with np.load(f'{prefix}_train_labels.npz') as archive:
+    train_labels = archive['labels'].copy()
+  with np.load(f'{prefix}_test_labels.npz') as archive:
+    test_labels = archive['labels'].copy()
+  return x_train_all, train_labels, x_test, test_labels
+
+
+
+
+
+
+def _canonicalize_single_label_array(x, num_channels):
+  """Convert single-label input arrays to (N, C, T)."""
+  x = np.asarray(x, dtype=np.float16)
+
+  # Remove singleton dimensions except batch when possible
+  while x.ndim > 3:
+    squeeze_axes = tuple(i for i in range(1, x.ndim) if x.shape[i] == 1)
+    if not squeeze_axes:
+      break
+    x = np.squeeze(x, axis=squeeze_axes)
+
+  if x.ndim == 2:
+    # (N, T) -> (N, 1, T)
+    x = x[:, None, :]
+  elif x.ndim != 3:
+    raise ValueError(f'Expected single-label array with 2D/3D shape, got {x.shape}')
+
+  # Normalize layout to (N, C, T)
+  if x.shape[1] == num_channels:
+    return x
+  if x.shape[2] == num_channels:
+    return np.transpose(x, (0, 2, 1))
+
+  # Fallback for one-channel signals with ambiguous axes
+  if num_channels == 1:
+    if x.shape[1] == 1:
+      return x
+    if x.shape[2] == 1:
+      return np.transpose(x, (0, 2, 1))
+
+  raise ValueError(f'Could not infer (N, C, T) layout for shape {x.shape} with num_channels={num_channels}')
 
 
 def main():
@@ -135,6 +205,8 @@ def main():
     data_dir_lower = (args.data_dir or '').lower()
     if 'capture24' in data_dir_lower or 'capture-24' in data_dir_lower:
       dataset_type = 'har'
+    elif 'sdb' in data_dir_lower:
+      dataset_type = 'ppg'
     else:
       dataset_type = 'ecg'
 
@@ -156,6 +228,7 @@ def main():
     if is_main_process:
       logger.debug(f'loading encoder config from {args.encoder}')
     encoder_config_dict = configs.load_config_file(args.encoder)
+    encoder_config_dict.pop('run', None)
     encoder_config = configs.pretrain.Config(**encoder_config_dict)
     model_state_dict = None
   else:
@@ -163,6 +236,7 @@ def main():
       logger.debug(f'loading encoder checkpoint from {args.encoder}')
     chkpt = torch.load(args.encoder, map_location='cpu')
     encoder_config_dict = chkpt['config']
+    encoder_config_dict.pop('run', None)
     encoder_config = configs.pretrain.Config(**encoder_config_dict)
     if 'eval_config' in chkpt:  # continue fine-tuning the weights
       model_state_dict = chkpt['model']
@@ -178,39 +252,63 @@ def main():
   if is_main_process:
     logger.debug(f'loading dataset from {data_dir} (type={dataset_type})')
 
-  from datasets import load_dataset
-  hf_dataset = load_dataset(data_dir)
-  available_splits = list(hf_dataset.keys())
-  if is_main_process:
-    logger.debug(f'available splits: {available_splits}')
+  legacy_prefix = _find_capture24_legacy_prefix(data_dir)
+  hf_dataset = None
+  available_splits = []
+  if legacy_prefix is not None:
+    if is_main_process:
+      logger.debug(f'found legacy Capture24 dump prefix: {legacy_prefix}')
+  elif path.isdir(data_dir):
+    from datasets import load_dataset
+    hf_dataset = load_dataset(data_dir)
+    available_splits = list(hf_dataset.keys())
+    if is_main_process:
+      logger.debug(f'available splits: {available_splits}')
+  elif is_main_process:
+    logger.debug(f'data_dir is not a directory: {data_dir}')
 
-  if dataset_type == 'har':
-    # HAR: single-label classification (e.g., Capture24)
+
+  val_split_name = 'val' if 'val' in available_splits else ('validation' if 'validation' in available_splits else None)
+
+  if dataset_type in ('har', 'ppg'):
+    # Single-label classification for HAR/PPG datasets
     single_label = True
-    task_name = 'har'
-    dataset_cls = Capture24
+    task_name = dataset_type
+    dataset_cls = Capture24 if dataset_type == 'har' else SDB
 
-    # Get num_classes from ClassLabel feature
-    label_feature = hf_dataset['train'].features.get('label')
-    if hasattr(label_feature, 'names'):
-      num_classes = len(label_feature.names)
+    har_transpose_input = legacy_prefix is not None
+    if legacy_prefix is not None:
+      x_train_all, train_labels, x_test, test_labels = _load_capture24_legacy(legacy_prefix)
+      train_labels = np.asarray(train_labels, dtype=np.int64)
+      test_labels = np.asarray(test_labels, dtype=np.int64)
+      num_classes = int(max(train_labels.max(), test_labels.max()) + 1)
       if is_main_process:
-        logger.debug(f'ClassLabel names: {label_feature.names}')
+        logger.debug('loaded HAR data from legacy dump files')
+    elif hf_dataset is not None:
+      # Get num_classes from ClassLabel feature
+      label_feature = hf_dataset['train'].features.get('label')
+      if hasattr(label_feature, 'names'):
+        num_classes = len(label_feature.names)
+        if is_main_process:
+          logger.debug(f'ClassLabel names: {label_feature.names}')
+      else:
+        # fallback
+        train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
+        test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
+        num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
+
+      # Load train split: data is (N, num_channels, channel_size)
+      train_ds = hf_dataset['train']
+      x_train_all = np.array(train_ds['data'], dtype=np.float16)
+      train_labels = np.array(train_ds['label'], dtype=np.int64)
+
+      # Load test split
+      test_ds = hf_dataset['test']
+      x_test = np.array(test_ds['data'], dtype=np.float16)
+      test_labels = np.array(test_ds['label'], dtype=np.int64)
     else:
-      # fallback
-      train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
-      test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
-      num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
-
-    # Load train split: data is (N, num_channels, channel_size)
-    train_ds = hf_dataset['train']
-    x_train_all = np.array(train_ds['data'], dtype=np.float16)
-    train_labels = np.array(train_ds['label'], dtype=np.int64)
-
-    # Load test split
-    test_ds = hf_dataset['test']
-    x_test = np.array(test_ds['data'], dtype=np.float16)
-    test_labels = np.array(test_ds['label'], dtype=np.int64)
+      raise ValueError(f'Could not load single-label HAR/PPG dataset from {data_dir}. '
+                       f'Expected HF dataset directory or legacy Capture24 dump prefix.')
 
     # Split train into train/val with a fixed random seed
     rng = np.random.RandomState(VAL_SEED)
@@ -225,18 +323,14 @@ def main():
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
 
-    # normalize using training statistics (channels-first: axis=(0, 2) for per-channel stats)
+    # Canonicalize to channels-first (N, C, T), then compute per-channel stats.
+    num_channels = len(dataset_cls.channels)
+    x_train_all = _canonicalize_single_label_array(x_train_all, num_channels=num_channels)
+    x_test = _canonicalize_single_label_array(x_test, num_channels=num_channels)
+    har_transpose_input = False
+
     mean = np.mean(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
     std = np.std(x_train_all[train_indices], axis=(0, 2), keepdims=True, dtype=np.float32)
-    transforms.normalize_(x_train_all, mean_std=(mean, std))
-    x_train_all.clip(-5, 5, out=x_train_all)
-    transforms.normalize_(x_test, mean_std=(mean, std))
-    x_test.clip(-5, 5, out=x_test)
-
-    # ensure matching channels (channels-first: index along axis 1)
-    channel_order = get_channel_order(dataset_cls.channels, encoder_config.channels)
-    x_train_all = x_train_all[:, channel_order]
-    x_test = x_test[:, channel_order]
 
     y_train_all = torch.from_numpy(train_labels).long()
     y_test = torch.from_numpy(test_labels).long()
@@ -361,10 +455,21 @@ def main():
   num_workers = min(8, max(1, num_cpus // world_size))
   eval_num_workers = min(2, num_workers)
 
+  if dataset_type in ('har', 'ppg'):
+    har_preprocess = PreprocessHAR(
+      mean_std=(mean, std),
+      channel_order=get_channel_order(dataset_cls.channels, encoder_config.channels),
+      transpose_input=har_transpose_input)
+    train_transform = [har_preprocess, TrainTransform(crop_size=crop_size)]
+    eval_transform = [har_preprocess, EvalTransform(crop_size=crop_size, crop_stride=crop_stride)]
+  else:
+    train_transform = TrainTransform(crop_size=crop_size)
+    eval_transform = EvalTransform(crop_size=crop_size, crop_stride=crop_stride)
+
   train_dataset = TensorDataset(
     data=x_train,
     labels=y_train,
-    transform=TrainTransform(crop_size=crop_size))
+    transform=train_transform)
 
   train_sampler = DistributedSampler(
     train_dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
@@ -383,18 +488,14 @@ def main():
     dataset=TensorDataset(
       data=x_val,
       labels=y_val,
-      transform=EvalTransform(
-        crop_size=crop_size,
-        crop_stride=crop_stride)),
+      transform=eval_transform),
     batch_size=eval_config.batch_size,
     num_workers=eval_num_workers)
   test_loader = DataLoader(
     dataset=TensorDataset(
       data=x_test,
       labels=y_test,
-      transform=EvalTransform(
-        crop_size=crop_size,
-        crop_stride=crop_stride)),
+      transform=eval_transform),
     batch_size=eval_config.batch_size,
     num_workers=eval_num_workers)
 
@@ -432,10 +533,10 @@ def main():
   # -------------------------------------------------------------------------
   # Training loop (shared structure, branched on single_label for metrics)
   # -------------------------------------------------------------------------
-  step_time = AverageMeter()
   train_loss = AverageMeter()
   best_val_metric = float('-inf')
   best_val_predictions, saved_val_targets = None, None
+  best_val_metric_stats = None
   best_epoch_or_step = None
   best_chkpt = None
   global_step = 0
@@ -449,6 +550,75 @@ def main():
     if single_label:
       return F.cross_entropy(logits, y)
     return F.binary_cross_entropy_with_logits(logits, y)
+
+  def _safe_ratio(numerator, denominator):
+    return np.divide(numerator, denominator, out=np.full_like(numerator, np.nan, dtype=np.float64), where=denominator > 0)
+
+  def _compute_macro_sensitivity_specificity(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.ndim == 1:
+      classes = np.unique(np.concatenate([y_true, y_pred]))
+      cm = confusion_matrix(y_true, y_pred, labels=classes)
+      tp = np.diag(cm).astype(np.float64)
+      fn = cm.sum(axis=1) - tp
+      fp = cm.sum(axis=0) - tp
+      tn = cm.sum() - (tp + fn + fp)
+    else:
+      mcm = multilabel_confusion_matrix(y_true, y_pred)
+      tn = mcm[:, 0, 0].astype(np.float64)
+      fp = mcm[:, 0, 1].astype(np.float64)
+      fn = mcm[:, 1, 0].astype(np.float64)
+      tp = mcm[:, 1, 1].astype(np.float64)
+    sensitivity_per_class = _safe_ratio(tp, tp + fn)
+    specificity_per_class = _safe_ratio(tn, tn + fp)
+    positive_per_class = tp + fn
+    negative_per_class = tn + fp
+    return {
+      'sensitivity_per_class': sensitivity_per_class,
+      'specificity_per_class': specificity_per_class,
+      'positive_per_class': positive_per_class,
+      'negative_per_class': negative_per_class,
+      'tp_per_class': tp,
+      'tn_per_class': tn,
+      'fp_per_class': fp,
+      'fn_per_class': fn,
+      'sensitivity_macro': float(np.nanmean(sensitivity_per_class)),
+      'specificity_macro': float(np.nanmean(specificity_per_class)),
+    }
+
+  def _safe_macro_ovr_auroc(y_true, y_score):
+    classes = np.arange(y_score.shape[1])
+    class_aurocs = []
+    skipped_classes = []
+    for cls in classes:
+      y_true_binary = (y_true == cls).astype(np.int32)
+      # AUC is undefined when a class is all-positive or all-negative.
+      if y_true_binary.min() == y_true_binary.max():
+        skipped_classes.append(int(cls))
+        continue
+      class_aurocs.append(roc_auc_score(y_true_binary, y_score[:, cls]))
+    if len(class_aurocs) == 0:
+      return float('nan'), skipped_classes
+    return float(np.mean(class_aurocs)), skipped_classes
+
+  def _metric_semantics_text():
+    if single_label:
+      return ('Sensitivity=TPR(recall), positive=the class itself in one-vs-rest; '
+              'Specificity=TNR, negative=all other classes in one-vs-rest.')
+    return ('Sensitivity=TPR(recall), positive=label 1; '
+            'Specificity=TNR, negative=label 0.')
+
+  def _compute_single_label_metrics(targets, logits):
+    probs = torch.softmax(logits, dim=1).cpu().numpy()
+    preds = logits.argmax(dim=1).cpu().numpy()
+    f1 = f1_score(y_true=targets, y_pred=preds, average='macro')
+    acc = accuracy_score(y_true=targets, y_pred=preds)
+    metric_stats = _compute_macro_sensitivity_specificity(targets, preds)
+    auroc, skipped_classes = _safe_macro_ovr_auroc(targets, probs)
+    if is_main_process and skipped_classes:
+      logger.warning(f'AUROC skipped classes without both positive/negative samples: {skipped_classes}')
+    return preds, probs, f1, acc, auroc, metric_stats
 
   def _eval_val():
     val_logits_or_preds, val_targets = [], []
@@ -464,39 +634,48 @@ def main():
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
         if single_label:
-          val_logits_or_preds.append(logits.argmax(dim=1).clone())
+          val_logits_or_preds.append(logits.clone())
         else:
           val_logits_or_preds.append(logits.clone())
         val_targets.append(by.clone())
     model.train()
     targets = torch.cat(val_targets).cpu().numpy()
     if single_label:
-      preds = torch.cat(val_logits_or_preds).cpu().numpy()
-      metric = f1_score(y_true=targets, y_pred=preds, average='macro')
-      acc = accuracy_score(y_true=targets, y_pred=preds)
-      return preds, targets, metric, acc
+      logits = torch.cat(val_logits_or_preds)
+      preds, probs, metric, acc, auroc, metric_stats = _compute_single_label_metrics(targets, logits)
+      return {'preds': preds, 'probs': probs}, targets, metric, acc, auroc, metric_stats
     else:
       preds = torch.cat(val_logits_or_preds).sigmoid().cpu().numpy()
       metric = roc_auc_score(y_true=targets, y_score=preds, average='macro')
-      return preds, targets, metric, None
+      binary_preds = (preds >= 0.5).astype(np.int32)
+      metric_stats = _compute_macro_sensitivity_specificity(targets, binary_preds)
+      return preds, targets, metric, None, None, metric_stats
 
-  def _log_val(epoch_or_step, label, preds, targets, metric, acc, new_best):
+  def _log_val(epoch_or_step, label, preds, targets, metric, acc, auroc, metric_stats, new_best):
+    sensitivity = metric_stats['sensitivity_macro']
+    specificity = metric_stats['specificity_macro']
     if single_label:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
                   f'val_f1: {metric:.4f} '
-                  f'val_acc: {acc:.4f}')
+                  f'val_acc: {acc:.4f} '
+                  f'val_auroc: {auroc:.4f} '
+                  f'val_sensitivity(TPR): {sensitivity:.4f} '
+                  f'val_specificity(TNR): {specificity:.4f} '
+                  f'[{_metric_semantics_text()}]')
     else:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
-                  f'val_auc: {metric:.4f}')
+                  f'val_auc: {metric:.4f} '
+                  f'val_sensitivity(TPR): {sensitivity:.4f} '
+                  f'val_specificity(TNR): {specificity:.4f} '
+                  f'[{_metric_semantics_text()}]')
 
   if eval_config.epochs > 0:
     for epoch in range(eval_config.epochs):
       if is_distributed:
         train_sampler.set_epoch(epoch)
       for x, y in train_loader:
-        step_start = time()
         update_learning_rate_(optimizer, next(lr_schedule))
         x, y = x.to(device), y.to(device)
         with auto_mixed_precision:
@@ -508,21 +687,14 @@ def main():
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
-        step_time.update(time() - step_start)
         train_loss.update(loss.item())
         if is_main_process:
           current_epoch = global_step / steps_per_epoch
           current_lr = optimizer.param_groups[0]['lr']
           last_loss = train_loss.value
           last_lr = current_lr
-          logger.info(f'step: {global_step} '
-                      f'epoch: {current_epoch:.4f} '
-                      f'train_loss: {train_loss.value:.4f} '
-                      f'lr: {current_lr:.6e} '
-                      f'step_time: {step_time.value:.4f}')
           pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
           pbar.update(1)
-          step_time = AverageMeter()
           train_loss = AverageMeter()
         if is_main_process and global_step % eval_config.checkpoint_interval == 0:
           new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
@@ -533,16 +705,18 @@ def main():
             'eval_config': dataclasses.asdict(eval_config),
             'step': global_step,
           }, new_chkpt_path)
-      val_predictions, val_targets, val_metric, val_acc = _eval_val()
+      val_predictions, val_targets, val_metric, val_acc, val_auroc, val_metric_stats = _eval_val()
       new_best = val_metric > best_val_metric
       if new_best:
         best_val_metric = val_metric
         best_val_predictions = val_predictions
         saved_val_targets = val_targets
+        best_val_metric_stats = val_metric_stats
         best_epoch_or_step = epoch
         best_chkpt = copy.deepcopy(original_model.state_dict())
       if is_main_process:
-        _log_val(epoch + 1, 'epoch', val_predictions, val_targets, val_metric, val_acc, new_best)
+        _log_val(epoch + 1, 'epoch', val_predictions, val_targets, val_metric, val_acc, val_auroc,
+                 val_metric_stats, new_best)
       if epoch - best_epoch_or_step >= eval_config.early_stopping_patience:
         if is_main_process:
           logging.info(f'stopping training early because validation metric does not improve')
@@ -558,7 +732,6 @@ def main():
     train_dataset_size = len(train_dataset)
     train_iterator = _cycle(train_loader)
     for step in range(eval_config.steps):
-      step_start = time()
       update_learning_rate_(optimizer, next(lr_schedule))
       x, y = (tensor.to(device) for tensor in next(train_iterator))
       with auto_mixed_precision:
@@ -569,21 +742,14 @@ def main():
         torch.nn.utils.clip_grad_norm_(model.parameters(), eval_config.gradient_clip)
       optimizer.step()
       optimizer.zero_grad(set_to_none=True)
-      step_time.update(time() - step_start)
       train_loss.update(loss.item())
       if is_main_process:
         current_epoch = (step + 1) * eval_config.batch_size / train_dataset_size
         current_lr = optimizer.param_groups[0]['lr']
         last_loss = train_loss.value
         last_lr = current_lr
-        logger.info(f'step: {step + 1} '
-                    f'epoch: {current_epoch:.4f} '
-                    f'train_loss: {train_loss.value:.4f} '
-                    f'lr: {current_lr:.6e} '
-                    f'step_time: {step_time.value:.4f}')
         pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
         pbar.update(1)
-        step_time = AverageMeter()
         train_loss = AverageMeter()
       if (step + 1) % eval_config.checkpoint_interval == 0:
         if is_main_process:
@@ -595,16 +761,18 @@ def main():
             'eval_config': dataclasses.asdict(eval_config),
             'step': step + 1,
           }, new_chkpt_path)
-        val_predictions, val_targets, val_metric, val_acc = _eval_val()
+        val_predictions, val_targets, val_metric, val_acc, val_auroc, val_metric_stats = _eval_val()
         new_best = val_metric > best_val_metric
         if new_best:
           best_val_metric = val_metric
           best_val_predictions = val_predictions
           saved_val_targets = val_targets
+          best_val_metric_stats = val_metric_stats
           best_epoch_or_step = step
           best_chkpt = copy.deepcopy(original_model.state_dict())
         if is_main_process:
-          _log_val(step + 1, 'step', val_predictions, val_targets, val_metric, val_acc, new_best)
+          _log_val(step + 1, 'step', val_predictions, val_targets, val_metric, val_acc, val_auroc,
+                   val_metric_stats, new_best)
         if step - best_epoch_or_step >= eval_config.early_stopping_patience:
           if is_main_process:
             logging.info('stopping training early because validation metric does not improve')
@@ -625,6 +793,8 @@ def main():
 
   if is_main_process:
     logger.info('loading best model checkpoint')
+    if best_val_metric_stats is None:
+      raise RuntimeError('best_val_metric_stats is not available; validation did not run')
     original_model.load_state_dict(best_chkpt)
 
     test_logits_or_preds, test_targets = [], []
@@ -639,18 +809,29 @@ def main():
         if eval_config.crop_duration is not None:
           logits = logits.reshape(batch_size, num_crops, eval_config.num_classes)
           logits = logits.mean(dim=1)
-        if single_label:
-          test_logits_or_preds.append(logits.argmax(dim=1).clone())
-        else:
-          test_logits_or_preds.append(logits.clone())
+        test_logits_or_preds.append(logits.clone())
         test_targets.append(by.clone())
 
     test_targets = torch.cat(test_targets).cpu().numpy()
     if single_label:
-      test_predictions = torch.cat(test_logits_or_preds).cpu().numpy()
-      test_f1 = f1_score(y_true=test_targets, y_pred=test_predictions, average='macro')
-      test_acc = accuracy_score(y_true=test_targets, y_pred=test_predictions)
-      logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}')
+      test_logits = torch.cat(test_logits_or_preds)
+      test_predictions, test_probabilities, test_f1, test_acc, test_auroc, test_metric_stats = _compute_single_label_metrics(
+        targets=test_targets, logits=test_logits)
+      val_probabilities = best_val_predictions['probs']
+      val_sensitivity = best_val_metric_stats['sensitivity_macro']
+      val_specificity = best_val_metric_stats['specificity_macro']
+      test_sensitivity = test_metric_stats['sensitivity_macro']
+      test_specificity = test_metric_stats['specificity_macro']
+      try:
+        val_auroc, skipped_classes = _safe_macro_ovr_auroc(saved_val_targets, val_probabilities)
+        if skipped_classes:
+          logger.warning(f'Best-val AUROC skipped classes without both positive/negative samples: {skipped_classes}')
+      except ValueError:
+        val_auroc = float('nan')
+      logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}  test_auroc {test_auroc:.4f}  '
+                  f'test_sensitivity(TPR) {test_sensitivity:.4f}  '
+                  f'test_specificity(TNR) {test_specificity:.4f}  '
+                  f'[{_metric_semantics_text()}]')
       eval_results = {
         'task': task_name,
         'dataset_type': args.dataset_type,
@@ -658,8 +839,38 @@ def main():
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
         'val_f1': float(best_val_metric),
+        'val_auroc': float(val_auroc),
+        'val_sensitivity': float(val_sensitivity),
+        'val_specificity': float(val_specificity),
+        'val_sensitivity_positive': float(val_sensitivity),
+        'val_specificity_negative': float(val_specificity),
+        'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_sensitivity_per_class_positive': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class_negative': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
+        'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
+        'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
+        'val_tn_per_class': best_val_metric_stats['tn_per_class'].tolist(),
+        'val_fp_per_class': best_val_metric_stats['fp_per_class'].tolist(),
+        'val_fn_per_class': best_val_metric_stats['fn_per_class'].tolist(),
         'test_f1': float(test_f1),
         'test_acc': float(test_acc),
+        'test_auroc': float(test_auroc),
+        'test_sensitivity': float(test_sensitivity),
+        'test_specificity': float(test_specificity),
+        'test_sensitivity_positive': float(test_sensitivity),
+        'test_specificity_negative': float(test_specificity),
+        'test_sensitivity_per_class': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class': test_metric_stats['specificity_per_class'].tolist(),
+        'test_sensitivity_per_class_positive': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class_negative': test_metric_stats['specificity_per_class'].tolist(),
+        'test_positive_per_class': test_metric_stats['positive_per_class'].tolist(),
+        'test_negative_per_class': test_metric_stats['negative_per_class'].tolist(),
+        'test_tp_per_class': test_metric_stats['tp_per_class'].tolist(),
+        'test_tn_per_class': test_metric_stats['tn_per_class'].tolist(),
+        'test_fp_per_class': test_metric_stats['fp_per_class'].tolist(),
+        'test_fn_per_class': test_metric_stats['fn_per_class'].tolist(),
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
@@ -668,7 +879,14 @@ def main():
     else:
       test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
-      logger.info(f'test_auc {test_auc:.4f}')
+      test_binary_predictions = (test_predictions >= 0.5).astype(np.int32)
+      test_metric_stats = _compute_macro_sensitivity_specificity(test_targets, test_binary_predictions)
+      val_sensitivity = best_val_metric_stats['sensitivity_macro']
+      val_specificity = best_val_metric_stats['specificity_macro']
+      test_sensitivity = test_metric_stats['sensitivity_macro']
+      test_specificity = test_metric_stats['specificity_macro']
+      logger.info(f'test_auc {test_auc:.4f}  test_sensitivity {test_sensitivity:.4f}  '
+                  f'test_specificity {test_specificity:.4f}  [{_metric_semantics_text()}]')
       eval_results = {
         'task': task_name,
         'dataset_type': args.dataset_type,
@@ -676,7 +894,35 @@ def main():
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
         'val_auc': float(best_val_metric),
+        'val_sensitivity': float(val_sensitivity),
+        'val_specificity': float(val_specificity),
+        'val_sensitivity_positive': float(val_sensitivity),
+        'val_specificity_negative': float(val_specificity),
+        'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_sensitivity_per_class_positive': best_val_metric_stats['sensitivity_per_class'].tolist(),
+        'val_specificity_per_class_negative': best_val_metric_stats['specificity_per_class'].tolist(),
+        'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
+        'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
+        'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
+        'val_tn_per_class': best_val_metric_stats['tn_per_class'].tolist(),
+        'val_fp_per_class': best_val_metric_stats['fp_per_class'].tolist(),
+        'val_fn_per_class': best_val_metric_stats['fn_per_class'].tolist(),
         'test_auc': float(test_auc),
+        'test_sensitivity': float(test_sensitivity),
+        'test_specificity': float(test_specificity),
+        'test_sensitivity_positive': float(test_sensitivity),
+        'test_specificity_negative': float(test_specificity),
+        'test_sensitivity_per_class': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class': test_metric_stats['specificity_per_class'].tolist(),
+        'test_sensitivity_per_class_positive': test_metric_stats['sensitivity_per_class'].tolist(),
+        'test_specificity_per_class_negative': test_metric_stats['specificity_per_class'].tolist(),
+        'test_positive_per_class': test_metric_stats['positive_per_class'].tolist(),
+        'test_negative_per_class': test_metric_stats['negative_per_class'].tolist(),
+        'test_tp_per_class': test_metric_stats['tp_per_class'].tolist(),
+        'test_tn_per_class': test_metric_stats['tn_per_class'].tolist(),
+        'test_fp_per_class': test_metric_stats['fp_per_class'].tolist(),
+        'test_fn_per_class': test_metric_stats['fn_per_class'].tolist(),
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
@@ -688,9 +934,21 @@ def main():
       json.dump(eval_results, f, indent=2, ensure_ascii=False)
     logger.info(f'saved eval results json to {json_result_path}')
 
-    np.savez(path.join(args.out, f'{task_name}_predictions.npz'),
-             val_targets=saved_val_targets, val_predictions=best_val_predictions,
-             test_targets=test_targets, test_predictions=test_predictions)
+    prediction_dump_path = path.join(args.out, f'{task_name}_predictions.npz')
+    if single_label:
+      np.savez(prediction_dump_path,
+               val_targets=saved_val_targets,
+               val_predictions=best_val_predictions['preds'],
+               val_probabilities=best_val_predictions['probs'],
+               test_targets=test_targets,
+               test_predictions=test_predictions,
+               test_probabilities=test_probabilities)
+    else:
+      np.savez(prediction_dump_path,
+               val_targets=saved_val_targets,
+               val_predictions=best_val_predictions,
+               test_targets=test_targets,
+               test_predictions=test_predictions)
 
   pbar.close()
   if is_main_process:
@@ -706,9 +964,13 @@ def main():
       f'  Best val metric : {best_val_metric:.4f}',
     ]
     if single_label:
-      lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}')
+      lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}  Test AUROC: {test_auroc:.4f}')
+      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f} '
+                   f'({ _metric_semantics_text() })')
     else:
       lines.append(f'  Test AUC      : {test_auc:.4f}')
+      lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f} '
+                   f'({ _metric_semantics_text() })')
     lines.append('=' * 50)
     logger.info('\n' + '\n'.join(lines))
 
@@ -727,6 +989,32 @@ class PreprocessECG:
       x = transforms.highpass_filter(x, fs=PTB_XL.sampling_frequency)
     if self.channel_size is not None and self.channel_size != channel_size:
       x = transforms.resample(x, self.channel_size)
+    return x
+
+
+class PreprocessHAR:
+  def __init__(self, *, mean_std, channel_order, transpose_input=False):
+    self.mean, self.std = mean_std
+    self.channel_order = channel_order
+    self.transpose_input = transpose_input
+
+  def __call__(self, x):
+    x = np.array(x, dtype=np.float32, copy=True)
+    x = np.squeeze(x)
+    if x.ndim == 1:
+      x = x[None, :]
+    elif x.ndim != 2:
+      raise ValueError(f'Expected (C, T) or (T, C) sample, got {x.shape}')
+
+    expected_channels = len(self.channel_order)
+    if self.transpose_input or (x.shape[0] != expected_channels and x.shape[1] == expected_channels):
+      x = x.T
+
+    mean = np.asarray(self.mean, dtype=np.float32).reshape(-1, 1)
+    std = np.asarray(self.std, dtype=np.float32).reshape(-1, 1)
+    x = (x - mean) / (std + 1e-8)
+    x.clip(-5, 5, out=x)
+    x = x[self.channel_order]
     return x
 
 

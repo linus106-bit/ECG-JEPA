@@ -1,6 +1,7 @@
 # learnable encoder parameters: 14,277,888
 # run (execution settings — previously in the shell script)
 run:
+  out_dir: results/pretrain/ViTS_ptbxl
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training
@@ -13,8 +14,8 @@ min_block_size: 10
 min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
-  mimic-iv-ecg:
-    path: /group-volume/home/jaeuk.moon/SensorLM/ECG-JEPA/hf/mimic-iv-ecg  # HF dataset directory
+  ptb-xl:
+    path: /path/to/ptb-xl  # HF dataset directory (or .npy file for legacy)
     split: train
     weight: 1.
 # model architecture
@@ -33,7 +34,7 @@ bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
 # training
-epochs: 200
+epochs: 2000
 batch_size: 2048
 encoder_momentum: 0.998
 final_encoder_momentum: 0.9995
@@ -46,4 +47,4 @@ opt_betas: [0.9, 0.99]
 opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
-checkpoint_interval: 20
+checkpoint_interval: 1000

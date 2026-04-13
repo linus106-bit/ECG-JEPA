@@ -1,5 +1,6 @@
 # run (execution settings — previously in the shell script)
 run:
+  out_dir: results/pretrain/CNNXS_mimic
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training
@@ -47,4 +48,4 @@ opt_betas: [0.9, 0.99]
 opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
-checkpoint_interval: 20
+checkpoint_interval: 1000

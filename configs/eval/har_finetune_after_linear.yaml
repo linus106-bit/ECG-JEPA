@@ -1,18 +1,18 @@
-# run (execution settings — previously in the shell script)
+# Finetuning-after-linear evaluation config for Capture-24 HAR
 run:
-  out_dir: results/finetune/finetune_after_linear
+  out_dir: results/finetune/har_finetune_after_linear
   amp: bfloat16
-  encoder: pretrain/ViTS_ptbxl/checkpoint.pt  # path to pretrain checkpoint
-  task: all
-  dataset_type: ecg
+  encoder: pretrain/ViTS_capture24/checkpoint.pt  # path to pretrain checkpoint
+  task: har
+  dataset_type: har
 
 # dataset path (set data_dir to your dataset location)
 dataset:
-  data_dir: /path/to/ptb-xl
+  data_dir: /path/to/capture-24
 
 # data
-crop_duration: 2.5
-crop_stride: 1.25
+crop_duration: null
+crop_stride: null
 # model architecture
 use_register: True
 attn_pooling: True
@@ -21,8 +21,8 @@ bias: False
 dropout: 0.1
 frozen: False
 # training
-epochs: 40
-batch_size: 128
+epochs: 25
+batch_size: 1024
 learning_rate: 1.0e-4
 final_learning_rate: 1.0e-6
 learning_rate_warmup_ratio: 0.05
