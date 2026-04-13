@@ -12,11 +12,12 @@ set -euo pipefail
 #   NUM_GPUS — 사용할 GPU 수
 # =============================================================================
 
-CONFIG="${1:-configs/pretrain/ViT/ViTS_ptbxl.yaml}"
-NUM_GPUS=8
+CONFIG="${1:-configs/pretrain/ViT/ViTB_ptb-xl.yaml}" # configs/pretrain/ViT/ViTB_capture24.yaml
+NUM_GPUS="${NUM_GPUS:-8}"  # Use environment variable or default to 8
+shift  # Remove first argument (CONFIG) from args
 
 # 사용할 GPU ID 지정 (전체 사용 시 주석 처리)
 # export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-torchrun --standalone --nproc_per_node="${NUM_GPUS}" pretrain.py --config "${CONFIG}"
+torchrun --standalone --nproc_per_node="${NUM_GPUS}" pretrain.py --config "${CONFIG}" "$@"

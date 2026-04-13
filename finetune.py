@@ -211,7 +211,7 @@ def main():
       dataset_type = 'ecg'
 
   eval_config_dict = configs.load_config_file(args.config)
-  eval_config_dict.pop('run', None)
+  eval_config_dict.pop('run', None)  # Remove 'run' section if present
   if is_main_process:
     logger.debug(f'loading configuration file from {args.config}\n'
                  f'{pprint.pformat(eval_config_dict, compact=True, sort_dicts=False, width=120)}')
@@ -350,12 +350,14 @@ def main():
     if args.task == 'ST-MEM':
       single_label = True
 
-    if val_split_name is None:
-      raise ValueError('ECG dataset must have train/val/test splits. '
+    # Determine validation split name (can be 'val' or 'validation')
+    val_split_name = 'val' if 'val' in available_splits else 'validation'
+    if val_split_name not in available_splits or 'train' not in available_splits or 'test' not in available_splits:
+      raise ValueError('ECG dataset must have train/val/test or train/validation/test splits. '
                        'Use scripts/convert_to_hf_dataset.py to create the proper format.')
 
     if is_main_process:
-      logger.debug('loading from HF dataset with train/val/test splits')
+      logger.debug(f'loading from HF dataset with train/{val_split_name}/test splits')
 
     # Load each split directly: data is (N, num_channels, channel_size)
     def _load_ecg_split(split_ds):

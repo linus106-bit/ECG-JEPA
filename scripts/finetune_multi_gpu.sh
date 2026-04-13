@@ -12,8 +12,8 @@ set -euo pipefail
 #   NUM_GPUS — 사용할 GPU 수
 # =============================================================================
 
-CONFIG="${1:-configs/eval/finetune.yaml}"
-NUM_GPUS=8
+CONFIG="${1:-configs/eval/ablation/linear/test.yaml}"
+NUM_GPUS="${NUM_GPUS:-8}"  # Use environment variable or default to 8
 
 # 사용할 GPU ID 지정 (전체 사용 시 주석 처리)
 # export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7

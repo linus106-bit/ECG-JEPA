@@ -16,7 +16,7 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   capture-24:
-    path: /path/to/capture-24  # HF dataset directory (or .npy file for legacy)
+    path: /group-volume/datasets/openDB/Capture24
     split: train
     weight: 1.
 # model architecture

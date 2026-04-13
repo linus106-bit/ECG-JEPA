@@ -15,7 +15,7 @@ min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
   mimic-iv-ecg:
-    path: /path/to/mimic-iv-ecg  # HF dataset directory (or .npy file for legacy)
+    path: /group-volume/home/jaeuk.moon/SensorLM/ECG-JEPA/hf/mimic-iv-ecg  # HF dataset directory
     split: train
     weight: 1.
 # model architecture

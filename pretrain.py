@@ -36,6 +36,7 @@ from data.utils import (
   load_hf_variable_dataset,
 )
 from models import JEPA
+from models.LeJEPA import LeJEPA
 from utils.monitoring import (
   AverageMeter,
   get_cpu_count,
@@ -54,6 +55,8 @@ parser.add_argument('--config', default='ViTS_mimic', help='path to config file 
 parser.add_argument('--chkpt', default=None, help='resume training from model checkpoint (default: run.checkpoint in config yaml)')
 parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
 parser.add_argument('--compile', action='store_true', help='compile model (or set run.compile: true in config yaml)')
+parser.add_argument('--jepa_mode', default=None, choices=['ijepa', 'lejepa'], help='JEPA mode (default: from config)')
+parser.add_argument('--sigreg_lambda', default=None, type=float, help='SIGReg lambda for LeJEPA (default: from config)')
 args = parser.parse_args()
 
 # NOTE: we update means and standard deviations of some datasets
@@ -150,6 +153,14 @@ def main():
       logger.debug(f'loading configuration file from {args.config}:\n'
                    f'{pprint.pformat(yaml_dict, compact=True, sort_dicts=False, width=120)}')
     chkpt = None
+
+  # command-line overrides for LeJEPA
+  if args.jepa_mode is not None:
+    config.jepa_mode = args.jepa_mode
+  if args.sigreg_lambda is not None:
+    config.sigreg_lambda = args.sigreg_lambda
+  if is_main_process:
+    logger.debug(f'JEPA mode: {config.jepa_mode}')
 
   for dataset_name, dataset_info in config.datasets.items():
     if dataset_name not in DATASETS:
@@ -285,11 +296,15 @@ def main():
     start_step = chkpt['step'] if chkpt is not None else 0
 
   # setup hyperparameter schedules
-  momentum_schedule = linear_schedule(
-    total_steps=total_steps,
-    start_value=config.encoder_momentum,
-    final_value=config.final_encoder_momentum,
-    step=start_step)
+  use_lejepa = config.jepa_mode == 'lejepa'
+
+  if not use_lejepa:
+    momentum_schedule = linear_schedule(
+      total_steps=total_steps,
+      start_value=config.encoder_momentum,
+      final_value=config.final_encoder_momentum,
+      step=start_step)
+
   lr_schedule = cosine_schedule(
     total_steps=total_steps,
     start_value=config.learning_rate,
@@ -304,11 +319,17 @@ def main():
     step=start_step)
 
   # setup model
-  original_model = JEPA(
-    config=config,
-    momentum_schedule=momentum_schedule,
-    use_sdp_kernel=using_cuda
-  ).to(device)
+  if use_lejepa:
+    original_model = LeJEPA(
+      config=config,
+      use_sdp_kernel=using_cuda
+    ).to(device)
+  else:
+    original_model = JEPA(
+      config=config,
+      momentum_schedule=momentum_schedule,
+      use_sdp_kernel=using_cuda
+    ).to(device)
   optimizer = original_model.get_optimizer(fused=using_cuda)
 
   if chkpt is not None:  # resume training from checkpoint
