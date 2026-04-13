@@ -7,8 +7,8 @@ run:
   dataset_type: har
 
 # dataset path (set data_dir to your dataset location)
-dataset:
-  data_dir: /group-volume/datasets/openDB/Capture24
+# dataset:
+#   data_dir: /path/to/capture-24
 
 # data
 crop_duration: null

@@ -48,18 +48,18 @@ class LeJEPA(nn.Module):
   def __init__(self, config: configs.pretrain.Config, use_sdp_kernel=True):
     super().__init__()
     self.config = config
-    self.encoder = create_encoder(config, use_sdp_kernel=use_sdp_kernel)
+    self.target_encoder = create_encoder(config, use_sdp_kernel=use_sdp_kernel)
     self.predictor = Predictor(config, use_sdp_kernel=use_sdp_kernel)
     self.sigreg = SIGReg(num_proj=config.sigreg_num_slices)
     self.sigreg_lambda = config.sigreg_lambda
 
   def forward(self, x, mask_encoder, mask_predictor):
     # Pass 1: full encoding (all patches) → target
-    z_all = self.encoder(x)  # (B, N, D) — no masking
+    z_all = self.target_encoder(x)  # (B, N, D) — no masking
     z_target = apply_mask(z_all, mask_predictor).detach()  # (B, M, D), stop gradient
 
     # Pass 2: masked encoding (visible patches only) → context
-    z_context = self.encoder(x, mask_encoder)  # (B, K, D)
+    z_context = self.target_encoder(x, mask_encoder)  # (B, K, D)
 
     # Predictor: predict masked patches from visible
     z_pred = self.predictor(z_context, mask_encoder, mask_predictor)  # (B, M, D)

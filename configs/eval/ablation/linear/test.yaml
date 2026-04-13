@@ -1,0 +1,28 @@
+run:
+  out_dir: results/finetune/ablation/linear/ViTS_capture24_lejepa_linear
+  amp: bfloat16
+  encoder: pretrain/ViTB_capture24/chkpt_90000.pt
+  task: har
+  dataset_type: har
+dataset:
+  data_dir: /group-volume/datasets/openDB/Capture24/
+crop_duration: null
+crop_stride: null
+use_register: true
+attn_pooling: true
+layer_scale_eps: 0.0
+bias: false
+dropout: 0.0
+frozen: true
+epochs: 25
+batch_size: 1024
+learning_rate: 0.001
+final_learning_rate: 0.001
+learning_rate_warmup_ratio: 0.0
+weight_decay: 0.1
+opt_betas:
+- 0.9
+- 0.999
+gradient_clip: 1.0
+early_stopping_patience: 25
+checkpoint_interval: 1000

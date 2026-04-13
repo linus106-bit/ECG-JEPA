@@ -1,29 +1,30 @@
-# learnable encoder parameters: 14,277,888
+# ViT-Base for Capture-24 accelerometer HAR pretraining
+# learnable encoder parameters: ~85M
 # run (execution settings — previously in the shell script)
 run:
   amp: bfloat16
   compile: false
   checkpoint: null  # set to a checkpoint path to resume training
 # data
-sampling_frequency: 500
-channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
-channel_size: 5000
-patch_size: 25
-min_block_size: 10
+sampling_frequency: 100
+channels: [x, y, z]
+channel_size: 1000
+patch_size: 20
+min_block_size: 5
 min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
-  mimic-iv-ecg:
-    path: /group-volume/home/jaeuk.moon/SensorLM/ECG-JEPA/hf/mimic-iv-ecg  # HF dataset directory
+  capture-24:
+    path: /group-volume/datasets/openDB/Capture24
     split: train
     weight: 1.
 # model architecture
-dim: 384
-depth: 8
-num_heads: 6
-pred_dim: 192
-pred_depth: 8
-pred_num_heads: 6
+dim: 768
+depth: 12
+num_heads: 12
+pred_dim: 384
+pred_depth: 12
+pred_num_heads: 12
 mlp_ratio: 4.
 qkv_bias: False
 dropout: 0.
@@ -33,7 +34,7 @@ bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
 # training
-epochs: 200
+epochs: 300
 batch_size: 2048
 encoder_momentum: 0.998
 final_encoder_momentum: 0.9995
@@ -46,4 +47,4 @@ opt_betas: [0.9, 0.99]
 opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
-checkpoint_interval: 20
+checkpoint_interval: 10000
