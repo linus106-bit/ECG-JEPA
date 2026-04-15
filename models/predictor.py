@@ -5,7 +5,7 @@ from torch import nn
 
 import configs
 from models.modules import Block
-from models.utils import get_1d_pos_embed, apply_mask
+from models.utils import get_1d_pos_embed, get_2d_rope_cache, apply_mask
 
 
 class Predictor(nn.Module):
@@ -16,12 +16,22 @@ class Predictor(nn.Module):
     num_patches = config.num_patches
     self.embed = nn.Linear(config.dim, config.pred_dim, bias=config.bias)
     self.mask_token = nn.Parameter(torch.zeros(1, 1, config.pred_dim))
+    self.patches_per_channel = config.channel_size // config.patch_size
     self.register_buffer(
       'pos_embed',
       get_1d_pos_embed(
         dim=config.pred_dim,
         num_patches=num_patches),
       persistent=False)
+    self.use_2d_rope = config.per_channel_patching
+    if self.use_2d_rope:
+      head_dim = config.pred_dim // config.pred_num_heads
+      rope_cos, rope_sin = get_2d_rope_cache(
+        head_dim=head_dim,
+        num_channels=config.num_channels,
+        patches_per_channel=self.patches_per_channel)
+      self.register_buffer('rope_cos', rope_cos, persistent=False)
+      self.register_buffer('rope_sin', rope_sin, persistent=False)
     self.blocks = nn.ModuleList([
       Block(
         dim=config.pred_dim,
@@ -63,8 +73,13 @@ class Predictor(nn.Module):
     mask_token = self.mask_token.repeat(B, K, 1)
     mask_token = mask_token + pos_predictor
     x = torch.cat([x, mask_token], dim=1)
+    token_positions = torch.cat([mask_encoder, mask_predictor], dim=1) if self.use_2d_rope else None
     for block in self.blocks:
-      x = block(x)
+      x = block(
+        x,
+        rope_cos=self.rope_cos if self.use_2d_rope else None,
+        rope_sin=self.rope_sin if self.use_2d_rope else None,
+        rope_positions=token_positions)
     x = self.norm(x)
     mask_token = x[:, -K:]
     mask_token = self.proj(mask_token)
