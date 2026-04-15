@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 import configs
 from data import transforms, utils as datautils
-from data.datasets import DATASETS, PTB_XL, Capture24, SDB
+from data.datasets import DATASETS, PTB_XL, Capture24, SDB, Hyper
 from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
@@ -205,7 +205,7 @@ def main():
     data_dir_lower = (args.data_dir or '').lower()
     if 'capture24' in data_dir_lower or 'capture-24' in data_dir_lower:
       dataset_type = 'har'
-    elif 'sdb' in data_dir_lower:
+    elif 'sdb' in data_dir_lower or 'hyper' in data_dir_lower:
       dataset_type = 'ppg'
     else:
       dataset_type = 'ecg'
@@ -274,7 +274,12 @@ def main():
     # Single-label classification for HAR/PPG datasets
     single_label = True
     task_name = dataset_type
-    dataset_cls = Capture24 if dataset_type == 'har' else SDB
+    if dataset_type == 'har':
+      dataset_cls = Capture24
+    elif 'hyper' in data_dir.lower():
+      dataset_cls = Hyper
+    else:
+      dataset_cls = SDB
 
     har_transpose_input = legacy_prefix is not None
     if legacy_prefix is not None:
