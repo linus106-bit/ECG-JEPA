@@ -183,7 +183,7 @@ def main():
       logger.debug(f'loading {dataset_name} from {dataset_path} (split={split})')
     dataset_cls = DATASETS[dataset_name]
     resample_ratio = config.sampling_frequency / dataset_cls.sampling_frequency
-    channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
+    channel_order = datautils.get_channel_order(dataset_cls.channels, config.active_channels)
     mean = np.array(dataset_cls.mean, dtype=np.float16).reshape(-1, 1)
     std = np.array(dataset_cls.std, dtype=np.float16).reshape(-1, 1)
     preprocess = ECGPreprocessor(
