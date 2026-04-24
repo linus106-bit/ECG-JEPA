@@ -270,6 +270,7 @@ def main():
 
 
   val_split_name = 'val' if 'val' in available_splits else ('validation' if 'validation' in available_splits else None)
+  class_label_names = None
 
   if dataset_type in ('har', 'ppg'):
     # Single-label classification for HAR/PPG datasets
@@ -295,6 +296,7 @@ def main():
       label_feature = hf_dataset['train'].features.get('label')
       if hasattr(label_feature, 'names'):
         num_classes = len(label_feature.names)
+        class_label_names = list(label_feature.names)
         if is_main_process:
           logger.debug(f'ClassLabel names: {label_feature.names}')
       else:
@@ -302,6 +304,7 @@ def main():
         train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
         test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
         num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
+        class_label_names = [str(i) for i in range(num_classes)]
 
       # Load train split: data is (N, num_channels, channel_size)
       train_ds = hf_dataset['train']
@@ -328,6 +331,8 @@ def main():
     if is_main_process:
       logger.debug(f'train={len(train_indices)}, val={len(val_indices)}, '
                    f'test={len(x_test)}, num_classes={num_classes}')
+    if class_label_names is None:
+      class_label_names = [str(i) for i in range(num_classes)]
 
     # Canonicalize to channels-first (N, C, T), then compute per-channel stats.
     num_channels = len(dataset_cls.channels)
@@ -378,6 +383,7 @@ def main():
     # Get label_names and num_classes from the dataset
     label_names = hf_dataset['train'][0]['label_names']
     num_classes = len(label_names)
+    class_label_names = list(label_names)
     if is_main_process:
       logger.debug(f'num_classes={num_classes}, label_names={label_names}')
 
@@ -930,6 +936,21 @@ def main():
         writer.writeheader()
         writer.writerows(test_metric_stats['threshold_curve_rows'])
       logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
+
+      per_label_auroc_rows = [row for row in test_metric_stats['threshold_rows'] if 'auroc' in row]
+      per_label_auroc_map = {int(row['class_index']): float(row['auroc']) for row in per_label_auroc_rows}
+      auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
+      with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
+        writer.writeheader()
+        for label_id in range(eval_config.num_classes):
+          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
+          writer.writerow({
+            'label_id': int(label_id),
+            'label_name': label_name,
+            'auroc': per_label_auroc_map.get(label_id, float('nan')),
+          })
+      logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
 
       threshold_plot_path = path.join(args.out, f'{task_name}_test_opt_sens_spec_macro.png')
       try:
