@@ -128,6 +128,22 @@ def _canonicalize_single_label_array(x, num_channels):
   raise ValueError(f'Could not infer (N, C, T) layout for shape {x.shape} with num_channels={num_channels}')
 
 
+def _resolve_single_label_key(hf_dataset, dataset_cls):
+  """Resolve the label column name for single-label datasets."""
+  train_features = hf_dataset['train'].features
+
+  preferred_keys = ['label']
+  if dataset_cls is Hyper:
+    preferred_keys = list(Hyper.label_keys)
+
+  for key in preferred_keys:
+    if key in train_features:
+      return key
+
+  available = list(train_features.keys())
+  raise ValueError(f'Could not find a label column in train split. tried={preferred_keys}, available={available}')
+
+
 def main():
   # Load config YAML and extract run: section early (needed before distributed setup)
   if args.config is None:
@@ -292,8 +308,12 @@ def main():
       if is_main_process:
         logger.debug('loaded HAR data from legacy dump files')
     elif hf_dataset is not None:
+      label_key = _resolve_single_label_key(hf_dataset, dataset_cls)
+      if is_main_process and label_key != 'label':
+        logger.debug(f'using non-default label key "{label_key}" for {dataset_cls.__name__}')
+
       # Get num_classes from ClassLabel feature
-      label_feature = hf_dataset['train'].features.get('label')
+      label_feature = hf_dataset['train'].features.get(label_key)
       if hasattr(label_feature, 'names'):
         num_classes = len(label_feature.names)
         class_label_names = list(label_feature.names)
@@ -301,20 +321,20 @@ def main():
           logger.debug(f'ClassLabel names: {label_feature.names}')
       else:
         # fallback
-        train_labels_tmp = np.array(hf_dataset['train']['label'], dtype=np.int64)
-        test_labels_tmp = np.array(hf_dataset['test']['label'], dtype=np.int64)
+        train_labels_tmp = np.array(hf_dataset['train'][label_key], dtype=np.int64)
+        test_labels_tmp = np.array(hf_dataset['test'][label_key], dtype=np.int64)
         num_classes = int(max(train_labels_tmp.max(), test_labels_tmp.max()) + 1)
         class_label_names = [str(i) for i in range(num_classes)]
 
       # Load train split: data is (N, num_channels, channel_size)
       train_ds = hf_dataset['train']
       x_train_all = np.array(train_ds['data'], dtype=np.float16)
-      train_labels = np.array(train_ds['label'], dtype=np.int64)
+      train_labels = np.array(train_ds[label_key], dtype=np.int64)
 
       # Load test split
       test_ds = hf_dataset['test']
       x_test = np.array(test_ds['data'], dtype=np.float16)
-      test_labels = np.array(test_ds['label'], dtype=np.int64)
+      test_labels = np.array(test_ds[label_key], dtype=np.int64)
     else:
       raise ValueError(f'Could not load single-label HAR/PPG dataset from {data_dir}. '
                        f'Expected HF dataset directory or legacy Capture24 dump prefix.')
