@@ -725,6 +725,29 @@ def main():
     return ('Sensitivity=TPR(recall), positive=label 1; '
             'Specificity=TNR, negative=label 0.')
 
+  def _compute_per_label_metrics_from_confusion(metric_stats, per_label_auroc_map):
+    tp = np.asarray(metric_stats['tp_per_class'], dtype=np.float64)
+    tn = np.asarray(metric_stats['tn_per_class'], dtype=np.float64)
+    fp = np.asarray(metric_stats['fp_per_class'], dtype=np.float64)
+    fn = np.asarray(metric_stats['fn_per_class'], dtype=np.float64)
+    sensitivity = np.asarray(metric_stats['sensitivity_per_class'], dtype=np.float64)
+    specificity = np.asarray(metric_stats['specificity_per_class'], dtype=np.float64)
+    total = tp + tn + fp + fn
+    accuracy = _safe_ratio(tp + tn, total)
+    precision = _safe_ratio(tp, tp + fp)
+    f1 = _safe_ratio(2.0 * precision * sensitivity, precision + sensitivity)
+    per_label_metrics = []
+    for cls in range(len(tp)):
+      per_label_metrics.append({
+        'class_index': int(cls),
+        'auroc': float(per_label_auroc_map.get(cls, float('nan'))),
+        'f1': float(f1[cls]),
+        'accuracy': float(accuracy[cls]),
+        'sensitivity': float(sensitivity[cls]),
+        'specificity': float(specificity[cls]),
+      })
+    return per_label_metrics
+
   def _compute_single_label_metrics(targets, logits):
     probs = torch.softmax(logits, dim=1).cpu().numpy()
     preds = logits.argmax(dim=1).cpu().numpy()
@@ -1023,6 +1046,25 @@ def main():
           })
       logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
 
+      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
+      metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
+      with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
+        writer.writeheader()
+        for row in per_label_metrics:
+          label_id = int(row['class_index'])
+          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
+          writer.writerow({
+            'label_id': label_id,
+            'label_name': label_name,
+            'auroc': row['auroc'],
+            'f1': row['f1'],
+            'accuracy': row['accuracy'],
+            'sensitivity': row['sensitivity'],
+            'specificity': row['specificity'],
+          })
+      logger.info(f'saved per-label metrics csv to {metrics_csv_path}')
+
       try:
         import matplotlib.pyplot as plt
 
@@ -1129,6 +1171,25 @@ def main():
             'auroc': per_label_auroc_map.get(label_id, float('nan')),
           })
       logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
+
+      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
+      metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
+      with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
+        writer.writeheader()
+        for row in per_label_metrics:
+          label_id = int(row['class_index'])
+          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
+          writer.writerow({
+            'label_id': label_id,
+            'label_name': label_name,
+            'auroc': row['auroc'],
+            'f1': row['f1'],
+            'accuracy': row['accuracy'],
+            'sensitivity': row['sensitivity'],
+            'specificity': row['specificity'],
+          })
+      logger.info(f'saved per-label metrics csv to {metrics_csv_path}')
 
     json_result_path = path.join(args.out, f'{task_name}_eval_results.json')
     with open(json_result_path, 'w', encoding='utf-8') as f:
