@@ -748,6 +748,13 @@ def main():
       })
     return per_label_metrics
 
+  def _extract_per_label_auroc_map(threshold_rows):
+    return {
+      int(row['class_index']): float(row['auroc'])
+      for row in threshold_rows
+      if 'auroc' in row
+    }
+
   def _compute_single_label_metrics(targets, logits):
     probs = torch.softmax(logits, dim=1).cpu().numpy()
     preds = logits.argmax(dim=1).cpu().numpy()
@@ -1031,22 +1038,22 @@ def main():
         writer.writerows(test_metric_stats['threshold_curve_rows'])
       logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
 
-      per_label_auroc_rows = [row for row in test_metric_stats['threshold_rows'] if 'auroc' in row]
-      per_label_auroc_map = {int(row['class_index']): float(row['auroc']) for row in per_label_auroc_rows}
+      per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
+      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
       auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
       with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
         writer.writeheader()
-        for label_id in range(eval_config.num_classes):
+        for row in per_label_metrics:
+          label_id = int(row['class_index'])
           label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
           writer.writerow({
-            'label_id': int(label_id),
+            'label_id': label_id,
             'label_name': label_name,
-            'auroc': per_label_auroc_map.get(label_id, float('nan')),
+            'auroc': row['auroc'],
           })
       logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
 
-      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
       metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
       with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
@@ -1157,22 +1164,22 @@ def main():
         writer.writerows(test_metric_stats['threshold_curve_rows'])
       logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
 
-      per_label_auroc_rows = [row for row in test_metric_stats['threshold_rows'] if 'auroc' in row]
-      per_label_auroc_map = {int(row['class_index']): float(row['auroc']) for row in per_label_auroc_rows}
+      per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
+      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
       auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
       with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
         writer.writeheader()
-        for label_id in range(eval_config.num_classes):
+        for row in per_label_metrics:
+          label_id = int(row['class_index'])
           label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
           writer.writerow({
-            'label_id': int(label_id),
+            'label_id': label_id,
             'label_name': label_name,
-            'auroc': per_label_auroc_map.get(label_id, float('nan')),
+            'auroc': row['auroc'],
           })
       logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
 
-      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
       metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
       with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
