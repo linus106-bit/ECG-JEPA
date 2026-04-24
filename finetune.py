@@ -918,7 +918,6 @@ def main():
         'test_opt_threshold': float(test_metric_stats['opt_threshold_macro']),
         'test_opt_sens': float(test_metric_stats['opt_sens_macro']),
         'test_opt_spec': float(test_metric_stats['opt_spec_macro']),
-        'test_threshold_rows': test_metric_stats['threshold_rows'],
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
