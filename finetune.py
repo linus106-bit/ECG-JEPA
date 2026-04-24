@@ -967,7 +967,7 @@ def main():
           spec = np.array([float(r['specificity']) for r in rows_sorted], dtype=np.float64)
           if len(thresholds) == 0:
             continue
-          sweet_idx = int(np.argmin(np.abs(sens - spec)))
+          sweet_idx = int(np.argmax(sens + spec))
           sweet_threshold = float(thresholds[sweet_idx])
           sweet_sens = float(sens[sweet_idx])
           sweet_spec = float(spec[sweet_idx])
@@ -982,7 +982,7 @@ def main():
           ax.scatter([sweet_threshold], [sweet_sens], color='tab:blue', s=24, zorder=3)
           ax.scatter([sweet_threshold], [sweet_spec], color='tab:orange', s=24, zorder=3)
           ax.axvline(sweet_threshold, color='tab:green', linestyle='--', linewidth=1.2,
-                     label=f'sweet spot th={sweet_threshold:.4f}')
+                     label=f'sweet spot (max sens+spec) th={sweet_threshold:.4f}')
           ax.set_ylim(0.0, 1.0)
           ax.set_xlabel('Threshold')
           ax.set_ylabel('Score')
