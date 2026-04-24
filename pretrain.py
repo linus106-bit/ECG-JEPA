@@ -306,6 +306,7 @@ def main():
     steps_per_epoch = None
     total_steps = config.steps
     start_step = chkpt['step'] if chkpt is not None else 0
+    start_epoch = 0
 
   # setup hyperparameter schedules
   use_lejepa = config.jepa_mode == 'lejepa'

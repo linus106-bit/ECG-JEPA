@@ -15,6 +15,7 @@ class Hyper:
   # Placeholder stats; compute dataset-specific values when available.
   mean = [0.0] * len(channels)
   std = [1.0] * len(channels)
+  label_keys = ('hypertension', 'label')
 
   @staticmethod
   def load_data(data_dir):
@@ -37,7 +38,8 @@ class Hyper:
         x = np.array(sample['data'], dtype=np.float16)  # (C, T)
         x = x.T  # (T, C), channels last
         all_data.append(x)
-        all_labels.append(int(sample['label']) if 'label' in sample else -1)
+        sample_label = next((sample[k] for k in Hyper.label_keys if k in sample), -1)
+        all_labels.append(int(sample_label))
         all_splits.append(split_name)
 
     return np.array(all_data, dtype=object), np.array(all_labels, dtype=np.int64), np.array(all_splits)

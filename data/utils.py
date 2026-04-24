@@ -178,7 +178,10 @@ def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
   from datasets import load_dataset
   ds = load_dataset(dataset_path, split=split)
   data = np.array(ds['data'], dtype=dtype)
-  labels = ds['label']
+  label_key = 'label' if 'label' in ds.column_names else ('hypertension' if 'hypertension' in ds.column_names else None)
+  if label_key is None:
+    raise ValueError(f'No supported label column found. available columns: {ds.column_names}')
+  labels = ds[label_key]
   return data, labels
 
 
