@@ -1,4 +1,5 @@
 import argparse
+import csv
 import copy
 import dataclasses
 import json
@@ -17,7 +18,7 @@ from tqdm import tqdm
 import numpy as np
 import torch
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix, multilabel_confusion_matrix
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score, confusion_matrix, multilabel_confusion_matrix, roc_curve
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
@@ -607,6 +608,58 @@ def main():
       return float('nan'), skipped_classes
     return float(np.mean(class_aurocs)), skipped_classes
 
+  def _compute_optimal_ovr_thresholds(y_true, y_score):
+    classes = np.arange(y_score.shape[1])
+    threshold_rows = []
+    threshold_curve_rows = []
+    per_class_auroc = []
+    for cls in classes:
+      y_true_binary = (y_true == cls).astype(np.int32)
+      if y_true_binary.min() == y_true_binary.max():
+        continue
+      fpr, tpr, thresholds = roc_curve(y_true_binary, y_score[:, cls])
+      opt_idx = int(np.argmax(tpr - fpr))
+      class_auroc = roc_auc_score(y_true_binary, y_score[:, cls])
+      per_class_auroc.append(float(class_auroc))
+      for i, th in enumerate(thresholds):
+        row = {
+          'class_index': int(cls),
+          'threshold': round(float(th), 6),
+          'sensitivity': float(tpr[i]),
+          'specificity': float(1.0 - fpr[i]),
+          'youden_j': float(tpr[i] - fpr[i]),
+        }
+        threshold_rows.append(row)
+        threshold_curve_rows.append(row)
+      threshold_rows.append({
+        'class_index': int(cls),
+        'auroc': float(class_auroc),
+        'opt_youden_j': float(tpr[opt_idx] - fpr[opt_idx]),
+        'opt_threshold': float(thresholds[opt_idx]),
+        'opt_sens': float(tpr[opt_idx]),
+        'opt_spec': float(1.0 - fpr[opt_idx]),
+      })
+    if not threshold_rows:
+      return {
+        'threshold_rows': [],
+        'threshold_curve_rows': [],
+        'macro_auroc_from_thresholds': float('nan'),
+        'opt_youden_j_macro': float('nan'),
+        'opt_threshold_macro': float('nan'),
+        'opt_sens_macro': float('nan'),
+        'opt_spec_macro': float('nan'),
+      }
+    opt_rows = [row for row in threshold_rows if 'opt_youden_j' in row]
+    return {
+      'threshold_rows': threshold_rows,
+      'threshold_curve_rows': threshold_curve_rows,
+      'macro_auroc_from_thresholds': float(np.mean(per_class_auroc)) if per_class_auroc else float('nan'),
+      'opt_youden_j_macro': float(np.mean([row['opt_youden_j'] for row in opt_rows])) if opt_rows else float('nan'),
+      'opt_threshold_macro': float(np.mean([row['opt_threshold'] for row in opt_rows])) if opt_rows else float('nan'),
+      'opt_sens_macro': float(np.mean([row['opt_sens'] for row in opt_rows])) if opt_rows else float('nan'),
+      'opt_spec_macro': float(np.mean([row['opt_spec'] for row in opt_rows])) if opt_rows else float('nan'),
+    }
+
   def _metric_semantics_text():
     if single_label:
       return ('Sensitivity=TPR(recall), positive=the class itself in one-vs-rest; '
@@ -621,6 +674,16 @@ def main():
     acc = accuracy_score(y_true=targets, y_pred=preds)
     metric_stats = _compute_macro_sensitivity_specificity(targets, preds)
     auroc, skipped_classes = _safe_macro_ovr_auroc(targets, probs)
+    threshold_stats = _compute_optimal_ovr_thresholds(targets, probs)
+    metric_stats.update({
+      'macro_auroc_from_thresholds': threshold_stats['macro_auroc_from_thresholds'],
+      'opt_youden_j_macro': threshold_stats['opt_youden_j_macro'],
+      'opt_threshold_macro': threshold_stats['opt_threshold_macro'],
+      'opt_sens_macro': threshold_stats['opt_sens_macro'],
+      'opt_spec_macro': threshold_stats['opt_spec_macro'],
+      'threshold_rows': threshold_stats['threshold_rows'],
+      'threshold_curve_rows': threshold_stats['threshold_curve_rows'],
+    })
     if is_main_process and skipped_classes:
       logger.warning(f'AUROC skipped classes without both positive/negative samples: {skipped_classes}')
     return preds, probs, f1, acc, auroc, metric_stats
@@ -822,17 +885,8 @@ def main():
       test_logits = torch.cat(test_logits_or_preds)
       test_predictions, test_probabilities, test_f1, test_acc, test_auroc, test_metric_stats = _compute_single_label_metrics(
         targets=test_targets, logits=test_logits)
-      val_probabilities = best_val_predictions['probs']
-      val_sensitivity = best_val_metric_stats['sensitivity_macro']
-      val_specificity = best_val_metric_stats['specificity_macro']
       test_sensitivity = test_metric_stats['sensitivity_macro']
       test_specificity = test_metric_stats['specificity_macro']
-      try:
-        val_auroc, skipped_classes = _safe_macro_ovr_auroc(saved_val_targets, val_probabilities)
-        if skipped_classes:
-          logger.warning(f'Best-val AUROC skipped classes without both positive/negative samples: {skipped_classes}')
-      except ValueError:
-        val_auroc = float('nan')
       logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}  test_auroc {test_auroc:.4f}  '
                   f'test_sensitivity(TPR) {test_sensitivity:.4f}  '
                   f'test_specificity(TNR) {test_specificity:.4f}  '
@@ -843,22 +897,6 @@ def main():
         'single_label': bool(single_label),
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
-        'val_f1': float(best_val_metric),
-        'val_auroc': float(val_auroc),
-        'val_sensitivity': float(val_sensitivity),
-        'val_specificity': float(val_specificity),
-        'val_sensitivity_positive': float(val_sensitivity),
-        'val_specificity_negative': float(val_specificity),
-        'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
-        'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
-        'val_sensitivity_per_class_positive': best_val_metric_stats['sensitivity_per_class'].tolist(),
-        'val_specificity_per_class_negative': best_val_metric_stats['specificity_per_class'].tolist(),
-        'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
-        'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
-        'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
-        'val_tn_per_class': best_val_metric_stats['tn_per_class'].tolist(),
-        'val_fp_per_class': best_val_metric_stats['fp_per_class'].tolist(),
-        'val_fn_per_class': best_val_metric_stats['fn_per_class'].tolist(),
         'test_f1': float(test_f1),
         'test_acc': float(test_acc),
         'test_auroc': float(test_auroc),
@@ -876,18 +914,46 @@ def main():
         'test_tn_per_class': test_metric_stats['tn_per_class'].tolist(),
         'test_fp_per_class': test_metric_stats['fp_per_class'].tolist(),
         'test_fn_per_class': test_metric_stats['fn_per_class'].tolist(),
+        'test_opt_youden_j': float(test_metric_stats['opt_youden_j_macro']),
+        'test_opt_threshold': float(test_metric_stats['opt_threshold_macro']),
+        'test_opt_sens': float(test_metric_stats['opt_sens_macro']),
+        'test_opt_spec': float(test_metric_stats['opt_spec_macro']),
+        'test_threshold_rows': test_metric_stats['threshold_rows'],
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
         'encoder_path': args.encoder,
       }
+
+      threshold_csv_path = path.join(args.out, f'{task_name}_test_threshold_sens_spec.csv')
+      with open(threshold_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['class_index', 'threshold', 'sensitivity', 'specificity', 'youden_j'])
+        writer.writeheader()
+        writer.writerows(test_metric_stats['threshold_curve_rows'])
+      logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
+
+      threshold_plot_path = path.join(args.out, f'{task_name}_test_opt_sens_spec_macro.png')
+      try:
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ax.bar(['opt_sens_macro', 'opt_spec_macro'],
+               [test_metric_stats['opt_sens_macro'], test_metric_stats['opt_spec_macro']],
+               color=['tab:blue', 'tab:orange'])
+        ax.set_ylim(0.0, 1.0)
+        ax.set_ylabel('Score')
+        ax.set_title('Optimal Macro Sensitivity / Specificity')
+        fig.tight_layout()
+        fig.savefig(threshold_plot_path, dpi=150)
+        plt.close(fig)
+        logger.info(f'saved optimal sensitivity/specificity plot to {threshold_plot_path}')
+      except Exception as e:
+        logger.warning(f'failed to save optimal sensitivity/specificity plot: {e}')
     else:
       test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
       test_binary_predictions = (test_predictions >= 0.5).astype(np.int32)
       test_metric_stats = _compute_macro_sensitivity_specificity(test_targets, test_binary_predictions)
-      val_sensitivity = best_val_metric_stats['sensitivity_macro']
-      val_specificity = best_val_metric_stats['specificity_macro']
       test_sensitivity = test_metric_stats['sensitivity_macro']
       test_specificity = test_metric_stats['specificity_macro']
       logger.info(f'test_auc {test_auc:.4f}  test_sensitivity {test_sensitivity:.4f}  '
@@ -898,21 +964,6 @@ def main():
         'single_label': bool(single_label),
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
-        'val_auc': float(best_val_metric),
-        'val_sensitivity': float(val_sensitivity),
-        'val_specificity': float(val_specificity),
-        'val_sensitivity_positive': float(val_sensitivity),
-        'val_specificity_negative': float(val_specificity),
-        'val_sensitivity_per_class': best_val_metric_stats['sensitivity_per_class'].tolist(),
-        'val_specificity_per_class': best_val_metric_stats['specificity_per_class'].tolist(),
-        'val_sensitivity_per_class_positive': best_val_metric_stats['sensitivity_per_class'].tolist(),
-        'val_specificity_per_class_negative': best_val_metric_stats['specificity_per_class'].tolist(),
-        'val_positive_per_class': best_val_metric_stats['positive_per_class'].tolist(),
-        'val_negative_per_class': best_val_metric_stats['negative_per_class'].tolist(),
-        'val_tp_per_class': best_val_metric_stats['tp_per_class'].tolist(),
-        'val_tn_per_class': best_val_metric_stats['tn_per_class'].tolist(),
-        'val_fp_per_class': best_val_metric_stats['fp_per_class'].tolist(),
-        'val_fn_per_class': best_val_metric_stats['fn_per_class'].tolist(),
         'test_auc': float(test_auc),
         'test_sensitivity': float(test_sensitivity),
         'test_specificity': float(test_specificity),
