@@ -952,23 +952,48 @@ def main():
           })
       logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
 
-      threshold_plot_path = path.join(args.out, f'{task_name}_test_opt_sens_spec_macro.png')
       try:
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(5, 4))
-        ax.bar(['opt_sens_macro', 'opt_spec_macro'],
-               [test_metric_stats['opt_sens_macro'], test_metric_stats['opt_spec_macro']],
-               color=['tab:blue', 'tab:orange'])
-        ax.set_ylim(0.0, 1.0)
-        ax.set_ylabel('Score')
-        ax.set_title('Optimal Macro Sensitivity / Specificity')
-        fig.tight_layout()
-        fig.savefig(threshold_plot_path, dpi=150)
-        plt.close(fig)
-        logger.info(f'saved optimal sensitivity/specificity plot to {threshold_plot_path}')
+        threshold_rows_by_class = {}
+        for row in test_metric_stats['threshold_curve_rows']:
+          cls = int(row['class_index'])
+          threshold_rows_by_class.setdefault(cls, []).append(row)
+
+        for cls, rows in threshold_rows_by_class.items():
+          rows_sorted = sorted(rows, key=lambda r: float(r['threshold']))
+          thresholds = np.array([float(r['threshold']) for r in rows_sorted], dtype=np.float64)
+          sens = np.array([float(r['sensitivity']) for r in rows_sorted], dtype=np.float64)
+          spec = np.array([float(r['specificity']) for r in rows_sorted], dtype=np.float64)
+          if len(thresholds) == 0:
+            continue
+          sweet_idx = int(np.argmin(np.abs(sens - spec)))
+          sweet_threshold = float(thresholds[sweet_idx])
+          sweet_sens = float(sens[sweet_idx])
+          sweet_spec = float(spec[sweet_idx])
+
+          label_name = class_label_names[cls] if class_label_names is not None and cls < len(class_label_names) else str(cls)
+          safe_label_name = str(label_name).replace('/', '_').replace(' ', '_')
+          threshold_plot_path = path.join(args.out, f'{task_name}_label{cls}_{safe_label_name}_sens_spec_curve.png')
+
+          fig, ax = plt.subplots(figsize=(6, 4))
+          ax.plot(thresholds, sens, label='sensitivity', color='tab:blue')
+          ax.plot(thresholds, spec, label='specificity', color='tab:orange')
+          ax.scatter([sweet_threshold], [sweet_sens], color='tab:blue', s=24, zorder=3)
+          ax.scatter([sweet_threshold], [sweet_spec], color='tab:orange', s=24, zorder=3)
+          ax.axvline(sweet_threshold, color='tab:green', linestyle='--', linewidth=1.2,
+                     label=f'sweet spot th={sweet_threshold:.4f}')
+          ax.set_ylim(0.0, 1.0)
+          ax.set_xlabel('Threshold')
+          ax.set_ylabel('Score')
+          ax.set_title(f'Label {cls} ({label_name}) Sens/Spec vs Threshold')
+          ax.legend(loc='best')
+          fig.tight_layout()
+          fig.savefig(threshold_plot_path, dpi=150)
+          plt.close(fig)
+        logger.info(f'saved per-label sensitivity/specificity threshold plots to {args.out}')
       except Exception as e:
-        logger.warning(f'failed to save optimal sensitivity/specificity plot: {e}')
+        logger.warning(f'failed to save sensitivity/specificity threshold plots: {e}')
     else:
       test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
       test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
