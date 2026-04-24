@@ -161,6 +161,7 @@ def main():
     config.sigreg_lambda = args.sigreg_lambda
   if is_main_process:
     logger.debug(f'JEPA mode: {config.jepa_mode}')
+    logger.debug(f'active channels: {config.active_channels} (only_lead_one={config.only_lead_one})')
 
   for dataset_name, dataset_info in config.datasets.items():
     if dataset_name not in DATASETS:
