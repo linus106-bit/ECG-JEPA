@@ -666,6 +666,58 @@ def main():
       'opt_spec_macro': float(np.mean([row['opt_spec'] for row in opt_rows])) if opt_rows else float('nan'),
     }
 
+  def _compute_optimal_multilabel_thresholds(y_true, y_score):
+    classes = np.arange(y_score.shape[1])
+    threshold_rows = []
+    threshold_curve_rows = []
+    per_class_auroc = []
+    for cls in classes:
+      y_true_binary = y_true[:, cls].astype(np.int32)
+      if y_true_binary.min() == y_true_binary.max():
+        continue
+      fpr, tpr, thresholds = roc_curve(y_true_binary, y_score[:, cls])
+      opt_idx = int(np.argmax(tpr - fpr))
+      class_auroc = roc_auc_score(y_true_binary, y_score[:, cls])
+      per_class_auroc.append(float(class_auroc))
+      for i, th in enumerate(thresholds):
+        row = {
+          'class_index': int(cls),
+          'threshold': round(float(th), 6),
+          'sensitivity': float(tpr[i]),
+          'specificity': float(1.0 - fpr[i]),
+          'youden_j': float(tpr[i] - fpr[i]),
+        }
+        threshold_rows.append(row)
+        threshold_curve_rows.append(row)
+      threshold_rows.append({
+        'class_index': int(cls),
+        'auroc': float(class_auroc),
+        'opt_youden_j': float(tpr[opt_idx] - fpr[opt_idx]),
+        'opt_threshold': float(thresholds[opt_idx]),
+        'opt_sens': float(tpr[opt_idx]),
+        'opt_spec': float(1.0 - fpr[opt_idx]),
+      })
+    if not threshold_rows:
+      return {
+        'threshold_rows': [],
+        'threshold_curve_rows': [],
+        'macro_auroc_from_thresholds': float('nan'),
+        'opt_youden_j_macro': float('nan'),
+        'opt_threshold_macro': float('nan'),
+        'opt_sens_macro': float('nan'),
+        'opt_spec_macro': float('nan'),
+      }
+    opt_rows = [row for row in threshold_rows if 'opt_youden_j' in row]
+    return {
+      'threshold_rows': threshold_rows,
+      'threshold_curve_rows': threshold_curve_rows,
+      'macro_auroc_from_thresholds': float(np.mean(per_class_auroc)) if per_class_auroc else float('nan'),
+      'opt_youden_j_macro': float(np.mean([row['opt_youden_j'] for row in opt_rows])) if opt_rows else float('nan'),
+      'opt_threshold_macro': float(np.mean([row['opt_threshold'] for row in opt_rows])) if opt_rows else float('nan'),
+      'opt_sens_macro': float(np.mean([row['opt_sens'] for row in opt_rows])) if opt_rows else float('nan'),
+      'opt_spec_macro': float(np.mean([row['opt_spec'] for row in opt_rows])) if opt_rows else float('nan'),
+    }
+
   def _metric_semantics_text():
     if single_label:
       return ('Sensitivity=TPR(recall), positive=the class itself in one-vs-rest; '
@@ -694,6 +746,25 @@ def main():
       logger.warning(f'AUROC skipped classes without both positive/negative samples: {skipped_classes}')
     return preds, probs, f1, acc, auroc, metric_stats
 
+  def _compute_multi_label_metrics(targets, logits):
+    probs = torch.sigmoid(logits).cpu().numpy()
+    preds = (probs >= 0.5).astype(np.int32)
+    f1 = f1_score(y_true=targets, y_pred=preds, average='macro')
+    acc = accuracy_score(y_true=targets, y_pred=preds)
+    auroc = roc_auc_score(y_true=targets, y_score=probs, average='macro')
+    metric_stats = _compute_macro_sensitivity_specificity(targets, preds)
+    threshold_stats = _compute_optimal_multilabel_thresholds(targets, probs)
+    metric_stats.update({
+      'macro_auroc_from_thresholds': threshold_stats['macro_auroc_from_thresholds'],
+      'opt_youden_j_macro': threshold_stats['opt_youden_j_macro'],
+      'opt_threshold_macro': threshold_stats['opt_threshold_macro'],
+      'opt_sens_macro': threshold_stats['opt_sens_macro'],
+      'opt_spec_macro': threshold_stats['opt_spec_macro'],
+      'threshold_rows': threshold_stats['threshold_rows'],
+      'threshold_curve_rows': threshold_stats['threshold_curve_rows'],
+    })
+    return preds, probs, f1, acc, auroc, metric_stats
+
   def _eval_val():
     val_logits_or_preds, val_targets = [], []
     model.eval()
@@ -719,11 +790,9 @@ def main():
       preds, probs, metric, acc, auroc, metric_stats = _compute_single_label_metrics(targets, logits)
       return {'preds': preds, 'probs': probs}, targets, metric, acc, auroc, metric_stats
     else:
-      preds = torch.cat(val_logits_or_preds).sigmoid().cpu().numpy()
-      metric = roc_auc_score(y_true=targets, y_score=preds, average='macro')
-      binary_preds = (preds >= 0.5).astype(np.int32)
-      metric_stats = _compute_macro_sensitivity_specificity(targets, binary_preds)
-      return preds, targets, metric, None, None, metric_stats
+      logits = torch.cat(val_logits_or_preds)
+      preds, probs, metric, acc, auroc, metric_stats = _compute_multi_label_metrics(targets, logits)
+      return {'preds': preds, 'probs': probs}, targets, metric, acc, auroc, metric_stats
 
   def _log_val(epoch_or_step, label, preds, targets, metric, acc, auroc, metric_stats, new_best):
     sensitivity = metric_stats['sensitivity_macro']
@@ -740,7 +809,9 @@ def main():
     else:
       logger.info(f'{label}: {epoch_or_step} '
                   f'{"(*)" if new_best else "   "} '
-                  f'val_auc: {metric:.4f} '
+                  f'val_f1: {metric:.4f} '
+                  f'val_acc: {acc:.4f} '
+                  f'val_auroc: {auroc:.4f} '
                   f'val_sensitivity(TPR): {sensitivity:.4f} '
                   f'val_specificity(TNR): {specificity:.4f} '
                   f'[{_metric_semantics_text()}]')
@@ -995,13 +1066,13 @@ def main():
       except Exception as e:
         logger.warning(f'failed to save sensitivity/specificity threshold plots: {e}')
     else:
-      test_predictions = torch.cat(test_logits_or_preds).sigmoid().cpu().numpy()
-      test_auc = roc_auc_score(y_true=test_targets, y_score=test_predictions, average='macro')
-      test_binary_predictions = (test_predictions >= 0.5).astype(np.int32)
-      test_metric_stats = _compute_macro_sensitivity_specificity(test_targets, test_binary_predictions)
+      test_logits = torch.cat(test_logits_or_preds)
+      test_predictions, test_probabilities, test_f1, test_acc, test_auroc, test_metric_stats = _compute_multi_label_metrics(
+        targets=test_targets, logits=test_logits)
       test_sensitivity = test_metric_stats['sensitivity_macro']
       test_specificity = test_metric_stats['specificity_macro']
-      logger.info(f'test_auc {test_auc:.4f}  test_sensitivity {test_sensitivity:.4f}  '
+      logger.info(f'test_f1 {test_f1:.4f}  test_acc {test_acc:.4f}  test_auroc {test_auroc:.4f}  '
+                  f'test_sensitivity {test_sensitivity:.4f}  '
                   f'test_specificity {test_specificity:.4f}  [{_metric_semantics_text()}]')
       eval_results = {
         'task': task_name,
@@ -1009,7 +1080,10 @@ def main():
         'single_label': bool(single_label),
         'best_val_metric': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
-        'test_auc': float(test_auc),
+        'test_f1': float(test_f1),
+        'test_acc': float(test_acc),
+        'test_auroc': float(test_auroc),
+        'test_auc': float(test_auroc),
         'test_sensitivity': float(test_sensitivity),
         'test_specificity': float(test_specificity),
         'test_sensitivity_positive': float(test_sensitivity),
@@ -1024,11 +1098,37 @@ def main():
         'test_tn_per_class': test_metric_stats['tn_per_class'].tolist(),
         'test_fp_per_class': test_metric_stats['fp_per_class'].tolist(),
         'test_fn_per_class': test_metric_stats['fn_per_class'].tolist(),
+        'test_opt_youden_j': float(test_metric_stats['opt_youden_j_macro']),
+        'test_opt_threshold': float(test_metric_stats['opt_threshold_macro']),
+        'test_opt_sens': float(test_metric_stats['opt_sens_macro']),
+        'test_opt_spec': float(test_metric_stats['opt_spec_macro']),
         'timestamp': datetime.now().isoformat(),
         'out_dir': args.out,
         'config_path': args.config,
         'encoder_path': args.encoder,
       }
+
+      threshold_csv_path = path.join(args.out, f'{task_name}_test_threshold_sens_spec.csv')
+      with open(threshold_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['class_index', 'threshold', 'sensitivity', 'specificity', 'youden_j'])
+        writer.writeheader()
+        writer.writerows(test_metric_stats['threshold_curve_rows'])
+      logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
+
+      per_label_auroc_rows = [row for row in test_metric_stats['threshold_rows'] if 'auroc' in row]
+      per_label_auroc_map = {int(row['class_index']): float(row['auroc']) for row in per_label_auroc_rows}
+      auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
+      with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
+        writer.writeheader()
+        for label_id in range(eval_config.num_classes):
+          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
+          writer.writerow({
+            'label_id': int(label_id),
+            'label_name': label_name,
+            'auroc': per_label_auroc_map.get(label_id, float('nan')),
+          })
+      logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
 
     json_result_path = path.join(args.out, f'{task_name}_eval_results.json')
     with open(json_result_path, 'w', encoding='utf-8') as f:
@@ -1047,9 +1147,11 @@ def main():
     else:
       np.savez(prediction_dump_path,
                val_targets=saved_val_targets,
-               val_predictions=best_val_predictions,
+               val_predictions=best_val_predictions['preds'],
+               val_probabilities=best_val_predictions['probs'],
                test_targets=test_targets,
-               test_predictions=test_predictions)
+               test_predictions=test_predictions,
+               test_probabilities=test_probabilities)
 
   pbar.close()
   if is_main_process:
@@ -1069,7 +1171,7 @@ def main():
       lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f} '
                    f'({ _metric_semantics_text() })')
     else:
-      lines.append(f'  Test AUC      : {test_auc:.4f}')
+      lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}  Test AUROC: {test_auroc:.4f}')
       lines.append(f'  Test Sens/Spec: {test_sensitivity:.4f} / {test_specificity:.4f} '
                    f'({ _metric_semantics_text() })')
     lines.append('=' * 50)
