@@ -420,7 +420,7 @@ def main():
     x_test.clip(-5, 5, out=x_test)
 
     # ensure matching channels (channels-first: index along axis 1)
-    channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.channels)
+    channel_order = datautils.get_channel_order(PTB_XL.channels, encoder_config.active_channels)
     x_train = x_train[:, channel_order]
     x_val = x_val[:, channel_order]
     x_test = x_test[:, channel_order]
@@ -470,7 +470,7 @@ def main():
   if dataset_type in ('har', 'ppg'):
     har_preprocess = PreprocessHAR(
       mean_std=(mean, std),
-      channel_order=get_channel_order(dataset_cls.channels, encoder_config.channels),
+      channel_order=get_channel_order(dataset_cls.channels, encoder_config.active_channels),
       transpose_input=har_transpose_input)
     train_transform = [har_preprocess, TrainTransform(crop_size=crop_size)]
     eval_transform = [har_preprocess, EvalTransform(crop_size=crop_size, crop_stride=crop_stride)]

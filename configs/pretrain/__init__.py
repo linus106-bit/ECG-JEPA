@@ -6,6 +6,7 @@ class Config:
   # data
   sampling_frequency: int = 500
   channels: tuple[str, ...] = ('I', 'II', 'III', 'AVR', 'AVL', 'AVF', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6')
+  only_lead_one: bool = False  # if True, use only the first channel from `channels` during training
   channel_size: int = 5000
   patch_size: int = 25
   # if True, split patches independently per channel (tokens = num_channels * channel_size // patch_size)
@@ -73,8 +74,14 @@ class Config:
   sigreg_num_slices: int = 1024
 
   @property
+  def active_channels(self):
+    if self.only_lead_one:
+      return self.channels[:1]
+    return self.channels
+
+  @property
   def num_channels(self):
-    return len(self.channels)
+    return len(self.active_channels)
 
   @property
   def num_patches(self):

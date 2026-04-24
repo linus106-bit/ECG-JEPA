@@ -8,6 +8,7 @@ run:
 # data
 sampling_frequency: 500
 channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
+only_lead_one: false  # true로 바꾸면 첫 번째 리드(lead I)만 사용
 channel_size: 5000
 patch_size: 25
 min_block_size: 10

@@ -161,6 +161,7 @@ def main():
     config.sigreg_lambda = args.sigreg_lambda
   if is_main_process:
     logger.debug(f'JEPA mode: {config.jepa_mode}')
+    logger.debug(f'active channels: {config.active_channels} (only_lead_one={config.only_lead_one})')
 
   for dataset_name, dataset_info in config.datasets.items():
     if dataset_name not in DATASETS:
@@ -183,7 +184,7 @@ def main():
       logger.debug(f'loading {dataset_name} from {dataset_path} (split={split})')
     dataset_cls = DATASETS[dataset_name]
     resample_ratio = config.sampling_frequency / dataset_cls.sampling_frequency
-    channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
+    channel_order = datautils.get_channel_order(dataset_cls.channels, config.active_channels)
     mean = np.array(dataset_cls.mean, dtype=np.float16).reshape(-1, 1)
     std = np.array(dataset_cls.std, dtype=np.float16).reshape(-1, 1)
     preprocess = ECGPreprocessor(
@@ -195,6 +196,7 @@ def main():
       resample_ratio=resample_ratio,
       channel_order=channel_order,
       transpose_input=True)
+    channel_selector = SelectChannels(channel_order=channel_order)
     _, ext = path.splitext(dataset_path)
     if path.isdir(dataset_path):
       # HuggingFace dataset directory
@@ -210,14 +212,19 @@ def main():
         new_sizes = np.array([x.shape[-1] for x in processed_records])
         new_starts = np.concatenate([np.array([0]), np.cumsum(new_sizes[:-1])])
         new_data = np.concatenate(processed_records, axis=-1)  # (num_channels, total_time)
+        transform = [TransformECG(crop_size=config.channel_size)]
+        if not online_mode:
+          transform.insert(0, channel_selector)
         dataset = VariableTensorDataset(
           new_data, new_starts, new_sizes,
-          transform=TransformECG(crop_size=config.channel_size))
+          transform=transform)
       else:
         data = load_hf_dataset(dataset_path, split=split)
         transform = [TransformECG(crop_size=config.channel_size)]
         if online_mode:
           transform.insert(0, preprocess)
+        else:
+          transform.insert(0, channel_selector)
         dataset = TensorDataset(
           data=data,
           transform=transform)
@@ -225,6 +232,8 @@ def main():
       transform = [TransformECG(crop_size=config.channel_size)]
       if online_mode:
         transform.insert(0, legacy_preprocess)
+      else:
+        transform.insert(0, channel_selector)
       dataset = TensorDataset(
         data=datautils.load_data_dump(dump_file=dataset_path),
         transform=transform)
@@ -234,9 +243,12 @@ def main():
         min_channel_size=config.channel_size,
         transform=legacy_preprocess if online_mode else None,
         processes=num_cpus)
+      transform = [TransformECG(crop_size=config.channel_size)]
+      if not online_mode:
+        transform.insert(0, channel_selector)
       dataset = VariableTensorDataset(
         var_data, var_starts, var_sizes,
-        transform=TransformECG(crop_size=config.channel_size))
+        transform=transform)
     else:
       raise ValueError(f'Unsupported dataset format: {dataset_path}')
     datasets[dataset_name] = (dataset, weight)
@@ -592,6 +604,14 @@ class TransformECG:  # called whenever dataloader accesses the data
     x = transforms.random_crop(x, self.crop_size)
     x = torch.from_numpy(x).float()
     return x
+
+
+class SelectChannels:
+  def __init__(self, channel_order):
+    self.channel_order = channel_order
+
+  def __call__(self, x):  # x: (num_channels, channel_size)
+    return x[self.channel_order]
 
 
 if __name__ == '__main__':
