@@ -429,7 +429,40 @@ def main():
     y_val = torch.from_numpy(y_val).float()
     y_test = torch.from_numpy(y_test).float()
 
+  def _label_name_from_idx(idx):
+    if class_label_names is not None and idx < len(class_label_names):
+      return str(class_label_names[idx])
+    return str(idx)
+
+  def _log_label_support(split_name, labels):
+    labels = np.asarray(labels)
+    if labels.ndim == 1:
+      support = np.bincount(labels.astype(np.int64), minlength=num_classes)
+      zero_support = np.where(support == 0)[0].tolist()
+      logger.info(f'[{split_name}] label support (single-label): classes={num_classes}, '
+                  f'zero-support={len(zero_support)}')
+      if zero_support:
+        preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in zero_support[:10])
+        logger.warning(f'[{split_name}] classes with zero support (first 10): {preview}')
+      return
+
+    positive = labels.sum(axis=0).astype(np.int64)
+    negative = (labels.shape[0] - positive).astype(np.int64)
+    no_positive = np.where(positive == 0)[0].tolist()
+    no_negative = np.where(negative == 0)[0].tolist()
+    logger.info(f'[{split_name}] label support (multi-label): labels={labels.shape[1]}, '
+                f'no-positive={len(no_positive)}, no-negative={len(no_negative)}')
+    if no_positive:
+      preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in no_positive[:10])
+      logger.warning(f'[{split_name}] labels with no positive samples (first 10): {preview}')
+    if no_negative:
+      preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in no_negative[:10])
+      logger.warning(f'[{split_name}] labels with no negative samples (first 10): {preview}')
+
   if is_main_process:
+    _log_label_support('train', y_train.cpu().numpy() if isinstance(y_train, torch.Tensor) else y_train)
+    _log_label_support('val', y_val.cpu().numpy() if isinstance(y_val, torch.Tensor) else y_val)
+    _log_label_support('test', y_test.cpu().numpy() if isinstance(y_test, torch.Tensor) else y_test)
     logger.debug(f'{get_memory_usage() / 1024 ** 3:,.2f}GB memory used after loading data')
 
   # -------------------------------------------------------------------------
@@ -1040,6 +1073,10 @@ def main():
 
       per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
       per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
+      nan_f1_labels = [int(row['class_index']) for row in per_label_metrics if np.isnan(row['f1'])]
+      if nan_f1_labels:
+        preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in nan_f1_labels[:10])
+        logger.warning(f'per-label F1 is NaN for {len(nan_f1_labels)} labels (first 10): {preview}')
       auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
       with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
@@ -1166,6 +1203,10 @@ def main():
 
       per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
       per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
+      nan_f1_labels = [int(row['class_index']) for row in per_label_metrics if np.isnan(row['f1'])]
+      if nan_f1_labels:
+        preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in nan_f1_labels[:10])
+        logger.warning(f'per-label F1 is NaN for {len(nan_f1_labels)} labels (first 10): {preview}')
       auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
       with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
