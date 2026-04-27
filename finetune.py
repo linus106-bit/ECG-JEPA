@@ -526,6 +526,47 @@ def main():
       fig.savefig(threshold_plot_path, dpi=150)
       plt.close(fig)
 
+  def _save_roc_curve_plots(threshold_curve_rows, per_label_auroc_map, label_name_whitelist=None):
+    import matplotlib.pyplot as plt
+
+    label_name_whitelist_upper = None
+    if label_name_whitelist:
+      label_name_whitelist_upper = {name.upper() for name in label_name_whitelist}
+
+    threshold_rows_by_class = {}
+    for row in threshold_curve_rows:
+      cls = int(row['class_index'])
+      label_name = _label_name_from_idx(cls)
+      if label_name_whitelist_upper is not None and str(label_name).upper() not in label_name_whitelist_upper:
+        continue
+      threshold_rows_by_class.setdefault(cls, []).append(row)
+
+    for cls, rows in threshold_rows_by_class.items():
+      rows_sorted = sorted(rows, key=lambda r: float(r['threshold']), reverse=True)
+      fpr = np.array([1.0 - float(r['specificity']) for r in rows_sorted], dtype=np.float64)
+      tpr = np.array([float(r['sensitivity']) for r in rows_sorted], dtype=np.float64)
+      if len(fpr) == 0:
+        continue
+
+      label_name = _label_name_from_idx(cls)
+      safe_label_name = str(label_name).replace('/', '_').replace(' ', '_')
+      roc_plot_path = path.join(args.out, f'{task_name}_label{cls}_{safe_label_name}_roc_curve.png')
+      auroc = per_label_auroc_map.get(cls, float('nan'))
+      auc_text = 'nan' if np.isnan(auroc) else f'{auroc:.4f}'
+
+      fig, ax = plt.subplots(figsize=(6, 4))
+      ax.plot(fpr, tpr, color='tab:blue', label=f'ROC (AUROC={auc_text})')
+      ax.plot([0, 1], [0, 1], linestyle='--', color='tab:gray', linewidth=1.0, label='random')
+      ax.set_xlim(0.0, 1.0)
+      ax.set_ylim(0.0, 1.0)
+      ax.set_xlabel('False Positive Rate')
+      ax.set_ylabel('True Positive Rate')
+      ax.set_title(f'Label {cls} ({label_name}) ROC Curve')
+      ax.legend(loc='lower right')
+      fig.tight_layout()
+      fig.savefig(roc_plot_path, dpi=150)
+      plt.close(fig)
+
   def _save_selected_label_csvs(task_name, per_label_metrics, threshold_curve_rows, target_label_names):
     target_lookup = {name.upper() for name in target_label_names}
     selected_label_ids = []
@@ -641,6 +682,21 @@ def main():
         logger.warning(f'failed to save sensitivity/specificity threshold plots: {e}')
       else:
         logger.warning(f'failed to save selected-label sensitivity/specificity threshold plots: {e}')
+
+    try:
+      _save_roc_curve_plots(
+        threshold_curve_rows=test_metric_stats['threshold_curve_rows'],
+        per_label_auroc_map=per_label_auroc_map,
+        label_name_whitelist=selected_plot_label_names)
+      if selected_plot_label_names is None:
+        logger.info(f'saved per-label roc curve plots to {args.out}')
+      else:
+        logger.info(f'saved selected-label roc curve plots to {args.out}')
+    except Exception as e:
+      if selected_plot_label_names is None:
+        logger.warning(f'failed to save per-label roc curve plots: {e}')
+      else:
+        logger.warning(f'failed to save selected-label roc curve plots: {e}')
 
   if is_main_process:
     _log_label_support('train', y_train.cpu().numpy() if isinstance(y_train, torch.Tensor) else y_train)
