@@ -37,8 +37,13 @@ class Block(nn.Module):
       bias=bias)
     self.mlp_ls = LayerScale(dim, eps=layer_scale_eps) if layer_scale_eps else nn.Identity()
 
-  def forward(self, x):
-    x = x + self.attn_ls(self.attn(self.norm1(x)))
+  def forward(self, x, rope_cos=None, rope_sin=None, rope_positions=None, rope_prefix_tokens=0):
+    x = x + self.attn_ls(self.attn(
+      self.norm1(x),
+      rope_cos=rope_cos,
+      rope_sin=rope_sin,
+      rope_positions=rope_positions,
+      rope_prefix_tokens=rope_prefix_tokens))
     x = x + self.mlp_ls(self.mlp(self.norm2(x)))
     return x
 
@@ -157,10 +162,37 @@ class Attention(nn.Module):
     self.proj = nn.Linear(dim, dim, bias=bias)
     self.proj_dropout = nn.Dropout(proj_dropout) if proj_dropout else nn.Identity()
 
-  def forward(self, x):
+  @staticmethod
+  def _rotate_half(x):
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+  def _apply_rope(self, q, k, rope_cos, rope_sin, rope_positions=None):
+    if rope_positions is None:
+      cos = rope_cos[:q.size(2)].unsqueeze(0).unsqueeze(0)
+      sin = rope_sin[:q.size(2)].unsqueeze(0).unsqueeze(0)
+    else:
+      index = rope_positions.to(torch.long)
+      cos = rope_cos[index].unsqueeze(1)
+      sin = rope_sin[index].unsqueeze(1)
+    q = (q * cos) + (self._rotate_half(q) * sin)
+    k = (k * cos) + (self._rotate_half(k) * sin)
+    return q, k
+
+  def forward(self, x, rope_cos=None, rope_sin=None, rope_positions=None, rope_prefix_tokens=0):
     B, N, C = x.shape
     qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
     q, k, v = qkv[0], qkv[1], qkv[2]  # [B, num_heads, N, D]
+    if rope_cos is not None and rope_sin is not None:
+      if rope_prefix_tokens > 0:
+        q_prefix, q_main = q[:, :, :rope_prefix_tokens], q[:, :, rope_prefix_tokens:]
+        k_prefix, k_main = k[:, :, :rope_prefix_tokens], k[:, :, rope_prefix_tokens:]
+        q_main, k_main = self._apply_rope(q_main, k_main, rope_cos, rope_sin, rope_positions=rope_positions)
+        q = torch.cat([q_prefix, q_main], dim=2)
+        k = torch.cat([k_prefix, k_main], dim=2)
+      else:
+        q, k = self._apply_rope(q, k, rope_cos, rope_sin, rope_positions=rope_positions)
     if self.use_sdp_kernel:
       x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout)
     else:

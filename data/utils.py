@@ -178,7 +178,10 @@ def load_hf_dataset_with_labels(dataset_path, split='train', dtype=np.float16):
   from datasets import load_dataset
   ds = load_dataset(dataset_path, split=split)
   data = np.array(ds['data'], dtype=dtype)
-  labels = ds['label']
+  label_key = 'label' if 'label' in ds.column_names else ('hypertension' if 'hypertension' in ds.column_names else None)
+  if label_key is None:
+    raise ValueError(f'No supported label column found. available columns: {ds.column_names}')
+  labels = ds[label_key]
   return data, labels
 
 
@@ -238,13 +241,21 @@ def load_variable_data_dump(dump_file, transform=None, processes=None, chunk_siz
   data_archive = np.load(dump_file)
   original_data, original_sizes = data_archive['data'], data_archive['sizes']
   original_starts = np.concatenate([[0], np.cumsum(original_sizes[:-1])])
+
+  def slice_record(start, size):
+    # Support both legacy channels-last dumps shaped (total_time, num_channels)
+    # and newer channels-first caches shaped (num_channels, total_time).
+    if original_data.ndim >= 2 and original_data.shape[-1] == original_sizes.sum():
+      return original_data[..., start:start + size]
+    return original_data[start:start + size]
+
   if transform is None:
-    data = [original_data[start:start + size]
+    data = [slice_record(start, size)
             for start, size in zip(original_starts, original_sizes)]
   else:
     def iter_original_data():
       for start, size in zip(original_starts, original_sizes):
-        yield original_data[start:start + size]
+        yield slice_record(start, size)
     data = []
     with mp.Pool(processes=processes or mp.cpu_count()) as pool:
       for x in pool.imap(transform, iter_original_data(), chunksize=chunk_size):

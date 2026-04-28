@@ -3,6 +3,8 @@ import dataclasses
 import logging.config
 import os
 import pprint
+import queue
+import threading
 from contextlib import nullcontext
 from datetime import datetime
 from os import path, makedirs
@@ -34,6 +36,7 @@ from data.utils import (
   load_hf_variable_dataset,
 )
 from models import JEPA
+from models.LeJEPA import LeJEPA
 from utils.monitoring import (
   AverageMeter,
   get_cpu_count,
@@ -52,6 +55,8 @@ parser.add_argument('--config', default='ViTS_mimic', help='path to config file 
 parser.add_argument('--chkpt', default=None, help='resume training from model checkpoint (default: run.checkpoint in config yaml)')
 parser.add_argument('--amp', default=None, choices=['bfloat16', 'float32'], help='precision (default: run.amp in config yaml)')
 parser.add_argument('--compile', action='store_true', help='compile model (or set run.compile: true in config yaml)')
+parser.add_argument('--jepa_mode', default=None, choices=['ijepa', 'lejepa'], help='JEPA mode (default: from config)')
+parser.add_argument('--sigreg_lambda', default=None, type=float, help='SIGReg lambda for LeJEPA (default: from config)')
 args = parser.parse_args()
 
 # NOTE: we update means and standard deviations of some datasets
@@ -149,6 +154,15 @@ def main():
                    f'{pprint.pformat(yaml_dict, compact=True, sort_dicts=False, width=120)}')
     chkpt = None
 
+  # command-line overrides for LeJEPA
+  if args.jepa_mode is not None:
+    config.jepa_mode = args.jepa_mode
+  if args.sigreg_lambda is not None:
+    config.sigreg_lambda = args.sigreg_lambda
+  if is_main_process:
+    logger.debug(f'JEPA mode: {config.jepa_mode}')
+    logger.debug(f'active channels: {config.active_channels} (only_lead_one={config.only_lead_one})')
+
   for dataset_name, dataset_info in config.datasets.items():
     if dataset_name not in DATASETS:
       raise ValueError(f'Unknown dataset {dataset_name}. '
@@ -156,6 +170,10 @@ def main():
     dataset_path = dataset_info['path']
     if not path.isdir(dataset_path) and not path.isfile(dataset_path):
       raise ValueError(f'Dataset does not exist: {dataset_path}')
+
+  if config.preprocess_mode not in {'online', 'offline_cached'}:
+    raise ValueError(f'preprocess_mode must be "online" or "offline_cached", got {config.preprocess_mode}')
+  online_mode = config.preprocess_mode == 'online'
 
   datasets = {}
   for dataset_name, dataset_info in config.datasets.items():
@@ -166,9 +184,19 @@ def main():
       logger.debug(f'loading {dataset_name} from {dataset_path} (split={split})')
     dataset_cls = DATASETS[dataset_name]
     resample_ratio = config.sampling_frequency / dataset_cls.sampling_frequency
-    channel_order = datautils.get_channel_order(dataset_cls.channels, config.channels)
+    channel_order = datautils.get_channel_order(dataset_cls.channels, config.active_channels)
     mean = np.array(dataset_cls.mean, dtype=np.float16).reshape(-1, 1)
     std = np.array(dataset_cls.std, dtype=np.float16).reshape(-1, 1)
+    preprocess = ECGPreprocessor(
+      mean_std=(mean, std),
+      resample_ratio=resample_ratio,
+      channel_order=channel_order)
+    legacy_preprocess = ECGPreprocessor(
+      mean_std=(mean, std),
+      resample_ratio=resample_ratio,
+      channel_order=channel_order,
+      transpose_input=True)
+    channel_selector = SelectChannels(channel_order=channel_order)
     _, ext = path.splitext(dataset_path)
     if path.isdir(dataset_path):
       # HuggingFace dataset directory
@@ -176,61 +204,51 @@ def main():
       if is_variable:
         data, starts, sizes = load_hf_variable_dataset(
           dataset_path, split=split, min_channel_size=config.channel_size)
-        # apply preprocessing to variable-length data
-        preprocessed = []
-        preprocess = PreprocessECG(
-          mean_std=(mean, std),
-          resample_ratio=resample_ratio,
-          channel_order=channel_order)
+        processed_records = []
         for i in range(len(sizes)):
           x = data[..., starts[i]:starts[i] + sizes[i]]  # (num_channels, channel_size)
-          preprocessed.append(preprocess(x))
-        preprocessed = [x for x in preprocessed if x.shape[-1] >= config.channel_size]
-        new_sizes = np.array([x.shape[-1] for x in preprocessed])
+          processed_records.append(preprocess(x) if online_mode else x)
+        processed_records = [x for x in processed_records if x.shape[-1] >= config.channel_size]
+        new_sizes = np.array([x.shape[-1] for x in processed_records])
         new_starts = np.concatenate([np.array([0]), np.cumsum(new_sizes[:-1])])
-        new_data = np.concatenate(preprocessed, axis=-1)  # (num_channels, total_time)
+        new_data = np.concatenate(processed_records, axis=-1)  # (num_channels, total_time)
+        transform = [TransformECG(crop_size=config.channel_size)]
+        if not online_mode:
+          transform.insert(0, channel_selector)
         dataset = VariableTensorDataset(
           new_data, new_starts, new_sizes,
-          transform=TransformECG(crop_size=config.channel_size))
+          transform=transform)
       else:
         data = load_hf_dataset(dataset_path, split=split)
+        transform = [TransformECG(crop_size=config.channel_size)]
+        if online_mode:
+          transform.insert(0, preprocess)
+        else:
+          transform.insert(0, channel_selector)
         dataset = TensorDataset(
           data=data,
-          transform=[
-            PreprocessECG(
-              mean_std=(mean, std),
-              resample_ratio=resample_ratio,
-              channel_order=channel_order),
-            TransformECG(crop_size=config.channel_size),
-          ])
+          transform=transform)
     elif ext == '.npy':
+      transform = [TransformECG(crop_size=config.channel_size)]
+      if online_mode:
+        transform.insert(0, legacy_preprocess)
+      else:
+        transform.insert(0, channel_selector)
       dataset = TensorDataset(
         data=datautils.load_data_dump(dump_file=dataset_path),
-        transform=[
-          PreprocessECG(
-            mean_std=(mean, std),
-            resample_ratio=resample_ratio,
-            channel_order=channel_order,
-            transpose_input=True),  # legacy .npy is channels-last
-          TransformECG(crop_size=config.channel_size),
-        ])
+        transform=transform)
     elif ext == '.npz':
-      records = load_variable_data_dump(
+      var_data, var_starts, var_sizes = load_variable_data_dump(
         dump_file=dataset_path,
-        transform=PreprocessECG(
-          mean_std=(mean, std),
-          resample_ratio=resample_ratio,
-          channel_order=channel_order,
-          transpose_input=True),  # legacy .npz is channels-last
+        min_channel_size=config.channel_size,
+        transform=legacy_preprocess if online_mode else None,
         processes=num_cpus)
-      # filter short records and build concatenated variable-length dataset
-      records = [x for x in records if x.shape[-1] >= config.channel_size]
-      var_sizes = np.array([x.shape[-1] for x in records])
-      var_starts = np.concatenate([np.array([0]), np.cumsum(var_sizes[:-1])])
-      var_data = np.concatenate(records, axis=-1)  # (num_channels, total_time)
+      transform = [TransformECG(crop_size=config.channel_size)]
+      if not online_mode:
+        transform.insert(0, channel_selector)
       dataset = VariableTensorDataset(
         var_data, var_starts, var_sizes,
-        transform=TransformECG(crop_size=config.channel_size))
+        transform=transform)
     else:
       raise ValueError(f'Unsupported dataset format: {dataset_path}')
     datasets[dataset_name] = (dataset, weight)
@@ -243,9 +261,12 @@ def main():
 
   # With DDP, divide global batch size across all ranks
   local_batch_size = config.batch_size // world_size
-  # Cap dataloader workers so single-GPU runs on high-core-count hosts
-  # do not exhaust file descriptors while keeping good throughput.
-  num_workers = min(8, max(1, num_cpus // world_size))
+  num_workers = config.dataloader_num_workers
+  if num_workers is None:
+    # Cap auto-selected workers so single-GPU jobs do not overrun file descriptors.
+    num_workers = min(8, max(1, num_cpus // world_size))
+  if num_workers < 1:
+    raise ValueError(f'dataloader_num_workers must be >= 1, got {num_workers}')
 
   def worker_init_fn(worker_id):
     np.random.seed(rank * num_workers + worker_id)
@@ -262,19 +283,15 @@ def main():
       strategy=config.masking_strategy,
       channel_independent=config.per_channel_patching),
     num_workers=num_workers,
-    worker_init_fn=worker_init_fn,
-    persistent_workers=(num_workers > 0))
+    persistent_workers=bool(config.dataloader_persistent_workers and num_workers > 0),
+    prefetch_factor=config.dataloader_prefetch_factor if num_workers > 0 else None,
+    worker_init_fn=worker_init_fn)
 
-  def map_to_device(data_iterator, device=None):
-    for batch in data_iterator:
-      yield tuple(x.to(device, non_blocking=using_cuda) for x in batch)
-
-  def prefetch_batch(data_iterator):
-    prefetched_batch = next(data_iterator)
-    for next_batch in data_iterator:
-      yield prefetched_batch
-      prefetched_batch = next_batch
-    yield prefetched_batch
+  if is_main_process:
+    logger.debug(f'dataloader settings: num_workers={num_workers} '
+                 f'persistent_workers={bool(config.dataloader_persistent_workers and num_workers > 0)} '
+                 f'prefetch_factor={config.dataloader_prefetch_factor} '
+                 f'prefetch_queue_size={config.prefetch_queue_size}')
 
   # if device is CUDA, batch data will be asynchronously transferred to the GPU,
   #  so we should perform as many CPU operations as possible between loading and using a batch
@@ -289,13 +306,18 @@ def main():
     steps_per_epoch = None
     total_steps = config.steps
     start_step = chkpt['step'] if chkpt is not None else 0
+    start_epoch = 0
 
   # setup hyperparameter schedules
-  momentum_schedule = linear_schedule(
-    total_steps=total_steps,
-    start_value=config.encoder_momentum,
-    final_value=config.final_encoder_momentum,
-    step=start_step)
+  use_lejepa = config.jepa_mode == 'lejepa'
+
+  if not use_lejepa:
+    momentum_schedule = linear_schedule(
+      total_steps=total_steps,
+      start_value=config.encoder_momentum,
+      final_value=config.final_encoder_momentum,
+      step=start_step)
+
   lr_schedule = cosine_schedule(
     total_steps=total_steps,
     start_value=config.learning_rate,
@@ -310,11 +332,17 @@ def main():
     step=start_step)
 
   # setup model
-  original_model = JEPA(
-    config=config,
-    momentum_schedule=momentum_schedule,
-    use_sdp_kernel=using_cuda
-  ).to(device)
+  if use_lejepa:
+    original_model = LeJEPA(
+      config=config,
+      use_sdp_kernel=using_cuda
+    ).to(device)
+  else:
+    original_model = JEPA(
+      config=config,
+      momentum_schedule=momentum_schedule,
+      use_sdp_kernel=using_cuda
+    ).to(device)
   optimizer = original_model.get_optimizer(fused=using_cuda)
 
   if chkpt is not None:  # resume training from checkpoint
@@ -330,7 +358,6 @@ def main():
   if args.compile:
     model = torch.compile(model)
 
-  step_time = AverageMeter()
   train_loss = AverageMeter()
   train_start_time = time()
   last_loss = None
@@ -339,12 +366,11 @@ def main():
               unit='step', disable=not is_main_process)
 
   def _train_step(train_iterator):
-    step_start = time()
     update_learning_rate_(optimizer, next(lr_schedule))
     update_weight_decay_(optimizer, next(wd_schedule))
     batch_loss = 0.
     for i in range(config.gradient_accumulation_steps):
-      x, mask_encoder, mask_predictor = next(train_iterator)
+      x, mask_encoder, mask_predictor = train_iterator.next_batch()
       sync_ctx = (nullcontext() if not is_distributed or i == config.gradient_accumulation_steps - 1
                   else model.no_sync())
       with sync_ctx, auto_mixed_precision:
@@ -357,70 +383,75 @@ def main():
     optimizer.step()
     train_loss.update(batch_loss)
     optimizer.zero_grad(set_to_none=True)
-    step_time.update(time() - step_start)
+
+  def log_training_stats(global_step, total_dataset_size):
+    current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
+    current_lr = optimizer.param_groups[0]['lr']
+    pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
+    pbar.update(1)
+    return current_lr
+
+  train_prefetcher = AsyncBatchPrefetcher(
+    loader=train_loader,
+    device=device,
+    using_cuda=using_cuda,
+    queue_size=config.prefetch_queue_size)
+  train_prefetcher.reset()
 
   global_step = start_step
-  if config.epochs > 0:
-    for epoch in range(start_epoch, config.epochs):
-      train_iterator = iter(train_loader)
-      train_iterator = map_to_device(train_iterator, device=device)
-      train_iterator = prefetch_batch(train_iterator)
-      for _ in range(steps_per_epoch):
-        _train_step(train_iterator)
-        global_step += 1
-        if is_main_process:
-          current_epoch = global_step * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
-          current_lr = optimizer.param_groups[0]['lr']
-          last_loss = train_loss.value
-          last_lr = current_lr
-          logger.info(f'step: {global_step} '
-                      f'epoch: {current_epoch:.4f} '
-                      f'train_loss: {train_loss.value:.4f} '
-                      f'lr: {current_lr:.6e} '
-                      f'step_time: {step_time.value:.4f}')
-          pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
-          pbar.update(1)
-          step_time = AverageMeter()
-          train_loss = AverageMeter()
-        if is_main_process and global_step % config.checkpoint_interval == 0:
-          new_chkpt_path = path.join(args.out, f'chkpt_{global_step}.pt')
-          torch.save({
-            'model': original_model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'config': dataclasses.asdict(config),
-            'epoch': epoch + 1,
-            'step': global_step,
-          }, new_chkpt_path)
-  else:
-    train_iterator = iter(train_loader)
-    train_iterator = map_to_device(train_iterator, device=device)
-    train_iterator = prefetch_batch(train_iterator)
-    for step in range(start_step, config.steps):
-      _train_step(train_iterator)
-      if is_main_process:
-        current_epoch = (step + 1) * config.batch_size * config.gradient_accumulation_steps / total_dataset_size
-        current_lr = optimizer.param_groups[0]['lr']
-        last_loss = train_loss.value
-        last_lr = current_lr
-        logger.info(f'step: {step + 1} '
-                    f'epoch: {current_epoch:.4f} '
-                    f'train_loss: {train_loss.value:.4f} '
-                    f'lr: {current_lr:.6e} '
-                    f'step_time: {step_time.value:.4f}')
-        pbar.set_postfix(loss=f'{train_loss.value:.4f}', lr=f'{current_lr:.2e}', epoch=f'{current_epoch:.2f}')
-        pbar.update(1)
-        step_time = AverageMeter()
-        train_loss = AverageMeter()
-      if is_main_process and (step + 1) % config.checkpoint_interval == 0:
-        new_chkpt_path = path.join(args.out, f'chkpt_{step + 1}.pt')
-        torch.save({
-          'model': original_model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'config': dataclasses.asdict(config),
-          'step': step + 1,
-        }, new_chkpt_path)
+  last_completed_epoch = start_epoch
 
-  pbar.close()
+  def _save_checkpoint(step, epoch=None):
+    chkpt = {
+      'model': original_model.state_dict(),
+      'optimizer': optimizer.state_dict(),
+      'config': dataclasses.asdict(config),
+      'step': step,
+    }
+    if epoch is not None:
+      chkpt['epoch'] = epoch
+    new_chkpt_path = path.join(args.out, f'chkpt_{step}.pt')
+    torch.save(chkpt, new_chkpt_path)
+    latest_chkpt_path = path.join(args.out, 'last_chkpt.pt')
+    torch.save(chkpt, latest_chkpt_path)
+
+  try:
+    if config.epochs > 0:
+      for epoch in range(start_epoch, config.epochs):
+        last_completed_epoch = epoch + 1
+        for _ in range(steps_per_epoch):
+          _train_step(train_prefetcher)
+          global_step += 1
+          if is_main_process:
+            last_loss = train_loss.value
+            last_lr = log_training_stats(
+              global_step=global_step,
+              total_dataset_size=total_dataset_size)
+            train_loss = AverageMeter()
+            train_prefetcher.reset_metrics()
+          if is_main_process and global_step % config.checkpoint_interval == 0:
+            _save_checkpoint(step=global_step, epoch=epoch + 1)
+    else:
+      for step in range(start_step, config.steps):
+        _train_step(train_prefetcher)
+        global_step = step + 1
+        if is_main_process:
+          last_loss = train_loss.value
+          last_lr = log_training_stats(
+            global_step=step + 1,
+            total_dataset_size=total_dataset_size)
+          train_loss = AverageMeter()
+          train_prefetcher.reset_metrics()
+        if is_main_process and (step + 1) % config.checkpoint_interval == 0:
+          _save_checkpoint(step=step + 1)
+
+    if is_main_process and global_step > start_step and global_step % config.checkpoint_interval != 0:
+      final_epoch = last_completed_epoch if config.epochs > 0 else None
+      _save_checkpoint(step=global_step, epoch=final_epoch)
+  finally:
+    train_prefetcher.close()
+    pbar.close()
+
   if is_main_process:
     total_time = time() - train_start_time
     h, rem = divmod(int(total_time), 3600)
@@ -441,14 +472,110 @@ def main():
 
 def load_variable_data_dump(dump_file, min_channel_size, transform=None, processes=None):
   data = datautils.load_variable_data_dump(dump_file, transform=transform, processes=processes)
-  data = [x for x in data if len(x) >= min_channel_size]
-  sizes = np.array([len(x) for x in data])
+  normalized_data = []
+  for x in data:
+    # Legacy variable-length dumps are channels-last: (channel_size, num_channels).
+    if x.ndim == 2 and x.shape[-1] < min_channel_size <= x.shape[0]:
+      x = x.T
+    normalized_data.append(x)
+  data = normalized_data
+  data = [x for x in data if x.shape[-1] >= min_channel_size]
+  sizes = np.array([x.shape[-1] for x in data])
   starts = np.concatenate([np.array([0]), np.cumsum(sizes[:-1])])
-  data = np.concatenate(data)
+  data = np.concatenate(data, axis=-1)
   return data, starts, sizes
 
+class AsyncBatchPrefetcher:
+  _SENTINEL = object()
 
-class PreprocessECG:  # called per sample in dataloader workers
+  def __init__(self, loader, device, using_cuda, queue_size=16):
+    if queue_size < 1:
+      raise ValueError(f'prefetch_queue_size must be >= 1, got {queue_size}')
+    self.loader = loader
+    self.device = device
+    self.using_cuda = using_cuda
+    self.queue_size = queue_size
+    self.stream = torch.cuda.Stream(device=device) if using_cuda else None
+    self.queue = None
+    self.thread = None
+    self.stop_event = threading.Event()
+    self.exception = None
+    self.next_device_batch = None
+    self.queue_empty_count = 0
+    self.queue_wait_time = 0.
+    self.step_times = []
+
+  def reset_metrics(self):
+    self.queue_empty_count = 0
+    self.queue_wait_time = 0.
+    self.step_times = []
+
+  def reset(self):
+    self.close()
+    self.queue = queue.Queue(maxsize=self.queue_size)
+    self.stop_event.clear()
+    self.exception = None
+    self.next_device_batch = None
+    self.thread = threading.Thread(target=self._producer_loop, daemon=True)
+    self.thread.start()
+    self._preload_next()
+
+  def _producer_loop(self):
+    try:
+      for batch in self.loader:
+        if self.stop_event.is_set():
+          break
+        if not self._put_queue_item(batch):
+          return
+      self._put_queue_item(self._SENTINEL)
+    except Exception as exc:
+      self.exception = exc
+      self._put_queue_item(self._SENTINEL)
+
+  def _put_queue_item(self, item):
+    while True:
+      try:
+        self.queue.put(item, timeout=0.1)
+        return True
+      except queue.Full:
+        if self.stop_event.is_set():
+          return False
+
+  def _preload_next(self):
+    wait_start = time()
+    if self.queue.empty():
+      self.queue_empty_count += 1
+    item = self.queue.get()
+    self.queue_wait_time += time() - wait_start
+    if item is self._SENTINEL:
+      self.next_device_batch = None
+    else:
+      if self.using_cuda:
+        with torch.cuda.stream(self.stream):
+          item = tuple(x.to(self.device, non_blocking=True) for x in item)
+      self.next_device_batch = item
+
+  def next_batch(self):
+    if self.exception is not None:
+      raise self.exception
+    if self.next_device_batch is None:
+      raise StopIteration('Prefetcher reached end of loader')
+    if self.using_cuda:
+      torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+    batch = self.next_device_batch
+    step_start = time()
+    self._preload_next()
+    self.step_times.append(time() - step_start)
+    return batch
+
+  def close(self):
+    self.stop_event.set()
+    if self.thread is not None and self.thread.is_alive():
+      self.thread.join(timeout=1.0)
+    self.thread = None
+
+
+class ECGPreprocessor:  # called per sample in dataloader workers
   def __init__(self, *, mean_std, resample_ratio, channel_order, transpose_input=False):
     self.mean, self.std = mean_std
     self.resample_ratio = resample_ratio
@@ -478,6 +605,14 @@ class TransformECG:  # called whenever dataloader accesses the data
     x = transforms.random_crop(x, self.crop_size)
     x = torch.from_numpy(x).float()
     return x
+
+
+class SelectChannels:
+  def __init__(self, channel_order):
+    self.channel_order = channel_order
+
+  def __call__(self, x):  # x: (num_channels, channel_size)
+    return x[self.channel_order]
 
 
 if __name__ == '__main__':

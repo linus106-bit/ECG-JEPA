@@ -1,31 +1,30 @@
-# ViT-Small for Capture-24 accelerometer HAR pretraining (per-channel patching)
-# learnable encoder parameters: ~14M (same architecture as ViTS_ptbxl)
+# learnable encoder parameters: 85,185,024
+# run (execution settings — previously in the shell script)
 run:
-  out_dir: results/pretrain/ViTS_capture24_per_channel
+  out_dir: results/pretrain/ViTB_mimic
   amp: bfloat16
   compile: false
-  checkpoint: null
+  checkpoint: null  # set to a checkpoint path to resume training
 # data
-sampling_frequency: 100
-channels: [x, y, z]
-channel_size: 1000
-patch_size: 20
-per_channel_patching: true
-min_block_size: 5
+sampling_frequency: 500
+channels: [I, II, III, AVR, AVL, AVF, V1, V2, V3, V4, V5, V6]
+channel_size: 5000
+patch_size: 25
+min_block_size: 10
 min_keep_ratio: 0.15
 max_keep_ratio: 0.25
 datasets:
-  capture-24:
-    path: /path/to/capture-24  # HF dataset directory (or .npy file for legacy)
+  mimic-iv-ecg:
+    path: /path/to/mimic-iv-ecg
     split: train
     weight: 1.
 # model architecture
-dim: 384
-depth: 8
-num_heads: 6
-pred_dim: 192
-pred_depth: 8
-pred_num_heads: 6
+dim: 768
+depth: 12
+num_heads: 12
+pred_dim: 384
+pred_depth: 12
+pred_num_heads: 12
 mlp_ratio: 4.
 qkv_bias: False
 dropout: 0.
@@ -35,7 +34,7 @@ bias: False
 norm_eps: 1.0e-6
 layer_scale_eps: 0.
 # training
-epochs: 300
+epochs: 200
 batch_size: 2048
 encoder_momentum: 0.998
 final_encoder_momentum: 0.9995
@@ -49,4 +48,3 @@ opt_eps: 1.0e-6
 gradient_clip: 0
 gradient_accumulation_steps: 1
 checkpoint_interval: 1000
-target_norm: layer_norm
