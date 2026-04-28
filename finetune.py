@@ -938,9 +938,9 @@ def main():
             'step': global_step,
           }, new_chkpt_path)
       val_predictions, val_targets, val_metric, val_acc, val_auroc, val_metric_stats = _eval_val()
-      new_best = val_metric > best_val_metric
+      new_best = val_auroc > best_val_metric
       if new_best:
-        best_val_metric = val_metric
+        best_val_metric = val_auroc
         best_val_predictions = val_predictions
         saved_val_targets = val_targets
         best_val_metric_stats = val_metric_stats
@@ -994,9 +994,9 @@ def main():
             'step': step + 1,
           }, new_chkpt_path)
         val_predictions, val_targets, val_metric, val_acc, val_auroc, val_metric_stats = _eval_val()
-        new_best = val_metric > best_val_metric
+        new_best = val_auroc > best_val_metric
         if new_best:
-          best_val_metric = val_metric
+          best_val_metric = val_auroc
           best_val_predictions = val_predictions
           saved_val_targets = val_targets
           best_val_metric_stats = val_metric_stats
@@ -1060,6 +1060,7 @@ def main():
         'dataset_type': args.dataset_type,
         'single_label': bool(single_label),
         'best_val_metric': float(best_val_metric),
+        'best_val_auroc': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
         'test_f1': float(test_f1),
         'test_acc': float(test_acc),
@@ -1103,6 +1104,7 @@ def main():
         'dataset_type': args.dataset_type,
         'single_label': bool(single_label),
         'best_val_metric': float(best_val_metric),
+        'best_val_auroc': float(best_val_metric),
         'best_epoch_or_step': int(best_epoch_or_step),
         'test_f1': float(test_f1),
         'test_acc': float(test_acc),
@@ -1172,7 +1174,7 @@ def main():
       f'  Total steps   : {global_step}',
       f'  Total time    : {h:02d}h {m:02d}m {s:02d}s ({total_time:.1f}s)',
       f'  Best val step/epoch: {best_epoch_or_step}',
-      f'  Best val metric : {best_val_metric:.4f}',
+      f'  Best val AUROC : {best_val_metric:.4f}',
     ]
     if single_label:
       lines.append(f'  Test F1       : {test_f1:.4f}  Test Acc: {test_acc:.4f}  Test AUROC: {test_auroc:.4f}')
