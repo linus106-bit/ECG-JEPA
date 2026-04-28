@@ -499,9 +499,10 @@ def main():
       thresholds = np.array([float(r['threshold']) for r in rows_sorted], dtype=np.float64)
       sens = np.array([float(r['sensitivity']) for r in rows_sorted], dtype=np.float64)
       spec = np.array([float(r['specificity']) for r in rows_sorted], dtype=np.float64)
+      youden_j = np.array([float(r['youden_j']) for r in rows_sorted], dtype=np.float64)
       if len(thresholds) == 0:
         continue
-      sweet_idx = int(np.argmax(sens + spec))
+      sweet_idx = int(np.argmax(youden_j))
       sweet_threshold = float(thresholds[sweet_idx])
       sweet_sens = float(sens[sweet_idx])
       sweet_spec = float(spec[sweet_idx])
