@@ -1134,7 +1134,7 @@ def main():
         'encoder_path': args.encoder,
       }
 
-      selected_plot_label_names = ['AFIB', '1AVB', '2AVB', 'STVAC', 'PAC', 'PVC']
+      selected_plot_label_names = ['AFIB', '1AVB', '2AVB', 'SVTAC', 'PAC', 'PVC']
       _save_per_label_eval_artifacts(
         task_name=task_name,
         test_metric_stats=test_metric_stats,
