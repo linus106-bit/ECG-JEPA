@@ -479,6 +479,226 @@ def main():
       preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in no_negative[:10])
       logger.warning(f'[{split_name}] labels with no negative samples (first 10): {preview}')
 
+  def _save_threshold_plots(threshold_curve_rows, label_name_whitelist=None):
+    import matplotlib.pyplot as plt
+
+    label_name_whitelist_upper = None
+    if label_name_whitelist:
+      label_name_whitelist_upper = {name.upper() for name in label_name_whitelist}
+
+    threshold_rows_by_class = {}
+    for row in threshold_curve_rows:
+      cls = int(row['class_index'])
+      label_name = _label_name_from_idx(cls)
+      if label_name_whitelist_upper is not None and str(label_name).upper() not in label_name_whitelist_upper:
+        continue
+      threshold_rows_by_class.setdefault(cls, []).append(row)
+
+    for cls, rows in threshold_rows_by_class.items():
+      rows_sorted = sorted(rows, key=lambda r: float(r['threshold']))
+      thresholds = np.array([float(r['threshold']) for r in rows_sorted], dtype=np.float64)
+      sens = np.array([float(r['sensitivity']) for r in rows_sorted], dtype=np.float64)
+      spec = np.array([float(r['specificity']) for r in rows_sorted], dtype=np.float64)
+      youden_j = np.array([float(r['youden_j']) for r in rows_sorted], dtype=np.float64)
+      if len(thresholds) == 0:
+        continue
+      sweet_idx = int(np.argmax(youden_j))
+      sweet_threshold = float(thresholds[sweet_idx])
+      sweet_sens = float(sens[sweet_idx])
+      sweet_spec = float(spec[sweet_idx])
+
+      label_name = _label_name_from_idx(cls)
+      safe_label_name = str(label_name).replace('/', '_').replace(' ', '_')
+      threshold_plot_path = path.join(args.out, f'{task_name}_label{cls}_{safe_label_name}_sens_spec_curve.png')
+
+      fig, ax = plt.subplots(figsize=(6, 4))
+      ax.plot(thresholds, sens, label='sensitivity', color='tab:blue')
+      ax.plot(thresholds, spec, label='specificity', color='tab:orange')
+      ax.scatter([sweet_threshold], [sweet_sens], color='tab:blue', s=24, zorder=3)
+      ax.scatter([sweet_threshold], [sweet_spec], color='tab:orange', s=24, zorder=3)
+      ax.axvline(sweet_threshold, color='tab:green', linestyle='--', linewidth=1.2,
+                 label=f'sweet spot (max sens+spec) th={sweet_threshold:.4f}')
+      ax.set_ylim(0.0, 1.0)
+      ax.set_xlabel('Threshold')
+      ax.set_ylabel('Score')
+      ax.set_title(f'Label {cls} ({label_name}) Sens/Spec vs Threshold')
+      ax.legend(loc='best')
+      fig.tight_layout()
+      fig.savefig(threshold_plot_path, dpi=150)
+      plt.close(fig)
+
+  def _save_roc_curve_plots(threshold_curve_rows, per_label_auroc_map, label_name_whitelist=None):
+    import matplotlib.pyplot as plt
+
+    label_name_whitelist_upper = None
+    if label_name_whitelist:
+      label_name_whitelist_upper = {name.upper() for name in label_name_whitelist}
+
+    threshold_rows_by_class = {}
+    for row in threshold_curve_rows:
+      cls = int(row['class_index'])
+      label_name = _label_name_from_idx(cls)
+      if label_name_whitelist_upper is not None and str(label_name).upper() not in label_name_whitelist_upper:
+        continue
+      threshold_rows_by_class.setdefault(cls, []).append(row)
+
+    for cls, rows in threshold_rows_by_class.items():
+      rows_sorted = sorted(rows, key=lambda r: float(r['threshold']), reverse=True)
+      fpr = np.array([1.0 - float(r['specificity']) for r in rows_sorted], dtype=np.float64)
+      tpr = np.array([float(r['sensitivity']) for r in rows_sorted], dtype=np.float64)
+      if len(fpr) == 0:
+        continue
+
+      label_name = _label_name_from_idx(cls)
+      safe_label_name = str(label_name).replace('/', '_').replace(' ', '_')
+      roc_plot_path = path.join(args.out, f'{task_name}_label{cls}_{safe_label_name}_roc_curve.png')
+      auroc = per_label_auroc_map.get(cls, float('nan'))
+      auc_text = 'nan' if np.isnan(auroc) else f'{auroc:.4f}'
+
+      fig, ax = plt.subplots(figsize=(6, 4))
+      ax.plot(fpr, tpr, color='tab:blue', label=f'ROC (AUROC={auc_text})')
+      ax.plot([0, 1], [0, 1], linestyle='--', color='tab:gray', linewidth=1.0, label='random')
+      ax.set_xlim(0.0, 1.0)
+      ax.set_ylim(0.0, 1.0)
+      ax.set_xlabel('False Positive Rate')
+      ax.set_ylabel('True Positive Rate')
+      ax.set_title(f'Label {cls} ({label_name}) ROC Curve')
+      ax.legend(loc='lower right')
+      fig.tight_layout()
+      fig.savefig(roc_plot_path, dpi=150)
+      plt.close(fig)
+
+  def _save_selected_label_csvs(task_name, per_label_metrics, threshold_curve_rows, target_label_names):
+    target_lookup = {name.upper() for name in target_label_names}
+    selected_label_ids = []
+    for row in per_label_metrics:
+      label_id = int(row['class_index'])
+      if _label_name_from_idx(label_id).upper() in target_lookup:
+        selected_label_ids.append(label_id)
+
+    if not selected_label_ids:
+      logger.warning(f'no labels matched target list for selected label csv export: {target_label_names}')
+      return
+
+    selected_label_ids_set = set(selected_label_ids)
+    selected_threshold_csv_path = path.join(args.out, f'{task_name}_test_selected_labels_threshold_sens_spec.csv')
+    with open(selected_threshold_csv_path, 'w', newline='', encoding='utf-8') as f:
+      writer = csv.DictWriter(f, fieldnames=['class_index', 'label_name', 'threshold', 'sensitivity', 'specificity', 'youden_j'])
+      writer.writeheader()
+      for row in threshold_curve_rows:
+        cls = int(row['class_index'])
+        if cls not in selected_label_ids_set:
+          continue
+        writer.writerow({
+          'class_index': cls,
+          'label_name': _label_name_from_idx(cls),
+          'threshold': row['threshold'],
+          'sensitivity': row['sensitivity'],
+          'specificity': row['specificity'],
+          'youden_j': row['youden_j'],
+        })
+    logger.info(f'saved selected-label threshold sensitivity/specificity csv to {selected_threshold_csv_path}')
+
+    selected_metrics_csv_path = path.join(args.out, f'{task_name}_test_selected_labels_per_label_metrics.csv')
+    with open(selected_metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
+      writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
+      writer.writeheader()
+      for row in per_label_metrics:
+        label_id = int(row['class_index'])
+        if label_id not in selected_label_ids_set:
+          continue
+        writer.writerow({
+          'label_id': label_id,
+          'label_name': _label_name_from_idx(label_id),
+          'auroc': row['auroc'],
+          'f1': row['f1'],
+          'accuracy': row['accuracy'],
+          'sensitivity': row['sensitivity'],
+          'specificity': row['specificity'],
+        })
+    logger.info(f'saved selected-label metrics csv to {selected_metrics_csv_path}')
+
+  def _save_per_label_eval_artifacts(task_name, test_metric_stats, selected_plot_label_names=None):
+    threshold_csv_path = path.join(args.out, f'{task_name}_test_threshold_sens_spec.csv')
+    with open(threshold_csv_path, 'w', newline='', encoding='utf-8') as f:
+      writer = csv.DictWriter(f, fieldnames=['class_index', 'threshold', 'sensitivity', 'specificity', 'youden_j'])
+      writer.writeheader()
+      writer.writerows(test_metric_stats['threshold_curve_rows'])
+    logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
+
+    per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
+    per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
+    nan_f1_labels = [int(row['class_index']) for row in per_label_metrics if np.isnan(row['f1'])]
+    if nan_f1_labels:
+      preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in nan_f1_labels[:10])
+      logger.warning(f'per-label F1 is NaN for {len(nan_f1_labels)} labels (first 10): {preview}')
+
+    auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
+    with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
+      writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
+      writer.writeheader()
+      for row in per_label_metrics:
+        label_id = int(row['class_index'])
+        writer.writerow({
+          'label_id': label_id,
+          'label_name': _label_name_from_idx(label_id),
+          'auroc': row['auroc'],
+        })
+    logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
+
+    metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
+    with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
+      writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
+      writer.writeheader()
+      for row in per_label_metrics:
+        label_id = int(row['class_index'])
+        writer.writerow({
+          'label_id': label_id,
+          'label_name': _label_name_from_idx(label_id),
+          'auroc': row['auroc'],
+          'f1': row['f1'],
+          'accuracy': row['accuracy'],
+          'sensitivity': row['sensitivity'],
+          'specificity': row['specificity'],
+        })
+    logger.info(f'saved per-label metrics csv to {metrics_csv_path}')
+
+    if selected_plot_label_names is not None:
+      _save_selected_label_csvs(
+        task_name=task_name,
+        per_label_metrics=per_label_metrics,
+        threshold_curve_rows=test_metric_stats['threshold_curve_rows'],
+        target_label_names=selected_plot_label_names)
+
+    try:
+      _save_threshold_plots(
+        threshold_curve_rows=test_metric_stats['threshold_curve_rows'],
+        label_name_whitelist=selected_plot_label_names)
+      if selected_plot_label_names is None:
+        logger.info(f'saved per-label sensitivity/specificity threshold plots to {args.out}')
+      else:
+        logger.info(f'saved selected-label sensitivity/specificity threshold plots to {args.out}')
+    except Exception as e:
+      if selected_plot_label_names is None:
+        logger.warning(f'failed to save sensitivity/specificity threshold plots: {e}')
+      else:
+        logger.warning(f'failed to save selected-label sensitivity/specificity threshold plots: {e}')
+
+    try:
+      _save_roc_curve_plots(
+        threshold_curve_rows=test_metric_stats['threshold_curve_rows'],
+        per_label_auroc_map=per_label_auroc_map,
+        label_name_whitelist=selected_plot_label_names)
+      if selected_plot_label_names is None:
+        logger.info(f'saved per-label roc curve plots to {args.out}')
+      else:
+        logger.info(f'saved selected-label roc curve plots to {args.out}')
+    except Exception as e:
+      if selected_plot_label_names is None:
+        logger.warning(f'failed to save per-label roc curve plots: {e}')
+      else:
+        logger.warning(f'failed to save selected-label roc curve plots: {e}')
+
   if is_main_process:
     _log_label_support('train', y_train.cpu().numpy() if isinstance(y_train, torch.Tensor) else y_train)
     _log_label_support('val', y_val.cpu().numpy() if isinstance(y_val, torch.Tensor) else y_val)
@@ -868,93 +1088,7 @@ def main():
         'encoder_path': args.encoder,
       }
 
-      threshold_csv_path = path.join(args.out, f'{task_name}_test_threshold_sens_spec.csv')
-      with open(threshold_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['class_index', 'threshold', 'sensitivity', 'specificity', 'youden_j'])
-        writer.writeheader()
-        writer.writerows(test_metric_stats['threshold_curve_rows'])
-      logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
-
-      per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
-      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
-      nan_f1_labels = [int(row['class_index']) for row in per_label_metrics if np.isnan(row['f1'])]
-      if nan_f1_labels:
-        preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in nan_f1_labels[:10])
-        logger.warning(f'per-label F1 is NaN for {len(nan_f1_labels)} labels (first 10): {preview}')
-      auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
-      with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
-        writer.writeheader()
-        for row in per_label_metrics:
-          label_id = int(row['class_index'])
-          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
-          writer.writerow({
-            'label_id': label_id,
-            'label_name': label_name,
-            'auroc': row['auroc'],
-          })
-      logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
-
-      metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
-      with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
-        writer.writeheader()
-        for row in per_label_metrics:
-          label_id = int(row['class_index'])
-          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
-          writer.writerow({
-            'label_id': label_id,
-            'label_name': label_name,
-            'auroc': row['auroc'],
-            'f1': row['f1'],
-            'accuracy': row['accuracy'],
-            'sensitivity': row['sensitivity'],
-            'specificity': row['specificity'],
-          })
-      logger.info(f'saved per-label metrics csv to {metrics_csv_path}')
-
-      try:
-        import matplotlib.pyplot as plt
-
-        threshold_rows_by_class = {}
-        for row in test_metric_stats['threshold_curve_rows']:
-          cls = int(row['class_index'])
-          threshold_rows_by_class.setdefault(cls, []).append(row)
-
-        for cls, rows in threshold_rows_by_class.items():
-          rows_sorted = sorted(rows, key=lambda r: float(r['threshold']))
-          thresholds = np.array([float(r['threshold']) for r in rows_sorted], dtype=np.float64)
-          sens = np.array([float(r['sensitivity']) for r in rows_sorted], dtype=np.float64)
-          spec = np.array([float(r['specificity']) for r in rows_sorted], dtype=np.float64)
-          if len(thresholds) == 0:
-            continue
-          sweet_idx = int(np.argmax(sens + spec))
-          sweet_threshold = float(thresholds[sweet_idx])
-          sweet_sens = float(sens[sweet_idx])
-          sweet_spec = float(spec[sweet_idx])
-
-          label_name = class_label_names[cls] if class_label_names is not None and cls < len(class_label_names) else str(cls)
-          safe_label_name = str(label_name).replace('/', '_').replace(' ', '_')
-          threshold_plot_path = path.join(args.out, f'{task_name}_label{cls}_{safe_label_name}_sens_spec_curve.png')
-
-          fig, ax = plt.subplots(figsize=(6, 4))
-          ax.plot(thresholds, sens, label='sensitivity', color='tab:blue')
-          ax.plot(thresholds, spec, label='specificity', color='tab:orange')
-          ax.scatter([sweet_threshold], [sweet_sens], color='tab:blue', s=24, zorder=3)
-          ax.scatter([sweet_threshold], [sweet_spec], color='tab:orange', s=24, zorder=3)
-          ax.axvline(sweet_threshold, color='tab:green', linestyle='--', linewidth=1.2,
-                     label=f'sweet spot (max sens+spec) th={sweet_threshold:.4f}')
-          ax.set_ylim(0.0, 1.0)
-          ax.set_xlabel('Threshold')
-          ax.set_ylabel('Score')
-          ax.set_title(f'Label {cls} ({label_name}) Sens/Spec vs Threshold')
-          ax.legend(loc='best')
-          fig.tight_layout()
-          fig.savefig(threshold_plot_path, dpi=150)
-          plt.close(fig)
-        logger.info(f'saved per-label sensitivity/specificity threshold plots to {args.out}')
-      except Exception as e:
-        logger.warning(f'failed to save sensitivity/specificity threshold plots: {e}')
+      _save_per_label_eval_artifacts(task_name=task_name, test_metric_stats=test_metric_stats)
     else:
       test_logits = torch.cat(test_logits_or_preds)
       test_predictions, test_probabilities, test_f1, test_acc, test_auroc, test_metric_stats = _compute_multi_label_metrics(
@@ -998,50 +1132,11 @@ def main():
         'encoder_path': args.encoder,
       }
 
-      threshold_csv_path = path.join(args.out, f'{task_name}_test_threshold_sens_spec.csv')
-      with open(threshold_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['class_index', 'threshold', 'sensitivity', 'specificity', 'youden_j'])
-        writer.writeheader()
-        writer.writerows(test_metric_stats['threshold_curve_rows'])
-      logger.info(f'saved threshold sensitivity/specificity csv to {threshold_csv_path}')
-
-      per_label_auroc_map = _extract_per_label_auroc_map(test_metric_stats['threshold_rows'])
-      per_label_metrics = _compute_per_label_metrics_from_confusion(test_metric_stats, per_label_auroc_map)
-      nan_f1_labels = [int(row['class_index']) for row in per_label_metrics if np.isnan(row['f1'])]
-      if nan_f1_labels:
-        preview = ', '.join(f'{idx}:{_label_name_from_idx(idx)}' for idx in nan_f1_labels[:10])
-        logger.warning(f'per-label F1 is NaN for {len(nan_f1_labels)} labels (first 10): {preview}')
-      auroc_csv_path = path.join(args.out, f'{task_name}_test_per_label_auroc.csv')
-      with open(auroc_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc'])
-        writer.writeheader()
-        for row in per_label_metrics:
-          label_id = int(row['class_index'])
-          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
-          writer.writerow({
-            'label_id': label_id,
-            'label_name': label_name,
-            'auroc': row['auroc'],
-          })
-      logger.info(f'saved per-label auroc csv to {auroc_csv_path}')
-
-      metrics_csv_path = path.join(args.out, f'{task_name}_test_per_label_metrics.csv')
-      with open(metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
-        writer.writeheader()
-        for row in per_label_metrics:
-          label_id = int(row['class_index'])
-          label_name = class_label_names[label_id] if class_label_names is not None and label_id < len(class_label_names) else str(label_id)
-          writer.writerow({
-            'label_id': label_id,
-            'label_name': label_name,
-            'auroc': row['auroc'],
-            'f1': row['f1'],
-            'accuracy': row['accuracy'],
-            'sensitivity': row['sensitivity'],
-            'specificity': row['specificity'],
-          })
-      logger.info(f'saved per-label metrics csv to {metrics_csv_path}')
+      selected_plot_label_names = ['AFIB', '1AVB', '2AVB', 'STVAC', 'PAC', 'PVC']
+      _save_per_label_eval_artifacts(
+        task_name=task_name,
+        test_metric_stats=test_metric_stats,
+        selected_plot_label_names=selected_plot_label_names)
 
     json_result_path = path.join(args.out, f'{task_name}_eval_results.json')
     with open(json_result_path, 'w', encoding='utf-8') as f:
