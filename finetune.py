@@ -165,6 +165,8 @@ def main():
   if not args.encoder:
     raise ValueError('encoder must be specified via --encoder or run.encoder in the eval config yaml')
 
+  run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+
   # Setup distributed training
   local_rank = int(os.environ.get('LOCAL_RANK', 0))
   rank = int(os.environ.get('RANK', 0))
@@ -179,8 +181,7 @@ def main():
   if is_main_process:
     makedirs(args.out, exist_ok=True)
     logging.config.fileConfig('logging.ini')
-    _timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    _log_file_path = path.join(args.out, f'train_{_timestamp}.log')
+    _log_file_path = path.join(args.out, f'train_{run_timestamp}.log')
     _file_handler = logging.FileHandler(_log_file_path)
     _file_handler.setLevel(logging.DEBUG)
     _file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(module)s:%(lineno)s => %(message)s'))
@@ -1140,7 +1141,7 @@ def main():
         test_metric_stats=test_metric_stats,
         selected_plot_label_names=selected_plot_label_names)
 
-    json_result_path = path.join(args.out, f'{task_name}_eval_results.json')
+    json_result_path = path.join(args.out, f'{task_name}_eval_results_{run_timestamp}.json')
     with open(json_result_path, 'w', encoding='utf-8') as f:
       json.dump(eval_results, f, indent=2, ensure_ascii=False)
     logger.info(f'saved eval results json to {json_result_path}')
