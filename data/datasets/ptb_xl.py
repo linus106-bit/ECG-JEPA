@@ -16,9 +16,16 @@ class PTB_XL:
   # shape: (21799, 5000, 12)
 
   @staticmethod
-  def find_records(data_dir):
+  def find_records(data_dir, sampling_frequency=500):
+    """Return PTB-XL WFDB record paths for either 500 Hz or 100 Hz signals."""
     record_list = pd.read_csv(path.join(data_dir, 'ptbxl_database.csv'), index_col='ecg_id')
-    record_names = [path.join(data_dir, filename) for filename in record_list.filename_hr.values]
+    if sampling_frequency == 500:
+      filename_column = 'filename_hr'
+    elif sampling_frequency == 100:
+      filename_column = 'filename_lr'
+    else:
+      raise ValueError('PTB-XL sampling_frequency must be either 500 or 100')
+    record_names = [path.join(data_dir, filename) for filename in record_list[filename_column].values]
     return record_names
 
   # utilities copy-pasted from https://github.com/helme/ecg_ptbxl_benchmarking (516740d)
