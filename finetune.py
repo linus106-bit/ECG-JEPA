@@ -519,6 +519,15 @@ def main():
       ax.scatter([sweet_threshold], [sweet_spec], color='tab:orange', s=24, zorder=3)
       ax.axvline(sweet_threshold, color='tab:green', linestyle='--', linewidth=1.2,
                  label=f'sweet spot (max sens+spec) th={sweet_threshold:.4f}')
+      ax.text(
+        sweet_threshold,
+        min(0.98, max(sweet_sens, sweet_spec) + 0.05),
+        f'sens={sweet_sens:.4f}\nspec={sweet_spec:.4f}',
+        fontsize=8,
+        ha='center',
+        va='bottom',
+        bbox={'boxstyle': 'round,pad=0.2', 'facecolor': 'white', 'alpha': 0.85, 'edgecolor': 'tab:green'},
+      )
       ax.set_ylim(0.0, 1.0)
       ax.set_xlabel('Threshold')
       ax.set_ylabel('Score')
