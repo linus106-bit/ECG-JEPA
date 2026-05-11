@@ -165,7 +165,7 @@ def main():
   if not args.encoder:
     raise ValueError('encoder must be specified via --encoder or run.encoder in the eval config yaml')
 
-  run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+  run_timestamp_digits = datetime.now().strftime('%Y%m%d%H%M%S')
 
   # Setup distributed training
   local_rank = int(os.environ.get('LOCAL_RANK', 0))
@@ -175,11 +175,18 @@ def main():
   is_main_process = rank == 0
 
   if is_distributed:
-    dist.init_process_group(backend='nccl')
-    timestamp_holder = [run_timestamp if is_main_process else None]
-    dist.broadcast_object_list(timestamp_holder, src=0)
-    run_timestamp = timestamp_holder[0]
     torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend='nccl')
+    timestamp_tensor = torch.tensor(
+      [int(run_timestamp_digits) if is_main_process else 0],
+      dtype=torch.long,
+      device=torch.device(f'cuda:{local_rank}'),
+    )
+    dist.broadcast(timestamp_tensor, src=0)
+    run_timestamp_digits = f'{timestamp_tensor.item():014d}'
+
+  run_timestamp = f'{run_timestamp_digits[:8]}_{run_timestamp_digits[8:]}'
+  args.out = path.join(args.out, run_timestamp)
 
   args.out = path.join(args.out, run_timestamp)
 
