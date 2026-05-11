@@ -188,6 +188,8 @@ def main():
   run_timestamp = f'{run_timestamp_digits[:8]}_{run_timestamp_digits[8:]}'
   args.out = path.join(args.out, run_timestamp)
 
+  args.out = path.join(args.out, run_timestamp)
+
   if is_main_process:
     makedirs(args.out, exist_ok=True)
     logging.config.fileConfig('logging.ini')
