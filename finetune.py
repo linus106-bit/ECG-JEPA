@@ -621,14 +621,34 @@ def main():
         })
     logger.info(f'saved selected-label threshold sensitivity/specificity csv to {selected_threshold_csv_path}')
 
+    opt_sens_spec_by_label = {}
+    for row in threshold_curve_rows:
+      cls = int(row['class_index'])
+      sens_spec_sum = float(row['sensitivity']) + float(row['specificity'])
+      current_best = opt_sens_spec_by_label.get(cls)
+      if current_best is None or sens_spec_sum > current_best['sens_spec_sum']:
+        opt_sens_spec_by_label[cls] = {
+          'sens_spec_sum': sens_spec_sum,
+          'opt_threshold': row['threshold'],
+          'opt_sens': row['sensitivity'],
+          'opt_spec': row['specificity'],
+        }
+
     selected_metrics_csv_path = path.join(args.out, f'{task_name}_test_selected_labels_per_label_metrics.csv')
     with open(selected_metrics_csv_path, 'w', newline='', encoding='utf-8') as f:
-      writer = csv.DictWriter(f, fieldnames=['label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity'])
+      writer = csv.DictWriter(
+        f,
+        fieldnames=[
+          'label_id', 'label_name', 'auroc', 'f1', 'accuracy', 'sensitivity', 'specificity',
+          'opt_threshold', 'opt_sens', 'opt_spec',
+        ],
+      )
       writer.writeheader()
       for row in per_label_metrics:
         label_id = int(row['class_index'])
         if label_id not in selected_label_ids_set:
           continue
+        opt_row = opt_sens_spec_by_label.get(label_id, {})
         writer.writerow({
           'label_id': label_id,
           'label_name': _label_name_from_idx(label_id),
@@ -637,6 +657,9 @@ def main():
           'accuracy': row['accuracy'],
           'sensitivity': row['sensitivity'],
           'specificity': row['specificity'],
+          'opt_threshold': opt_row.get('opt_threshold', float('nan')),
+          'opt_sens': opt_row.get('opt_sens', float('nan')),
+          'opt_spec': opt_row.get('opt_spec', float('nan')),
         })
     logger.info(f'saved selected-label metrics csv to {selected_metrics_csv_path}')
 
