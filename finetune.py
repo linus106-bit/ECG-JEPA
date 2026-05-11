@@ -176,7 +176,12 @@ def main():
 
   if is_distributed:
     dist.init_process_group(backend='nccl')
+    timestamp_holder = [run_timestamp if is_main_process else None]
+    dist.broadcast_object_list(timestamp_holder, src=0)
+    run_timestamp = timestamp_holder[0]
     torch.cuda.set_device(local_rank)
+
+  args.out = path.join(args.out, run_timestamp)
 
   if is_main_process:
     makedirs(args.out, exist_ok=True)
