@@ -23,6 +23,8 @@ Splits:
 Usage (run from project root):
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --out /path/to/output
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --task superdiagnostic --out /path/to/output
+  python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --task all \
+      --ptb-xl-labels AFIB,1AVB,2AVB,SVTAC,PVC,PAC --out /path/to/output_6labels
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/capture24 --dataset capture-24 --out /path/to/output
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/mimic-iv-ecg --dataset mimic-iv-ecg --out /path/to/output
 """
@@ -58,6 +60,13 @@ parser.add_argument('--dataset', choices=list(DATASETS), required=True, help='da
 parser.add_argument('--out', required=True, help='output directory for HF dataset')
 parser.add_argument('--task', choices=TASKS, default='all',
                     help='label task for PTB-XL (default: all). Ignored for non-PTB-XL datasets.')
+parser.add_argument('--ptb-xl-labels', default=None,
+                    help='comma-separated PTB-XL label names to keep after task aggregation, e.g. '
+                         'AFIB,1AVB,2AVB,SVTAC,PVC,PAC. Only valid for --dataset ptb-xl.')
+parser.add_argument('--drop-unselected-label-samples', action='store_true',
+                    help='for --dataset ptb-xl with --ptb-xl-labels, drop samples that have none of '
+                         'the selected labels. By default all samples from the chosen task are kept, '
+                         'with all-zero labels for samples outside the selected label set.')
 parser.add_argument('--shard-size', type=int, default=DEFAULT_SHARD_SIZE,
                     help=f'max records per parquet shard (default: {DEFAULT_SHARD_SIZE})')
 parser.add_argument('--normalize', action='store_true',
@@ -89,6 +98,47 @@ def _normalize_ecg(x, dataset_cls):
   transforms.normalize_(x, mean_std=(mean, std))
   x.clip(-5, 5, out=x)
   return x
+
+
+def _parse_label_names(label_names):
+  """Parse a comma-separated label list while preserving user-provided order."""
+  if label_names is None:
+    return None
+
+  parsed = [label.strip() for label in label_names.split(',') if label.strip()]
+  if not parsed:
+    raise ValueError('--ptb-xl-labels was provided but no valid label names were found')
+
+  normalized = [label.upper() for label in parsed]
+  duplicates = sorted({label for label in normalized if normalized.count(label) > 1})
+  if duplicates:
+    raise ValueError(f'--ptb-xl-labels contains duplicate label(s): {duplicates}')
+
+  return normalized
+
+
+def _select_multihot_labels(y_multihot, label_names, selected_label_names, drop_unselected_samples=False):
+  """Keep only selected multi-hot label columns for PTB-XL."""
+  if selected_label_names is None:
+    return y_multihot, label_names, None
+
+  label_to_idx = {name.upper(): idx for idx, name in enumerate(label_names)}
+  missing_labels = [label for label in selected_label_names if label not in label_to_idx]
+  if missing_labels:
+    raise ValueError(
+      f'selected PTB-XL label(s) are not present for this task: {missing_labels}. '
+      f'Available labels: {label_names}'
+    )
+
+  selected_indices = [label_to_idx[label] for label in selected_label_names]
+  y_selected = y_multihot[:, selected_indices]
+  selected_sample_indices = None
+
+  if drop_unselected_samples:
+    selected_sample_indices = np.flatnonzero(y_selected.sum(axis=1) > 0)
+    y_selected = y_selected[selected_sample_indices]
+
+  return y_selected, selected_label_names, selected_sample_indices
 
 
 def _flush_shard(batch, out_path, features=None):
@@ -142,7 +192,7 @@ def _save_dataset_sharded(dataset, out_dir, split='train', shard_size=DEFAULT_SH
 
 
 def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE, verbose=False,
-                   normalize=False):
+                   normalize=False, selected_label_names=None, drop_unselected_samples=False):
   """Convert PTB-XL to sharded parquet with train/val/test splits and multi-hot labels."""
   from data.utils import load_raw_data
 
@@ -157,10 +207,21 @@ def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE,
   all_x, labels_df, y_multihot, mlb = PTB_XL.select_data(data, labels_df, task, min_samples=0)
 
   label_names = list(mlb.classes_)
+  y_multihot, label_names, selected_sample_indices = _select_multihot_labels(
+    y_multihot, label_names, selected_label_names,
+    drop_unselected_samples=drop_unselected_samples)
+
+  if selected_sample_indices is not None:
+    all_x = all_x[selected_sample_indices]
+    labels_df = labels_df.iloc[selected_sample_indices]
+
   strat_folds = labels_df.strat_fold.values.tolist()
   ecg_ids = labels_df.index.tolist()
 
   print(f'  task={task}, num_classes={len(label_names)}, label_names={label_names}')
+  if selected_label_names is not None:
+    print(f'  selected PTB-XL labels: {label_names}')
+    print(f'  drop_unselected_label_samples={drop_unselected_samples}')
   print(f'  total samples after filtering: {len(all_x)}')
 
   os.makedirs(out_dir, exist_ok=True)
@@ -331,11 +392,19 @@ FIXED_LENGTH_DATASETS = {
 }
 VARIABLE_LENGTH_DATASETS = {'cpsc', 'cpsc-extra', 'ptb'}
 
+selected_label_names = _parse_label_names(args.ptb_xl_labels)
+if selected_label_names is not None and args.dataset != 'ptb-xl':
+  raise ValueError('--ptb-xl-labels is only valid with --dataset ptb-xl')
+if args.drop_unselected_label_samples and selected_label_names is None:
+  raise ValueError('--drop-unselected-label-samples requires --ptb-xl-labels')
+
 print(f'Converting {args.dataset} from {args.data_dir}')
 
 if args.dataset == 'ptb-xl':
   convert_ptb_xl(args.data_dir, args.out, task=args.task, shard_size=args.shard_size,
-                 verbose=args.verbose, normalize=args.normalize)
+                 verbose=args.verbose, normalize=args.normalize,
+                 selected_label_names=selected_label_names,
+                 drop_unselected_samples=args.drop_unselected_label_samples)
 elif args.dataset == 'capture-24':
   convert_capture24(args.data_dir, args.out, shard_size=args.shard_size,
                     verbose=args.verbose, normalize=args.normalize)
