@@ -414,7 +414,7 @@ if args.dataset == 'ptb-xl':
   convert_ptb_xl(args.data_dir, args.out, task=args.task, shard_size=args.shard_size,
                  verbose=args.verbose, normalize=args.normalize,
                  selected_label_names=selected_label_names,
-                 drop_unselected_samples=args.drop_unselected_label_samples)
+                 drop_unselected_samples=args.drop_unselected_label_samples,
                  sampling_frequency=args.ptb_xl_sampling_frequency)
 elif args.dataset == 'capture-24':
   convert_capture24(args.data_dir, args.out, shard_size=args.shard_size,

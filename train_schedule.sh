@@ -1,1 +1,0 @@
-bash /group-volume/users/jaeuk/SensorLM/ECG-JEPA/scripts/pretrain_multi_gpu.sh configs/pretrain/abalation.yaml
