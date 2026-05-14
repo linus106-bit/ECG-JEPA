@@ -23,6 +23,7 @@ Splits:
 Usage (run from project root):
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --out /path/to/output
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --task superdiagnostic --out /path/to/output
+  python -m scripts.convert_to_hf_dataset --data-dir /path/to/ptb-xl --dataset ptb-xl --ptb-xl-sampling-frequency 100 --out /path/to/output_100hz
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/capture24 --dataset capture-24 --out /path/to/output
   python -m scripts.convert_to_hf_dataset --data-dir /path/to/mimic-iv-ecg --dataset mimic-iv-ecg --out /path/to/output
 """
@@ -64,6 +65,9 @@ parser.add_argument('--normalize', action='store_true',
                     help='apply pretrain-style normalization: NaN interpolation → per-channel '
                          'normalize (using dataset mean/std) → clip to [-5, 5]. '
                          'Output dtype becomes float32 instead of float16.')
+parser.add_argument('--ptb-xl-sampling-frequency', type=int, choices=(100, 500), default=500,
+                    help='sampling frequency to export for PTB-XL: 500 uses filename_hr, '
+                         '100 uses filename_lr (default: 500). Ignored for non-PTB-XL datasets.')
 parser.add_argument('--verbose', action='store_true', help='verbose mode')
 args = parser.parse_args()
 
@@ -142,11 +146,16 @@ def _save_dataset_sharded(dataset, out_dir, split='train', shard_size=DEFAULT_SH
 
 
 def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE, verbose=False,
-                   normalize=False):
-  """Convert PTB-XL to sharded parquet with train/val/test splits and multi-hot labels."""
+                   normalize=False, sampling_frequency=500):
+  """Convert PTB-XL to sharded parquet with train/val/test splits and multi-hot labels.
+
+  PTB-XL ships with both 500 Hz records (``filename_hr``) and 100 Hz records
+  (``filename_lr``). ``sampling_frequency`` selects which set of WFDB records to
+  read while keeping the same labels and stratified folds.
+  """
   from data.utils import load_raw_data
 
-  record_names = PTB_XL.find_records(data_dir)
+  record_names = PTB_XL.find_records(data_dir, sampling_frequency=sampling_frequency)
   data = load_raw_data(record_names, verbose=verbose)
 
   # Load raw labels and compute aggregations for the specified task
@@ -160,6 +169,7 @@ def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE,
   strat_folds = labels_df.strat_fold.values.tolist()
   ecg_ids = labels_df.index.tolist()
 
+  print(f'  sampling_frequency={sampling_frequency}Hz')
   print(f'  task={task}, num_classes={len(label_names)}, label_names={label_names}')
   print(f'  total samples after filtering: {len(all_x)}')
 
@@ -188,7 +198,7 @@ def convert_ptb_xl(data_dir, out_dir, task='all', shard_size=DEFAULT_SHARD_SIZE,
     shutil.copy2(scp_file, path.join(out_dir, 'scp_statements.csv'))
     print(f'Copied scp_statements.csv to {out_dir}')
 
-  print(f'Saved PTB-XL sharded parquet to {out_dir}')
+  print(f'Saved PTB-XL {sampling_frequency}Hz sharded parquet to {out_dir}')
 
 
 def convert_capture24(data_dir, out_dir, shard_size=DEFAULT_SHARD_SIZE, verbose=False,
@@ -335,7 +345,8 @@ print(f'Converting {args.dataset} from {args.data_dir}')
 
 if args.dataset == 'ptb-xl':
   convert_ptb_xl(args.data_dir, args.out, task=args.task, shard_size=args.shard_size,
-                 verbose=args.verbose, normalize=args.normalize)
+                 verbose=args.verbose, normalize=args.normalize,
+                 sampling_frequency=args.ptb_xl_sampling_frequency)
 elif args.dataset == 'capture-24':
   convert_capture24(args.data_dir, args.out, shard_size=args.shard_size,
                     verbose=args.verbose, normalize=args.normalize)
