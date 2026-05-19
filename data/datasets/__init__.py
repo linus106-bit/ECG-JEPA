@@ -10,6 +10,7 @@ from data.datasets.challenge_2021 import (
 )
 from data.datasets.code_15 import CODE15
 from data.datasets.mimic_iv_ecg import MIMIC_IV_ECG
+from data.datasets.depression import Depression
 from data.datasets.hyper import Hyper
 from data.datasets.ptb_xl import PTB_XL
 from data.datasets.sdb import SDB
@@ -27,5 +28,6 @@ DATASETS = {
   'mimic-iv-ecg': MIMIC_IV_ECG,
   'ptb-xl': PTB_XL,
   'sdb': SDB,
-  'hyper': Hyper
+  'hyper': Hyper,
+  'depression': Depression
 }
