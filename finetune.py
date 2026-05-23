@@ -7,6 +7,7 @@ import logging
 import logging.config
 import os
 import pprint
+import shutil
 from contextlib import nullcontext
 from datetime import datetime
 from os import path, makedirs
@@ -186,9 +187,8 @@ def main():
     run_timestamp_digits = f'{timestamp_tensor.item():014d}'
 
   run_timestamp = f'{run_timestamp_digits[:8]}_{run_timestamp_digits[8:]}'
-  args.out = path.join(args.out, run_timestamp)
-
-  args.out = path.join(args.out, run_timestamp)
+  base_out_dir = args.out
+  args.out = path.join(base_out_dir, run_timestamp)
 
   if is_main_process:
     makedirs(args.out, exist_ok=True)
@@ -1059,6 +1059,8 @@ def main():
   # Save best checkpoint and run test evaluation (main process only)
   # -------------------------------------------------------------------------
   if is_main_process:
+    best_chkpt_filename = f'{task_name}_best_chkpt.pt'
+    best_chkpt_path = path.join(args.out, best_chkpt_filename)
     torch.save({
       'model': best_chkpt,
       'config': dataclasses.asdict(encoder_config),
@@ -1066,7 +1068,16 @@ def main():
       'preprocess': {'mean': torch.from_numpy(mean.squeeze()),
                      'std': torch.from_numpy(std.squeeze())},
       'task': task_name
-    }, path.join(args.out, f'{task_name}_best_chkpt.pt'))
+    }, best_chkpt_path)
+
+    # Keep timestamped run directories for traceability, but also expose the
+    # latest best checkpoint directly under the configured out_dir so a
+    # follow-up finetune_after_linear run can use a stable encoder path.
+    makedirs(base_out_dir, exist_ok=True)
+    for latest_chkpt_filename in (best_chkpt_filename, 'best_chkpt.pt'):
+      latest_chkpt_path = path.join(base_out_dir, latest_chkpt_filename)
+      shutil.copy2(best_chkpt_path, latest_chkpt_path)
+      logger.info(f'copied best checkpoint to {latest_chkpt_path}')
 
   if is_main_process:
     logger.info('loading best model checkpoint')
