@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 import configs
 import metrics
 from data import transforms, utils as datautils
-from data.datasets import DATASETS, PTB_XL, Capture24, SDB, Hyper
+from data.datasets import DATASETS, PTB_XL, Capture24, SDB, Depression, Hyper
 from data.utils import TensorDataset, get_channel_order
 from models import create_encoder, EncoderClassifier
 from utils.monitoring import AverageMeter, get_memory_usage, get_cpu_count
@@ -133,8 +133,8 @@ def _resolve_single_label_key(hf_dataset, dataset_cls):
   train_features = hf_dataset['train'].features
 
   preferred_keys = ['label']
-  if dataset_cls is Hyper:
-    preferred_keys = list(Hyper.label_keys)
+  if dataset_cls in (Hyper, Depression):
+    preferred_keys = list(dict.fromkeys([*dataset_cls.label_keys, 'depression', 'hypertension', 'label']))
 
   for key in preferred_keys:
     if key in train_features:

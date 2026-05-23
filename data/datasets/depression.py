@@ -1,8 +1,8 @@
 import numpy as np
 
 
-class Hyper:
-  """Hyper sensor dataset metadata.
+class Depression:
+  """Depression sensor dataset metadata.
 
   Assumes HF dataset records use channels-first layout: (C, T),
   with 15 sensor channels and fixed channel size 300.
@@ -19,7 +19,7 @@ class Hyper:
 
   @staticmethod
   def load_data(data_dir):
-    """Load Hyper from a HuggingFace dataset directory.
+    """Load Depression from a HuggingFace dataset directory.
 
     Returns:
       data: np.ndarray(dtype=object), each item shape (channel_size, 15), float16
@@ -38,7 +38,7 @@ class Hyper:
         x = np.array(sample['data'], dtype=np.float16)  # (C, T)
         x = x.T  # (T, C), channels last
         all_data.append(x)
-        sample_label = next((sample[k] for k in Hyper.label_keys if k in sample), -1)
+        sample_label = next((sample[k] for k in Depression.label_keys if k in sample), -1)
         all_labels.append(int(sample_label))
         all_splits.append(split_name)
 
