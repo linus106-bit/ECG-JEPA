@@ -168,6 +168,43 @@ python scripts/minify_pretrained_checkpoint.py \
   --checkpoint results/pretrain/ViTS_mimic/chkpt_10000.pt
 ```
 
+## Standalone Encoder Inference And ONNX Export
+
+Run PyTorch encoder inference directly from a full pre-training checkpoint, a
+minified checkpoint, or a fine-tuned checkpoint:
+
+```bash
+python scripts/infer_ecg_encoder.py \
+  --checkpoint results/pretrain/ViTS_mimic/chkpt_10000.pt \
+  --input /path/to/ecg.npy \
+  --output /path/to/embeddings.npz \
+  --length-mode center-crop \
+  --normalize per-record
+```
+
+Export the trained 500 Hz encoder to ONNX. Install optional ONNX dependencies
+first with `pip install onnx onnxruntime`. The exported model uses input name
+`ecg` with shape `(batch, channels, samples)` and output name
+`token_embeddings` with shape `(batch, tokens, embedding_dim)`. A sidecar
+metadata JSON is written next to the ONNX file by default.
+
+```bash
+python scripts/export_ecg_encoder_onnx.py \
+  --checkpoint results/pretrain/ViTS_mimic/chkpt_10000.pt \
+  --output results/pretrain/ViTS_mimic/ecg_encoder.onnx
+```
+
+Run ONNX Runtime inference from the exported encoder:
+
+```bash
+python scripts/infer_ecg_encoder_onnx.py \
+  --onnx results/pretrain/ViTS_mimic/ecg_encoder.onnx \
+  --input /path/to/ecg.npy \
+  --output /path/to/onnx_embeddings.npz \
+  --length-mode center-crop \
+  --normalize per-record
+```
+
 ## Fine-Tuning And Evaluation
 
 Evaluation configs live in `configs/eval`.
