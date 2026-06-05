@@ -36,6 +36,9 @@ import configs
 from models import EncoderClassifier, create_encoder
 
 
+DEFAULT_SIX_LABEL_NAMES = ('AFIB', '1AVB', '2AVB', 'SVTAC', 'PAC', 'PVC')
+
+
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(
     description='Standalone inference for a trained 500 Hz ECG-JEPA encoder.')
@@ -61,7 +64,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument('--allow-non-500hz', action='store_true',
                       help='Do not fail if checkpoint config.sampling_frequency is not 500.')
   parser.add_argument('--label-names', default=None,
-                      help='Comma-separated label names for printed classifier probabilities. Missing names default to label_N.')
+                      help='Comma-separated label names for printed classifier probabilities. Defaults to AFIB,1AVB,2AVB,SVTAC,PAC,PVC for 6-label checkpoints.')
   parser.add_argument('--num-print-labels', type=int, default=6,
                       help='Number of classifier labels to print per sample. Default: 6.')
   parser.add_argument('--probability-mode', choices=('sigmoid', 'softmax'), default='sigmoid',
@@ -179,6 +182,8 @@ def _as_eval_config(raw_config: Any) -> configs.eval.Config:
 
 def _label_names(num_classes: int, raw_label_names: str | None) -> list[str]:
   if raw_label_names is None:
+    if num_classes == len(DEFAULT_SIX_LABEL_NAMES):
+      return list(DEFAULT_SIX_LABEL_NAMES)
     return [f'label_{index}' for index in range(num_classes)]
   names = [name.strip() for name in raw_label_names.split(',') if name.strip()]
   if len(names) > num_classes:
@@ -261,6 +266,7 @@ def main() -> None:
   pooled_embeddings = token_embeddings.mean(axis=1)
   logits = np.concatenate(logit_batches, axis=0) if logit_batches else None
   probabilities = None
+  names = None
   if logits is not None:
     if args.probability_mode == 'softmax':
       logits_max = logits.max(axis=1, keepdims=True)
@@ -285,6 +291,7 @@ def main() -> None:
     'length_mode': args.length_mode,
     'has_classifier': classifier is not None,
     'probability_mode': args.probability_mode if classifier is not None else None,
+    'label_names': names,
   }
 
   args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -173,8 +173,8 @@ python scripts/minify_pretrained_checkpoint.py \
 Run PyTorch encoder inference directly from a full pre-training checkpoint, a
 minified checkpoint, or a fine-tuned checkpoint. If the checkpoint is a
 fine-tuned classifier checkpoint, the script also prints classifier
-probabilities for six labels by default; pass `--label-names` to replace the
-default `label_0` ... labels.
+probabilities for six labels by default: `AFIB`, `1AVB`, `2AVB`, `SVTAC`,
+`PAC`, and `PVC`; pass `--label-names` to override them.
 
 ```bash
 python scripts/infer_ecg_encoder.py \
