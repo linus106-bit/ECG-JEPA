@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-"""Export a trained ECG-JEPA encoder checkpoint to ONNX.
+"""Export a trained ECG-JEPA encoder or classifier checkpoint to ONNX.
 
-This exporter accepts the same checkpoint families as ``infer_ecg_encoder.py``:
-full pre-training checkpoints, minified target-encoder checkpoints, and
-fine-tuned checkpoints that contain an ``encoder.`` state dict prefix.
-
-The exported ONNX graph takes one input named ``ecg`` with shape
-``(batch, channels, samples)`` and returns one output named
-``token_embeddings`` with shape ``(batch, tokens, embedding_dim)``.
-Only the batch dimension is dynamic; the channel count and sample length are
-fixed by the checkpoint config because ECG-JEPA positional embeddings are
-created for the training-time signal length.
+This exporter accepts full pre-training checkpoints, minified target-encoder
+checkpoints, and fine-tuned classifier checkpoints.  Fine-tuned checkpoints can
+be exported as the full classifier graph so the ONNX model returns label logits
+and probabilities directly.
 """
 
 from __future__ import annotations
@@ -23,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from torch import nn
 
 # Make this file runnable both from the repository root and from another CWD.
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -30,7 +25,24 @@ if str(REPO_ROOT) not in sys.path:
   sys.path.insert(0, str(REPO_ROOT))
 
 import configs
-from models import create_encoder
+from models import EncoderClassifier, create_encoder
+
+DEFAULT_SIX_LABEL_NAMES = ('AFIB', '1AVB', '2AVB', 'SVTAC', 'PAC', 'PVC')
+
+
+class ClassifierWithProbabilities(nn.Module):
+  def __init__(self, classifier: EncoderClassifier, probability_mode: str):
+    super().__init__()
+    self.classifier = classifier
+    self.probability_mode = probability_mode
+
+  def forward(self, x):
+    logits = self.classifier(x)
+    if self.probability_mode == 'softmax':
+      probabilities = torch.softmax(logits, dim=1)
+    else:
+      probabilities = torch.sigmoid(logits)
+    return logits, probabilities
 
 
 def _as_config_dict(raw_config: Any) -> dict[str, Any]:
@@ -44,6 +56,10 @@ def _as_config_dict(raw_config: Any) -> dict[str, Any]:
     raise TypeError(f'Unsupported checkpoint config type: {type(raw_config)!r}')
   config_dict.pop('run', None)
   return config_dict
+
+
+def _as_eval_config(raw_config: Any) -> configs.eval.Config:
+  return configs.eval.Config(**_as_config_dict(raw_config))
 
 
 def _encoder_state_from_checkpoint(chkpt: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -66,18 +82,36 @@ def _encoder_state_from_checkpoint(chkpt: dict[str, Any]) -> dict[str, torch.Ten
   return dict(model_state)
 
 
+def _label_names(num_classes: int, raw_label_names: str | None) -> list[str]:
+  if raw_label_names is None:
+    if num_classes == len(DEFAULT_SIX_LABEL_NAMES):
+      return list(DEFAULT_SIX_LABEL_NAMES)
+    return [f'label_{index}' for index in range(num_classes)]
+  names = [name.strip() for name in raw_label_names.split(',') if name.strip()]
+  if len(names) > num_classes:
+    raise ValueError(f'--label-names cannot contain more than {num_classes} names, got {len(names)}')
+  names.extend(f'label_{index}' for index in range(len(names), num_classes))
+  return names
+
+
 def parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description='Export a trained 500 Hz ECG-JEPA encoder checkpoint to ONNX.')
+  parser = argparse.ArgumentParser(description='Export a trained 500 Hz ECG-JEPA encoder or classifier to ONNX.')
   parser.add_argument('--checkpoint', required=True, type=Path,
                       help='Path to a full/minified pre-train checkpoint or fine-tuned checkpoint.')
   parser.add_argument('--output', required=True, type=Path,
                       help='Output ONNX file path.')
+  parser.add_argument('--export-target', choices=('auto', 'encoder', 'classifier'), default='auto',
+                      help='What to export. auto exports classifier for fine-tuned checkpoints, otherwise encoder.')
   parser.add_argument('--opset', type=int, default=17,
                       help='ONNX opset version. Default: 17.')
   parser.add_argument('--device', default='cpu',
                       help='Device used during export. CPU is usually safest for ONNX export.')
   parser.add_argument('--keep-registers', action='store_true',
-                      help='Keep register tokens in the exported encoder output when the encoder has registers.')
+                      help='Keep register tokens in encoder ONNX output when exporting only the encoder.')
+  parser.add_argument('--probability-mode', choices=('sigmoid', 'softmax'), default='sigmoid',
+                      help='Classifier probability activation to include in ONNX. Default: sigmoid for multi-label ECG tasks.')
+  parser.add_argument('--label-names', default=None,
+                      help='Comma-separated classifier label names. Defaults to AFIB,1AVB,2AVB,SVTAC,PAC,PVC for 6-label checkpoints.')
   parser.add_argument('--allow-non-500hz', action='store_true',
                       help='Do not fail if checkpoint config.sampling_frequency is not 500.')
   parser.add_argument('--metadata-output', type=Path, default=None,
@@ -88,10 +122,15 @@ def parse_args() -> argparse.Namespace:
 def _metadata_from_config(
     checkpoint: Path,
     encoder_config: configs.pretrain.Config,
+    export_target: str,
+    output_names: list[str],
     keep_registers: bool,
-    opset: int) -> dict[str, Any]:
+    opset: int,
+    probability_mode: str | None = None,
+    label_names: list[str] | None = None) -> dict[str, Any]:
   return {
     'checkpoint': str(checkpoint),
+    'export_target': export_target,
     'sampling_frequency': encoder_config.sampling_frequency,
     'channels': list(encoder_config.active_channels),
     'num_channels': encoder_config.num_channels,
@@ -101,9 +140,11 @@ def _metadata_from_config(
     'embedding_dim': encoder_config.dim,
     'model_type': encoder_config.model_type,
     'keep_registers': keep_registers,
+    'probability_mode': probability_mode,
+    'label_names': label_names,
     'opset': opset,
     'input_name': 'ecg',
-    'output_name': 'token_embeddings',
+    'output_names': output_names,
     'input_shape': ['batch', encoder_config.num_channels, encoder_config.channel_size],
   }
 
@@ -123,18 +164,54 @@ def main() -> None:
       f'Checkpoint sampling_frequency is {encoder_config.sampling_frequency}, not 500. '
       'Use --allow-non-500hz only if this is intentional.')
 
+  has_classifier = 'eval_config' in chkpt
+  export_target = 'classifier' if args.export_target == 'auto' and has_classifier else args.export_target
+  if export_target == 'auto':
+    export_target = 'encoder'
+  if export_target == 'classifier' and not has_classifier:
+    raise ValueError('--export-target classifier requires a fine-tuned checkpoint with eval_config')
+
   # Disable scaled_dot_product_attention during export; explicit matmul/softmax
   # attention is more portable across ONNX runtimes and opset versions.
-  encoder = create_encoder(
-    config=encoder_config,
-    keep_registers=args.keep_registers,
-    use_sdp_kernel=False).to(device)
-  incompatible = encoder.load_state_dict(_encoder_state_from_checkpoint(chkpt), strict=False)
-  if incompatible.missing_keys or incompatible.unexpected_keys:
-    raise RuntimeError(
-      'Checkpoint is incompatible with the encoder. '
-      f'Missing keys: {incompatible.missing_keys}; unexpected keys: {incompatible.unexpected_keys}')
-  encoder.eval()
+  if export_target == 'classifier':
+    eval_config = _as_eval_config(chkpt['eval_config'])
+    encoder = create_encoder(
+      config=encoder_config,
+      keep_registers=eval_config.use_register,
+      use_sdp_kernel=False)
+    classifier = EncoderClassifier(encoder, eval_config, use_sdp_kernel=False).to(device)
+    incompatible = classifier.load_state_dict(chkpt['model'], strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+      raise RuntimeError(
+        'Checkpoint is incompatible with the encoder classifier. '
+        f'Missing keys: {incompatible.missing_keys}; unexpected keys: {incompatible.unexpected_keys}')
+    model = ClassifierWithProbabilities(classifier, args.probability_mode).to(device).eval()
+    output_names = ['logits', 'probabilities']
+    dynamic_axes = {
+      'ecg': {0: 'batch'},
+      'logits': {0: 'batch'},
+      'probabilities': {0: 'batch'},
+    }
+    label_names = _label_names(eval_config.num_classes, args.label_names)
+    keep_registers = eval_config.use_register
+  else:
+    model = create_encoder(
+      config=encoder_config,
+      keep_registers=args.keep_registers,
+      use_sdp_kernel=False).to(device)
+    incompatible = model.load_state_dict(_encoder_state_from_checkpoint(chkpt), strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+      raise RuntimeError(
+        'Checkpoint is incompatible with the encoder. '
+        f'Missing keys: {incompatible.missing_keys}; unexpected keys: {incompatible.unexpected_keys}')
+    model.eval()
+    output_names = ['token_embeddings']
+    dynamic_axes = {
+      'ecg': {0: 'batch'},
+      'token_embeddings': {0: 'batch'},
+    }
+    label_names = None
+    keep_registers = args.keep_registers
 
   dummy_ecg = torch.zeros(
     1,
@@ -145,25 +222,32 @@ def main() -> None:
 
   args.output.parent.mkdir(parents=True, exist_ok=True)
   torch.onnx.export(
-    encoder,
+    model,
     dummy_ecg,
     args.output,
     export_params=True,
     opset_version=args.opset,
     do_constant_folding=True,
     input_names=['ecg'],
-    output_names=['token_embeddings'],
-    dynamic_axes={
-      'ecg': {0: 'batch'},
-      'token_embeddings': {0: 'batch'},
-    })
+    output_names=output_names,
+    dynamic_axes=dynamic_axes)
 
   metadata_output = args.metadata_output or args.output.with_suffix(args.output.suffix + '.json')
   metadata_output.parent.mkdir(parents=True, exist_ok=True)
   metadata_output.write_text(
-    json.dumps(_metadata_from_config(args.checkpoint, encoder_config, args.keep_registers, args.opset), indent=2),
+    json.dumps(
+      _metadata_from_config(
+        args.checkpoint,
+        encoder_config,
+        export_target,
+        output_names,
+        keep_registers,
+        args.opset,
+        probability_mode=args.probability_mode if export_target == 'classifier' else None,
+        label_names=label_names),
+      indent=2),
     encoding='utf-8')
-  print(f'Exported ONNX encoder to {args.output}')
+  print(f'Exported ONNX {export_target} to {args.output}')
   print(f'Wrote metadata to {metadata_output}')
 
 

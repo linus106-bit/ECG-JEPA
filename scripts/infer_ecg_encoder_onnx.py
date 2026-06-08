@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run inference with an ONNX-exported ECG-JEPA encoder.
+"""Run inference with an ONNX-exported ECG-JEPA encoder or classifier.
 
 Use ``scripts/export_ecg_encoder_onnx.py`` first. This script loads the ONNX
 model with ONNX Runtime, prepares channels-first ECG arrays, runs batched
-inference, and writes ``token_embeddings`` plus mean-pooled embeddings to an
-``.npz`` file.
+inference, and writes the ONNX outputs to an ``.npz`` file. Encoder ONNX models
+produce ``token_embeddings`` plus mean-pooled embeddings; classifier ONNX models
+produce ``logits`` and ``probabilities``.
 """
 
 from __future__ import annotations
@@ -18,8 +19,11 @@ import numpy as np
 import onnxruntime as ort
 
 
+DEFAULT_SIX_LABEL_NAMES = ('AFIB', '1AVB', '2AVB', 'SVTAC', 'PAC', 'PVC')
+
+
 def parse_args() -> argparse.Namespace:
-  parser = argparse.ArgumentParser(description='Inference for an ONNX-exported ECG-JEPA encoder.')
+  parser = argparse.ArgumentParser(description='Inference for an ONNX-exported ECG-JEPA encoder or classifier.')
   parser.add_argument('--onnx', required=True, type=Path,
                       help='Path to an ONNX model exported by export_ecg_encoder_onnx.py.')
   parser.add_argument('--input', required=True, type=Path,
@@ -39,6 +43,12 @@ def parse_args() -> argparse.Namespace:
                       help='Optional per-channel z-score normalization for each record.')
   parser.add_argument('--providers', nargs='+', default=None,
                       help='Optional ONNX Runtime providers, e.g. CUDAExecutionProvider CPUExecutionProvider.')
+  parser.add_argument('--label-names', default=None,
+                      help='Comma-separated classifier label names. Defaults to metadata, then AFIB,1AVB,2AVB,SVTAC,PAC,PVC for 6-label models.')
+  parser.add_argument('--num-print-labels', type=int, default=6,
+                      help='Number of classifier probabilities to print per sample. Default: 6.')
+  parser.add_argument('--no-print-labels', action='store_true',
+                      help='Do not print classifier probabilities when the ONNX model returns probabilities.')
   return parser.parse_args()
 
 
@@ -112,6 +122,31 @@ def _load_metadata(args: argparse.Namespace) -> dict[str, Any]:
   return {}
 
 
+def _label_names(num_classes: int, raw_label_names: str | None, metadata: dict[str, Any]) -> list[str]:
+  if raw_label_names is not None:
+    names = [name.strip() for name in raw_label_names.split(',') if name.strip()]
+    if len(names) > num_classes:
+      raise ValueError(f'--label-names cannot contain more than {num_classes} names, got {len(names)}')
+    names.extend(f'label_{index}' for index in range(len(names), num_classes))
+    return names
+  metadata_names = metadata.get('label_names')
+  if metadata_names:
+    names = [str(name) for name in metadata_names]
+    names.extend(f'label_{index}' for index in range(len(names), num_classes))
+    return names[:num_classes]
+  if num_classes == len(DEFAULT_SIX_LABEL_NAMES):
+    return list(DEFAULT_SIX_LABEL_NAMES)
+  return [f'label_{index}' for index in range(num_classes)]
+
+
+def _print_label_probabilities(probabilities: np.ndarray, label_names: list[str], num_print_labels: int) -> None:
+  labels_to_print = min(num_print_labels, probabilities.shape[1])
+  for sample_index, row in enumerate(probabilities):
+    print(f'sample {sample_index} label probabilities:')
+    for label_index in range(labels_to_print):
+      print(f'  {label_names[label_index]}: {row[label_index]:.6f}')
+
+
 def main() -> None:
   args = parse_args()
   session = ort.InferenceSession(str(args.onnx), providers=args.providers)
@@ -130,14 +165,31 @@ def main() -> None:
   if args.normalize == 'per-record':
     x = _normalize_per_record(x)
 
-  token_batches: list[np.ndarray] = []
+  output_names = metadata.get('output_names') or ([metadata['output_name']] if metadata.get('output_name') else None)
+  output_names = output_names or [output.name for output in session.get_outputs()]
+  output_batches: dict[str, list[np.ndarray]] = {name: [] for name in output_names}
   for start in range(0, len(x), args.batch_size):
     batch = np.ascontiguousarray(x[start:start + args.batch_size], dtype=np.float32)
-    tokens = session.run(None, {input_name: batch})[0]
-    token_batches.append(tokens)
+    outputs = session.run(None, {input_name: batch})
+    for name, values in zip(output_names, outputs):
+      output_batches.setdefault(name, []).append(values)
 
-  token_embeddings = np.concatenate(token_batches, axis=0)
-  pooled_embeddings = token_embeddings.mean(axis=1)
+  outputs_np = {
+    name: np.concatenate(batches, axis=0)
+    for name, batches in output_batches.items()
+    if batches
+  }
+  token_embeddings = outputs_np.get('token_embeddings')
+  logits = outputs_np.get('logits')
+  probabilities = outputs_np.get('probabilities')
+  pooled_embeddings = token_embeddings.mean(axis=1) if token_embeddings is not None else None
+
+  label_names = None
+  if probabilities is not None:
+    label_names = _label_names(probabilities.shape[1], args.label_names, metadata)
+    if not args.no_print_labels:
+      _print_label_probabilities(probabilities, label_names, args.num_print_labels)
+
   output_metadata = {
     **metadata,
     'onnx': str(args.onnx),
@@ -145,15 +197,16 @@ def main() -> None:
     'normalize': args.normalize,
     'length_mode': args.length_mode,
     'providers': session.get_providers(),
+    'label_names': label_names or metadata.get('label_names'),
   }
 
   args.output.parent.mkdir(parents=True, exist_ok=True)
-  np.savez_compressed(
-    args.output,
-    token_embeddings=token_embeddings,
-    pooled_embeddings=pooled_embeddings,
-    metadata=json.dumps(output_metadata, ensure_ascii=False))
-  print(f'Saved token_embeddings {token_embeddings.shape} and pooled_embeddings {pooled_embeddings.shape} to {args.output}')
+  output_npz = {'metadata': json.dumps(output_metadata, ensure_ascii=False), **outputs_np}
+  if pooled_embeddings is not None:
+    output_npz['pooled_embeddings'] = pooled_embeddings
+  np.savez_compressed(args.output, **output_npz)
+  saved_shapes = ', '.join(f'{name} {value.shape}' for name, value in output_npz.items() if name != 'metadata')
+  print(f'Saved {saved_shapes} to {args.output}')
 
 
 if __name__ == '__main__':

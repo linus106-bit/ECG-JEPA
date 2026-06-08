@@ -185,25 +185,26 @@ python scripts/infer_ecg_encoder.py \
   --normalize per-record
 ```
 
-Export the trained 500 Hz encoder to ONNX. Install optional ONNX dependencies
-first with `pip install onnx onnxruntime`. The exported model uses input name
-`ecg` with shape `(batch, channels, samples)` and output name
-`token_embeddings` with shape `(batch, tokens, embedding_dim)`. A sidecar
-metadata JSON is written next to the ONNX file by default.
+Export the trained 500 Hz model to ONNX. Install optional ONNX dependencies
+first with `pip install onnx onnxruntime`. For fine-tuned classifier checkpoints,
+`--export-target auto` exports the full classifier by default, with input name
+`ecg` and outputs `logits` and `probabilities`. For pre-training checkpoints,
+the exporter emits encoder `token_embeddings`. A sidecar metadata JSON is
+written next to the ONNX file by default.
 
 ```bash
 python scripts/export_ecg_encoder_onnx.py \
-  --checkpoint results/pretrain/ViTS_mimic/chkpt_10000.pt \
-  --output results/pretrain/ViTS_mimic/ecg_encoder.onnx
+  --checkpoint /path/to/fine-tuned/all_best_chkpt.pt \
+  --output /path/to/ecg_classifier.onnx
 ```
 
-Run ONNX Runtime inference from the exported encoder:
+Run ONNX Runtime inference from the exported ONNX model:
 
 ```bash
 python scripts/infer_ecg_encoder_onnx.py \
-  --onnx results/pretrain/ViTS_mimic/ecg_encoder.onnx \
+  --onnx /path/to/ecg_classifier.onnx \
   --input /path/to/ecg.npy \
-  --output /path/to/onnx_embeddings.npz \
+  --output /path/to/onnx_predictions.npz \
   --length-mode center-crop \
   --normalize per-record
 ```
