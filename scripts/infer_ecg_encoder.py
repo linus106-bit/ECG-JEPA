@@ -57,8 +57,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument('--length-mode', choices=('strict', 'center-crop', 'left-crop', 'pad'),
                       default='strict',
                       help='How to handle sample length mismatch with checkpoint config.channel_size.')
-  parser.add_argument('--normalize', choices=('none', 'per-record'), default='none',
-                      help='Optional per-channel z-score normalization for each record.')
+  parser.add_argument('--normalize', choices=('auto', 'none', 'checkpoint', 'per-record'), default='auto',
+                      help='Input normalization. auto uses checkpoint preprocess stats when present, otherwise none.')
   parser.add_argument('--keep-registers', action='store_true',
                       help='Keep ViT/CNN/Mamba register tokens in the output when the encoder has registers.')
   parser.add_argument('--allow-non-500hz', action='store_true',
@@ -147,6 +147,31 @@ def _match_length(x: np.ndarray, expected_length: int, mode: str) -> np.ndarray:
     pad_width = expected_length - length
     return np.pad(x, ((0, 0), (0, 0), (0, pad_width)), mode='constant')
   raise ValueError(f'Unknown length mode: {mode}')
+
+
+
+def _checkpoint_preprocess_stats(chkpt: dict[str, Any], expected_channels: int) -> tuple[np.ndarray, np.ndarray] | None:
+  preprocess = chkpt.get('preprocess')
+  if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
+    return None
+  mean = preprocess['mean']
+  std = preprocess['std']
+  if isinstance(mean, torch.Tensor):
+    mean = mean.detach().cpu().numpy()
+  if isinstance(std, torch.Tensor):
+    std = std.detach().cpu().numpy()
+  mean = np.asarray(mean, dtype=np.float32).reshape(-1)
+  std = np.asarray(std, dtype=np.float32).reshape(-1)
+  if len(mean) < expected_channels or len(std) < expected_channels:
+    raise ValueError(
+      f'Checkpoint preprocess stats have {len(mean)} channels, but input expects {expected_channels}')
+  return mean[:expected_channels].reshape(1, expected_channels, 1), std[:expected_channels].reshape(1, expected_channels, 1)
+
+
+def _normalize_with_checkpoint_stats(x: np.ndarray, mean_std: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
+  mean, std = mean_std
+  x = (x - mean) / std
+  return np.clip(x, -5, 5)
 
 
 def _normalize_per_record(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -248,7 +273,15 @@ def main() -> None:
   x = _ensure_batched_channels_first(x)
   x = _match_channels(x, encoder_config.num_channels)
   x = _match_length(x, encoder_config.channel_size, args.length_mode)
-  if args.normalize == 'per-record':
+  checkpoint_mean_std = _checkpoint_preprocess_stats(chkpt, encoder_config.num_channels)
+  normalize_mode = args.normalize
+  if normalize_mode == 'auto':
+    normalize_mode = 'checkpoint' if checkpoint_mean_std is not None else 'none'
+  if normalize_mode == 'checkpoint':
+    if checkpoint_mean_std is None:
+      raise ValueError('Checkpoint does not contain preprocess mean/std; use --normalize none or --normalize per-record')
+    x = _normalize_with_checkpoint_stats(x, checkpoint_mean_std)
+  elif normalize_mode == 'per-record':
     x = _normalize_per_record(x)
 
   token_batches: list[np.ndarray] = []
@@ -287,7 +320,7 @@ def main() -> None:
     'num_patches': encoder_config.num_patches,
     'embedding_dim': encoder_config.dim,
     'keep_registers': actual_keep_registers,
-    'normalize': args.normalize,
+    'normalize': normalize_mode,
     'length_mode': args.length_mode,
     'has_classifier': classifier is not None,
     'probability_mode': args.probability_mode if classifier is not None else None,

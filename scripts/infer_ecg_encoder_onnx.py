@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument('--length-mode', choices=('strict', 'center-crop', 'left-crop', 'pad'),
                       default='strict',
                       help='How to handle sample length mismatch with the exported model input length.')
-  parser.add_argument('--normalize', choices=('none', 'per-record'), default='none',
-                      help='Optional per-channel z-score normalization for each record.')
+  parser.add_argument('--normalize', choices=('auto', 'none', 'checkpoint', 'per-record'), default='auto',
+                      help='Input normalization. auto uses metadata preprocess stats when present, otherwise none.')
   parser.add_argument('--providers', nargs='+', default=None,
                       help='Optional ONNX Runtime providers, e.g. CUDAExecutionProvider CPUExecutionProvider.')
   parser.add_argument('--label-names', default=None,
@@ -103,6 +103,31 @@ def _match_length(x: np.ndarray, expected_length: int, mode: str) -> np.ndarray:
   raise ValueError(f'Unknown length mode: {mode}')
 
 
+
+def _metadata_preprocess_stats(metadata: dict[str, Any], expected_channels: int) -> tuple[np.ndarray, np.ndarray, tuple[float, float] | None] | None:
+  preprocess = metadata.get('preprocess')
+  if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
+    return None
+  mean = np.asarray(preprocess['mean'], dtype=np.float32).reshape(-1)
+  std = np.asarray(preprocess['std'], dtype=np.float32).reshape(-1)
+  if len(mean) < expected_channels or len(std) < expected_channels:
+    raise ValueError(
+      f'Metadata preprocess stats have {len(mean)} channels, but input expects {expected_channels}')
+  clip = preprocess.get('clip')
+  clip_tuple = (float(clip[0]), float(clip[1])) if clip else None
+  return mean[:expected_channels].reshape(1, expected_channels, 1), std[:expected_channels].reshape(1, expected_channels, 1), clip_tuple
+
+
+def _normalize_with_metadata_stats(
+    x: np.ndarray,
+    mean_std_clip: tuple[np.ndarray, np.ndarray, tuple[float, float] | None]) -> np.ndarray:
+  mean, std, clip = mean_std_clip
+  x = (x - mean) / std
+  if clip is not None:
+    x = np.clip(x, clip[0], clip[1])
+  return x
+
+
 def _normalize_per_record(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
   mean = x.mean(axis=-1, keepdims=True)
   std = x.std(axis=-1, keepdims=True)
@@ -162,7 +187,15 @@ def main() -> None:
   x = _ensure_batched_channels_first(x)
   x = _match_channels(x, expected_channels)
   x = _match_length(x, expected_length, args.length_mode)
-  if args.normalize == 'per-record':
+  metadata_mean_std = _metadata_preprocess_stats(metadata, expected_channels)
+  normalize_mode = args.normalize
+  if normalize_mode == 'auto':
+    normalize_mode = 'checkpoint' if metadata_mean_std is not None else 'none'
+  if normalize_mode == 'checkpoint':
+    if metadata_mean_std is None:
+      raise ValueError('ONNX metadata does not contain preprocess mean/std; use --normalize none or --normalize per-record')
+    x = _normalize_with_metadata_stats(x, metadata_mean_std)
+  elif normalize_mode == 'per-record':
     x = _normalize_per_record(x)
 
   output_names = metadata.get('output_names') or ([metadata['output_name']] if metadata.get('output_name') else None)
@@ -194,7 +227,7 @@ def main() -> None:
     **metadata,
     'onnx': str(args.onnx),
     'input': str(args.input),
-    'normalize': args.normalize,
+    'normalize': normalize_mode,
     'length_mode': args.length_mode,
     'providers': session.get_providers(),
     'label_names': label_names or metadata.get('label_names'),

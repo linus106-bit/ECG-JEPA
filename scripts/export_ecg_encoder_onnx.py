@@ -82,6 +82,24 @@ def _encoder_state_from_checkpoint(chkpt: dict[str, Any]) -> dict[str, torch.Ten
   return dict(model_state)
 
 
+
+def _preprocess_metadata(chkpt: dict[str, Any]) -> dict[str, list[float]] | None:
+  preprocess = chkpt.get('preprocess')
+  if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
+    return None
+  mean = preprocess['mean']
+  std = preprocess['std']
+  if isinstance(mean, torch.Tensor):
+    mean = mean.detach().cpu().numpy()
+  if isinstance(std, torch.Tensor):
+    std = std.detach().cpu().numpy()
+  return {
+    'mean': [float(value) for value in mean.reshape(-1)],
+    'std': [float(value) for value in std.reshape(-1)],
+    'clip': [-5.0, 5.0],
+  }
+
+
 def _label_names(num_classes: int, raw_label_names: str | None) -> list[str]:
   if raw_label_names is None:
     if num_classes == len(DEFAULT_SIX_LABEL_NAMES):
@@ -127,7 +145,8 @@ def _metadata_from_config(
     keep_registers: bool,
     opset: int,
     probability_mode: str | None = None,
-    label_names: list[str] | None = None) -> dict[str, Any]:
+    label_names: list[str] | None = None,
+    preprocess: dict[str, list[float]] | None = None) -> dict[str, Any]:
   return {
     'checkpoint': str(checkpoint),
     'export_target': export_target,
@@ -142,6 +161,7 @@ def _metadata_from_config(
     'keep_registers': keep_registers,
     'probability_mode': probability_mode,
     'label_names': label_names,
+    'preprocess': preprocess,
     'opset': opset,
     'input_name': 'ecg',
     'output_names': output_names,
@@ -244,7 +264,8 @@ def main() -> None:
         keep_registers,
         args.opset,
         probability_mode=args.probability_mode if export_target == 'classifier' else None,
-        label_names=label_names),
+        label_names=label_names,
+        preprocess=_preprocess_metadata(chkpt)),
       indent=2),
     encoding='utf-8')
   print(f'Exported ONNX {export_target} to {args.output}')
