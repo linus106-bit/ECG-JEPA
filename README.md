@@ -193,7 +193,9 @@ first with `pip install onnx onnxruntime`. For fine-tuned classifier checkpoints
 `ecg` and outputs `logits` and `probabilities`. For pre-training checkpoints,
 the exporter emits encoder `token_embeddings`. A sidecar metadata JSON is
 written next to the ONNX file by default, including saved preprocessing stats
-when present so ONNX inference can use `--normalize auto`.
+and eval crop settings. For fine-tuned ECG configs this matches eval by running
+2.5-second crops with 1.25-second stride, averaging crop logits, then applying
+sigmoid.
 
 ```bash
 python scripts/export_ecg_encoder_onnx.py \

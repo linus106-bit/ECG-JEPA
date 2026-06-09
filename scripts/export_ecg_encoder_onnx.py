@@ -82,7 +82,6 @@ def _encoder_state_from_checkpoint(chkpt: dict[str, Any]) -> dict[str, torch.Ten
   return dict(model_state)
 
 
-
 def _preprocess_metadata(chkpt: dict[str, Any]) -> dict[str, list[float]] | None:
   preprocess = chkpt.get('preprocess')
   if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
@@ -111,6 +110,16 @@ def _label_names(num_classes: int, raw_label_names: str | None) -> list[str]:
   names.extend(f'label_{index}' for index in range(len(names), num_classes))
   return names
 
+
+def _eval_crop_config(eval_config: configs.eval.Config | None, sampling_frequency: int) -> tuple[int | None, int | None]:
+  if eval_config is None or eval_config.crop_duration is None:
+    return None, None
+  crop_size = int(eval_config.crop_duration * sampling_frequency)
+  if eval_config.crop_stride is not None:
+    crop_stride = int(eval_config.crop_stride * sampling_frequency)
+  else:
+    crop_stride = crop_size
+  return crop_size, crop_stride
 
 def parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description='Export a trained 500 Hz ECG-JEPA encoder or classifier to ONNX.')
@@ -142,6 +151,9 @@ def _metadata_from_config(
     encoder_config: configs.pretrain.Config,
     export_target: str,
     output_names: list[str],
+    model_input_size: int,
+    crop_size: int | None,
+    crop_stride: int | None,
     keep_registers: bool,
     opset: int,
     probability_mode: str | None = None,
@@ -154,6 +166,9 @@ def _metadata_from_config(
     'channels': list(encoder_config.active_channels),
     'num_channels': encoder_config.num_channels,
     'channel_size': encoder_config.channel_size,
+    'model_input_size': model_input_size,
+    'crop_size': crop_size,
+    'crop_stride': crop_stride,
     'patch_size': encoder_config.patch_size,
     'num_patches': encoder_config.num_patches,
     'embedding_dim': encoder_config.dim,
@@ -165,7 +180,7 @@ def _metadata_from_config(
     'opset': opset,
     'input_name': 'ecg',
     'output_names': output_names,
-    'input_shape': ['batch', encoder_config.num_channels, encoder_config.channel_size],
+    'input_shape': ['batch', encoder_config.num_channels, model_input_size],
   }
 
 
@@ -195,6 +210,8 @@ def main() -> None:
   # attention is more portable across ONNX runtimes and opset versions.
   if export_target == 'classifier':
     eval_config = _as_eval_config(chkpt['eval_config'])
+    crop_size, crop_stride = _eval_crop_config(eval_config, encoder_config.sampling_frequency)
+    model_input_size = crop_size or encoder_config.channel_size
     encoder = create_encoder(
       config=encoder_config,
       keep_registers=eval_config.use_register,
@@ -215,6 +232,8 @@ def main() -> None:
     label_names = _label_names(eval_config.num_classes, args.label_names)
     keep_registers = eval_config.use_register
   else:
+    crop_size, crop_stride = None, None
+    model_input_size = encoder_config.channel_size
     model = create_encoder(
       config=encoder_config,
       keep_registers=args.keep_registers,
@@ -236,7 +255,7 @@ def main() -> None:
   dummy_ecg = torch.zeros(
     1,
     encoder_config.num_channels,
-    encoder_config.channel_size,
+    model_input_size,
     dtype=torch.float32,
     device=device)
 
@@ -261,6 +280,9 @@ def main() -> None:
         encoder_config,
         export_target,
         output_names,
+        model_input_size,
+        crop_size,
+        crop_stride,
         keep_registers,
         args.opset,
         probability_mode=args.probability_mode if export_target == 'classifier' else None,

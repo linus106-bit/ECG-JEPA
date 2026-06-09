@@ -103,7 +103,6 @@ def _match_length(x: np.ndarray, expected_length: int, mode: str) -> np.ndarray:
   raise ValueError(f'Unknown length mode: {mode}')
 
 
-
 def _metadata_preprocess_stats(metadata: dict[str, Any], expected_channels: int) -> tuple[np.ndarray, np.ndarray, tuple[float, float] | None] | None:
   preprocess = metadata.get('preprocess')
   if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
@@ -133,6 +132,26 @@ def _normalize_per_record(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
   std = x.std(axis=-1, keepdims=True)
   return (x - mean) / (std + eps)
 
+
+def _strided_crops_batch(x: np.ndarray, crop_size: int, crop_stride: int) -> np.ndarray:
+  batch_size, num_channels, channel_size = x.shape
+  if crop_size > channel_size:
+    raise ValueError(f'Crop size {crop_size} is larger than input length {channel_size}')
+  crop_starts = list(range(0, channel_size - crop_size + 1, crop_stride))
+  if not crop_starts:
+    raise ValueError(f'No crops generated for length={channel_size}, crop_size={crop_size}, stride={crop_stride}')
+  crops = np.empty((batch_size, len(crop_starts), num_channels, crop_size), dtype=x.dtype)
+  for crop_index, start in enumerate(crop_starts):
+    crops[:, crop_index] = x[:, :, start:start + crop_size]
+  return crops
+
+
+def _probabilities_from_logits(logits: np.ndarray, probability_mode: str | None) -> np.ndarray:
+  if probability_mode == 'softmax':
+    logits_max = logits.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits - logits_max)
+    return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+  return 1.0 / (1.0 + np.exp(-logits))
 
 def _static_dim(value: Any, name: str) -> int:
   if isinstance(value, int):
@@ -198,11 +217,22 @@ def main() -> None:
   elif normalize_mode == 'per-record':
     x = _normalize_per_record(x)
 
+  crop_size = metadata.get('crop_size')
+  crop_stride = metadata.get('crop_stride')
+  model_input = x
+  batch_size = len(x)
+  num_crops = None
+  if crop_size is not None:
+    crop_stride = crop_stride or crop_size
+    crops = _strided_crops_batch(x, int(crop_size), int(crop_stride))
+    batch_size, num_crops, num_channels, crop_length = crops.shape
+    model_input = crops.reshape(batch_size * num_crops, num_channels, crop_length)
+
   output_names = metadata.get('output_names') or ([metadata['output_name']] if metadata.get('output_name') else None)
   output_names = output_names or [output.name for output in session.get_outputs()]
   output_batches: dict[str, list[np.ndarray]] = {name: [] for name in output_names}
-  for start in range(0, len(x), args.batch_size):
-    batch = np.ascontiguousarray(x[start:start + args.batch_size], dtype=np.float32)
+  for start in range(0, len(model_input), args.batch_size):
+    batch = np.ascontiguousarray(model_input[start:start + args.batch_size], dtype=np.float32)
     outputs = session.run(None, {input_name: batch})
     for name, values in zip(output_names, outputs):
       output_batches.setdefault(name, []).append(values)
@@ -215,7 +245,26 @@ def main() -> None:
   token_embeddings = outputs_np.get('token_embeddings')
   logits = outputs_np.get('logits')
   probabilities = outputs_np.get('probabilities')
-  pooled_embeddings = token_embeddings.mean(axis=1) if token_embeddings is not None else None
+  crop_logits = None
+  crop_probabilities = None
+  if num_crops is not None:
+    if token_embeddings is not None:
+      token_embeddings = token_embeddings.reshape(batch_size, num_crops, *token_embeddings.shape[1:])
+      outputs_np['token_embeddings'] = token_embeddings
+    if logits is not None:
+      crop_logits = logits.reshape(batch_size, num_crops, logits.shape[-1])
+      logits = crop_logits.mean(axis=1)
+      probabilities = _probabilities_from_logits(logits, metadata.get('probability_mode'))
+      outputs_np['logits'] = logits
+      outputs_np['probabilities'] = probabilities
+      outputs_np['crop_logits'] = crop_logits
+    elif probabilities is not None:
+      crop_probabilities = probabilities.reshape(batch_size, num_crops, probabilities.shape[-1])
+      probabilities = crop_probabilities.mean(axis=1)
+      outputs_np['probabilities'] = probabilities
+      outputs_np['crop_probabilities'] = crop_probabilities
+  pooled_embeddings = token_embeddings.mean(axis=(1, 2)) if token_embeddings is not None and num_crops is not None else (
+    token_embeddings.mean(axis=1) if token_embeddings is not None else None)
 
   label_names = None
   if probabilities is not None:
@@ -230,6 +279,7 @@ def main() -> None:
     'normalize': normalize_mode,
     'length_mode': args.length_mode,
     'providers': session.get_providers(),
+    'num_crops': num_crops,
     'label_names': label_names or metadata.get('label_names'),
   }
 

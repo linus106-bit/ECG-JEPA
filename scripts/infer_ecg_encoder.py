@@ -149,7 +149,6 @@ def _match_length(x: np.ndarray, expected_length: int, mode: str) -> np.ndarray:
   raise ValueError(f'Unknown length mode: {mode}')
 
 
-
 def _checkpoint_preprocess_stats(chkpt: dict[str, Any], expected_channels: int) -> tuple[np.ndarray, np.ndarray] | None:
   preprocess = chkpt.get('preprocess')
   if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
@@ -179,6 +178,29 @@ def _normalize_per_record(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
   std = x.std(axis=-1, keepdims=True)
   return (x - mean) / (std + eps)
 
+
+def _eval_crop_config(eval_config: configs.eval.Config | None, sampling_frequency: int) -> tuple[int | None, int | None]:
+  if eval_config is None or eval_config.crop_duration is None:
+    return None, None
+  crop_size = int(eval_config.crop_duration * sampling_frequency)
+  if eval_config.crop_stride is not None:
+    crop_stride = int(eval_config.crop_stride * sampling_frequency)
+  else:
+    crop_stride = crop_size
+  return crop_size, crop_stride
+
+
+def _strided_crops_batch(x: np.ndarray, crop_size: int, crop_stride: int) -> np.ndarray:
+  batch_size, num_channels, channel_size = x.shape
+  if crop_size > channel_size:
+    raise ValueError(f'Crop size {crop_size} is larger than input length {channel_size}')
+  crop_starts = list(range(0, channel_size - crop_size + 1, crop_stride))
+  if not crop_starts:
+    raise ValueError(f'No crops generated for length={channel_size}, crop_size={crop_size}, stride={crop_stride}')
+  crops = np.empty((batch_size, len(crop_starts), num_channels, crop_size), dtype=x.dtype)
+  for crop_index, start in enumerate(crop_starts):
+    crops[:, crop_index] = x[:, :, start:start + crop_size]
+  return crops
 
 def _encoder_state_from_checkpoint(chkpt: dict[str, Any]) -> dict[str, torch.Tensor]:
   if 'model' not in chkpt:
@@ -258,6 +280,7 @@ def main() -> None:
     classifier.eval()
     encoder = classifier.encoder
   else:
+    eval_config = None
     encoder = create_encoder(
       config=encoder_config,
       keep_registers=args.keep_registers,
@@ -268,6 +291,8 @@ def main() -> None:
         'Checkpoint is incompatible with the encoder. '
         f'Missing keys: {incompatible.missing_keys}; unexpected keys: {incompatible.unexpected_keys}')
     encoder.eval()
+
+  crop_size, crop_stride = _eval_crop_config(eval_config, encoder_config.sampling_frequency)
 
   x = _load_array(args.input, args.input_key)
   x = _ensure_batched_channels_first(x)
@@ -284,20 +309,34 @@ def main() -> None:
   elif normalize_mode == 'per-record':
     x = _normalize_per_record(x)
 
+  model_input = x
+  batch_size = len(x)
+  num_crops = None
+  if classifier is not None and crop_size is not None and crop_stride is not None:
+    crops = _strided_crops_batch(x, crop_size, crop_stride)
+    batch_size, num_crops, num_channels, crop_length = crops.shape
+    model_input = crops.reshape(batch_size * num_crops, num_channels, crop_length)
+
   token_batches: list[np.ndarray] = []
   logit_batches: list[np.ndarray] = []
   with torch.inference_mode():
-    for start in range(0, len(x), args.batch_size):
-      batch = torch.from_numpy(x[start:start + args.batch_size]).to(device=device, dtype=torch.float32)
+    for start in range(0, len(model_input), args.batch_size):
+      batch = torch.from_numpy(model_input[start:start + args.batch_size]).to(device=device, dtype=torch.float32)
       tokens_tensor = encoder(batch)
       token_batches.append(tokens_tensor.detach().cpu().numpy())
       if classifier is not None:
-        logits = classifier(tokens_tensor, encoded=True)
-        logit_batches.append(logits.detach().cpu().numpy())
+        logits_tensor = classifier(tokens_tensor, encoded=True)
+        logit_batches.append(logits_tensor.detach().cpu().numpy())
 
   token_embeddings = np.concatenate(token_batches, axis=0)
-  pooled_embeddings = token_embeddings.mean(axis=1)
   logits = np.concatenate(logit_batches, axis=0) if logit_batches else None
+  crop_logits = None
+  if num_crops is not None:
+    token_embeddings = token_embeddings.reshape(batch_size, num_crops, *token_embeddings.shape[1:])
+    if logits is not None:
+      crop_logits = logits.reshape(batch_size, num_crops, logits.shape[-1])
+      logits = crop_logits.mean(axis=1)
+  pooled_embeddings = token_embeddings.mean(axis=(1, 2)) if num_crops is not None else token_embeddings.mean(axis=1)
   probabilities = None
   names = None
   if logits is not None:
@@ -322,6 +361,9 @@ def main() -> None:
     'keep_registers': actual_keep_registers,
     'normalize': normalize_mode,
     'length_mode': args.length_mode,
+    'crop_size': crop_size,
+    'crop_stride': crop_stride,
+    'num_crops': num_crops,
     'has_classifier': classifier is not None,
     'probability_mode': args.probability_mode if classifier is not None else None,
     'label_names': names,
@@ -336,6 +378,8 @@ def main() -> None:
   if logits is not None and probabilities is not None:
     output['logits'] = logits
     output['probabilities'] = probabilities
+    if crop_logits is not None:
+      output['crop_logits'] = crop_logits
   np.savez_compressed(args.output, **output)
   print(f'Saved token_embeddings {token_embeddings.shape} and pooled_embeddings {pooled_embeddings.shape} to {args.output}')
 
