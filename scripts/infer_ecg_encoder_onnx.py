@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Run inference with an ONNX-exported ECG-JEPA encoder or classifier.
+
+Use ``scripts/export_ecg_encoder_onnx.py`` first. This script loads the ONNX
+model with ONNX Runtime, prepares channels-first ECG arrays, runs batched
+inference, and writes the ONNX outputs to an ``.npz`` file. Encoder ONNX models
+produce ``token_embeddings`` plus mean-pooled embeddings; classifier ONNX models
+produce ``logits`` and ``probabilities``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import onnxruntime as ort
+
+
+DEFAULT_SIX_LABEL_NAMES = ('AFIB', '1AVB', '2AVB', 'SVTAC', 'PAC', 'PVC')
+
+
+def parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser(description='Inference for an ONNX-exported ECG-JEPA encoder or classifier.')
+  parser.add_argument('--onnx', required=True, type=Path,
+                      help='Path to an ONNX model exported by export_ecg_encoder_onnx.py.')
+  parser.add_argument('--input', required=True, type=Path,
+                      help='Input ECG file: .npy or .npz with shape (channels, samples) or (batch, channels, samples).')
+  parser.add_argument('--output', required=True, type=Path,
+                      help='Output .npz path for embeddings and metadata.')
+  parser.add_argument('--input-key', default=None,
+                      help='Array key for .npz inputs. Defaults to the first array in the archive.')
+  parser.add_argument('--metadata', type=Path, default=None,
+                      help='Metadata JSON path. Defaults to <onnx>.json when present; otherwise shape is read from ONNX input.')
+  parser.add_argument('--batch-size', type=int, default=32,
+                      help='Inference batch size.')
+  parser.add_argument('--length-mode', choices=('strict', 'center-crop', 'left-crop', 'pad'),
+                      default='strict',
+                      help='How to handle sample length mismatch with the exported model input length.')
+  parser.add_argument('--normalize', choices=('auto', 'none', 'checkpoint', 'per-record'), default='auto',
+                      help='Input normalization. auto uses metadata preprocess stats when present, otherwise none.')
+  parser.add_argument('--providers', nargs='+', default=None,
+                      help='Optional ONNX Runtime providers, e.g. CUDAExecutionProvider CPUExecutionProvider.')
+  parser.add_argument('--label-names', default=None,
+                      help='Comma-separated classifier label names. Defaults to metadata, then AFIB,1AVB,2AVB,SVTAC,PAC,PVC for 6-label models.')
+  parser.add_argument('--num-print-labels', type=int, default=6,
+                      help='Number of classifier probabilities to print per sample. Default: 6.')
+  parser.add_argument('--no-print-labels', action='store_true',
+                      help='Do not print classifier probabilities when the ONNX model returns probabilities.')
+  return parser.parse_args()
+
+
+def _load_array(path: Path, input_key: str | None) -> np.ndarray:
+  suffix = path.suffix.lower()
+  if suffix == '.npy':
+    data = np.load(path)
+  elif suffix == '.npz':
+    archive = np.load(path)
+    key = input_key or archive.files[0]
+    if key not in archive.files:
+      raise KeyError(f'--input-key {key!r} not found in {path}; available keys: {archive.files}')
+    data = archive[key]
+  else:
+    raise ValueError(f'Unsupported input suffix {path.suffix!r}; use .npy or .npz')
+  return np.asarray(data, dtype=np.float32)
+
+
+def _ensure_batched_channels_first(x: np.ndarray) -> np.ndarray:
+  if x.ndim == 2:
+    x = x[None, ...]
+  if x.ndim != 3:
+    raise ValueError(f'Input must have shape (channels, samples) or (batch, channels, samples), got {x.shape}')
+  return x
+
+
+def _match_channels(x: np.ndarray, expected_channels: int) -> np.ndarray:
+  channels = x.shape[1]
+  if channels == expected_channels:
+    return x
+  if channels > expected_channels:
+    return x[:, :expected_channels, :]
+  raise ValueError(f'Input has {channels} channels, but the ONNX model expects {expected_channels}')
+
+
+def _match_length(x: np.ndarray, expected_length: int, mode: str) -> np.ndarray:
+  length = x.shape[-1]
+  if length == expected_length:
+    return x
+  if mode == 'strict':
+    raise ValueError(f'Input has {length} samples, but the ONNX model expects {expected_length}; choose another --length-mode')
+  if mode in {'center-crop', 'left-crop'}:
+    if length < expected_length:
+      raise ValueError(f'Cannot crop {length} samples up to expected length {expected_length}; use --length-mode pad')
+    start = 0 if mode == 'left-crop' else (length - expected_length) // 2
+    return x[..., start:start + expected_length]
+  if mode == 'pad':
+    if length > expected_length:
+      return x[..., :expected_length]
+    pad_width = expected_length - length
+    return np.pad(x, ((0, 0), (0, 0), (0, pad_width)), mode='constant')
+  raise ValueError(f'Unknown length mode: {mode}')
+
+
+def _metadata_preprocess_stats(metadata: dict[str, Any], expected_channels: int) -> tuple[np.ndarray, np.ndarray, tuple[float, float] | None] | None:
+  preprocess = metadata.get('preprocess')
+  if not preprocess or 'mean' not in preprocess or 'std' not in preprocess:
+    return None
+  mean = np.asarray(preprocess['mean'], dtype=np.float32).reshape(-1)
+  std = np.asarray(preprocess['std'], dtype=np.float32).reshape(-1)
+  if len(mean) < expected_channels or len(std) < expected_channels:
+    raise ValueError(
+      f'Metadata preprocess stats have {len(mean)} channels, but input expects {expected_channels}')
+  clip = preprocess.get('clip')
+  clip_tuple = (float(clip[0]), float(clip[1])) if clip else None
+  return mean[:expected_channels].reshape(1, expected_channels, 1), std[:expected_channels].reshape(1, expected_channels, 1), clip_tuple
+
+
+def _normalize_with_metadata_stats(
+    x: np.ndarray,
+    mean_std_clip: tuple[np.ndarray, np.ndarray, tuple[float, float] | None]) -> np.ndarray:
+  mean, std, clip = mean_std_clip
+  x = (x - mean) / std
+  if clip is not None:
+    x = np.clip(x, clip[0], clip[1])
+  return x
+
+
+def _normalize_per_record(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+  mean = x.mean(axis=-1, keepdims=True)
+  std = x.std(axis=-1, keepdims=True)
+  return (x - mean) / (std + eps)
+
+
+def _strided_crops_batch(x: np.ndarray, crop_size: int, crop_stride: int) -> np.ndarray:
+  batch_size, num_channels, channel_size = x.shape
+  if crop_size > channel_size:
+    raise ValueError(f'Crop size {crop_size} is larger than input length {channel_size}')
+  crop_starts = list(range(0, channel_size - crop_size + 1, crop_stride))
+  if not crop_starts:
+    raise ValueError(f'No crops generated for length={channel_size}, crop_size={crop_size}, stride={crop_stride}')
+  crops = np.empty((batch_size, len(crop_starts), num_channels, crop_size), dtype=x.dtype)
+  for crop_index, start in enumerate(crop_starts):
+    crops[:, crop_index] = x[:, :, start:start + crop_size]
+  return crops
+
+
+def _probabilities_from_logits(logits: np.ndarray, probability_mode: str | None) -> np.ndarray:
+  if probability_mode == 'softmax':
+    logits_max = logits.max(axis=1, keepdims=True)
+    exp_logits = np.exp(logits - logits_max)
+    return exp_logits / exp_logits.sum(axis=1, keepdims=True)
+  return 1.0 / (1.0 + np.exp(-logits))
+
+def _static_dim(value: Any, name: str) -> int:
+  if isinstance(value, int):
+    return value
+  raise ValueError(f'ONNX input {name} dimension must be static, got {value!r}')
+
+
+def _load_metadata(args: argparse.Namespace) -> dict[str, Any]:
+  metadata_path = args.metadata or args.onnx.with_suffix(args.onnx.suffix + '.json')
+  if metadata_path.exists():
+    return json.loads(metadata_path.read_text(encoding='utf-8'))
+  return {}
+
+
+def _label_names(num_classes: int, raw_label_names: str | None, metadata: dict[str, Any]) -> list[str]:
+  if raw_label_names is not None:
+    names = [name.strip() for name in raw_label_names.split(',') if name.strip()]
+    if len(names) > num_classes:
+      raise ValueError(f'--label-names cannot contain more than {num_classes} names, got {len(names)}')
+    names.extend(f'label_{index}' for index in range(len(names), num_classes))
+    return names
+  metadata_names = metadata.get('label_names')
+  if metadata_names:
+    names = [str(name) for name in metadata_names]
+    names.extend(f'label_{index}' for index in range(len(names), num_classes))
+    return names[:num_classes]
+  if num_classes == len(DEFAULT_SIX_LABEL_NAMES):
+    return list(DEFAULT_SIX_LABEL_NAMES)
+  return [f'label_{index}' for index in range(num_classes)]
+
+
+def _print_label_probabilities(probabilities: np.ndarray, label_names: list[str], num_print_labels: int) -> None:
+  labels_to_print = min(num_print_labels, probabilities.shape[1])
+  for sample_index, row in enumerate(probabilities):
+    print(f'sample {sample_index} label probabilities:')
+    for label_index in range(labels_to_print):
+      print(f'  {label_names[label_index]}: {row[label_index]:.6f}')
+
+
+def main() -> None:
+  args = parse_args()
+  session = ort.InferenceSession(str(args.onnx), providers=args.providers)
+  model_input = session.get_inputs()[0]
+  input_name = model_input.name
+  input_shape = model_input.shape
+  metadata = _load_metadata(args)
+
+  expected_channels = int(metadata.get('num_channels') or _static_dim(input_shape[1], 'channel'))
+  expected_length = int(metadata.get('channel_size') or _static_dim(input_shape[2], 'sample'))
+
+  x = _load_array(args.input, args.input_key)
+  x = _ensure_batched_channels_first(x)
+  x = _match_channels(x, expected_channels)
+  x = _match_length(x, expected_length, args.length_mode)
+  metadata_mean_std = _metadata_preprocess_stats(metadata, expected_channels)
+  normalize_mode = args.normalize
+  if normalize_mode == 'auto':
+    normalize_mode = 'checkpoint' if metadata_mean_std is not None else 'none'
+  if normalize_mode == 'checkpoint':
+    if metadata_mean_std is None:
+      raise ValueError('ONNX metadata does not contain preprocess mean/std; use --normalize none or --normalize per-record')
+    x = _normalize_with_metadata_stats(x, metadata_mean_std)
+  elif normalize_mode == 'per-record':
+    x = _normalize_per_record(x)
+
+  crop_size = metadata.get('crop_size')
+  crop_stride = metadata.get('crop_stride')
+  model_input = x
+  batch_size = len(x)
+  num_crops = None
+  if crop_size is not None:
+    crop_stride = crop_stride or crop_size
+    crops = _strided_crops_batch(x, int(crop_size), int(crop_stride))
+    batch_size, num_crops, num_channels, crop_length = crops.shape
+    model_input = crops.reshape(batch_size * num_crops, num_channels, crop_length)
+
+  output_names = metadata.get('output_names') or ([metadata['output_name']] if metadata.get('output_name') else None)
+  output_names = output_names or [output.name for output in session.get_outputs()]
+  output_batches: dict[str, list[np.ndarray]] = {name: [] for name in output_names}
+  for start in range(0, len(model_input), args.batch_size):
+    batch = np.ascontiguousarray(model_input[start:start + args.batch_size], dtype=np.float32)
+    outputs = session.run(None, {input_name: batch})
+    for name, values in zip(output_names, outputs):
+      output_batches.setdefault(name, []).append(values)
+
+  outputs_np = {
+    name: np.concatenate(batches, axis=0)
+    for name, batches in output_batches.items()
+    if batches
+  }
+  token_embeddings = outputs_np.get('token_embeddings')
+  logits = outputs_np.get('logits')
+  probabilities = outputs_np.get('probabilities')
+  crop_logits = None
+  crop_probabilities = None
+  if num_crops is not None:
+    if token_embeddings is not None:
+      token_embeddings = token_embeddings.reshape(batch_size, num_crops, *token_embeddings.shape[1:])
+      outputs_np['token_embeddings'] = token_embeddings
+    if logits is not None:
+      crop_logits = logits.reshape(batch_size, num_crops, logits.shape[-1])
+      logits = crop_logits.mean(axis=1)
+      probabilities = _probabilities_from_logits(logits, metadata.get('probability_mode'))
+      outputs_np['logits'] = logits
+      outputs_np['probabilities'] = probabilities
+      outputs_np['crop_logits'] = crop_logits
+    elif probabilities is not None:
+      crop_probabilities = probabilities.reshape(batch_size, num_crops, probabilities.shape[-1])
+      probabilities = crop_probabilities.mean(axis=1)
+      outputs_np['probabilities'] = probabilities
+      outputs_np['crop_probabilities'] = crop_probabilities
+  pooled_embeddings = token_embeddings.mean(axis=(1, 2)) if token_embeddings is not None and num_crops is not None else (
+    token_embeddings.mean(axis=1) if token_embeddings is not None else None)
+
+  label_names = None
+  if probabilities is not None:
+    label_names = _label_names(probabilities.shape[1], args.label_names, metadata)
+    if not args.no_print_labels:
+      _print_label_probabilities(probabilities, label_names, args.num_print_labels)
+
+  output_metadata = {
+    **metadata,
+    'onnx': str(args.onnx),
+    'input': str(args.input),
+    'normalize': normalize_mode,
+    'length_mode': args.length_mode,
+    'providers': session.get_providers(),
+    'num_crops': num_crops,
+    'label_names': label_names or metadata.get('label_names'),
+  }
+
+  args.output.parent.mkdir(parents=True, exist_ok=True)
+  output_npz = {'metadata': json.dumps(output_metadata, ensure_ascii=False), **outputs_np}
+  if pooled_embeddings is not None:
+    output_npz['pooled_embeddings'] = pooled_embeddings
+  np.savez_compressed(args.output, **output_npz)
+  saved_shapes = ', '.join(f'{name} {value.shape}' for name, value in output_npz.items() if name != 'metadata')
+  print(f'Saved {saved_shapes} to {args.output}')
+
+
+if __name__ == '__main__':
+  main()

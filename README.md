@@ -168,6 +168,53 @@ python scripts/minify_pretrained_checkpoint.py \
   --checkpoint results/pretrain/ViTS_mimic/chkpt_10000.pt
 ```
 
+## Standalone Encoder Inference And ONNX Export
+
+Run PyTorch encoder inference directly from a full pre-training checkpoint, a
+minified checkpoint, or a fine-tuned checkpoint. If the checkpoint is a
+fine-tuned classifier checkpoint, the script also prints classifier
+probabilities for six labels by default: `AFIB`, `1AVB`, `2AVB`, `SVTAC`,
+`PAC`, and `PVC`; pass `--label-names` to override them. `--normalize auto`
+uses the fine-tuned checkpoint's saved train-set mean/std preprocessing when
+available.
+
+```bash
+python scripts/infer_ecg_encoder.py \
+  --checkpoint results/pretrain/ViTS_mimic/chkpt_10000.pt \
+  --input /path/to/ecg.npy \
+  --output /path/to/embeddings.npz \
+  --length-mode center-crop \
+  --normalize auto
+```
+
+Export the trained 500 Hz model to ONNX. Install optional ONNX dependencies
+first with `pip install onnx onnxruntime`. For fine-tuned classifier checkpoints,
+`--export-target auto` exports the full classifier by default, with input name
+`ecg` and outputs `logits` and `probabilities`. For pre-training checkpoints,
+the exporter emits encoder `token_embeddings`. A sidecar metadata JSON is
+written next to the ONNX file by default, including saved preprocessing stats,
+eval crop settings, and the default six-label thresholds (`AFIB=0.473`,
+`1AVB=0.131`, `2AVB=0.009`, `SVTAC=0.012`, `PAC=0.251`, `PVC=0.028`).
+For fine-tuned ECG configs this matches eval by running 2.5-second crops with
+1.25-second stride, averaging crop logits, then applying sigmoid.
+
+```bash
+python scripts/export_ecg_encoder_onnx.py \
+  --checkpoint /path/to/fine-tuned/all_best_chkpt.pt \
+  --output /path/to/ecg_classifier.onnx
+```
+
+Run ONNX Runtime inference from the exported ONNX model:
+
+```bash
+python scripts/infer_ecg_encoder_onnx.py \
+  --onnx /path/to/ecg_classifier.onnx \
+  --input /path/to/ecg.npy \
+  --output /path/to/onnx_predictions.npz \
+  --length-mode center-crop \
+  --normalize auto
+```
+
 ## Fine-Tuning And Evaluation
 
 Evaluation configs live in `configs/eval`.
