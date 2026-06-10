@@ -28,6 +28,14 @@ import configs
 from models import EncoderClassifier, create_encoder
 
 DEFAULT_SIX_LABEL_NAMES = ('AFIB', '1AVB', '2AVB', 'SVTAC', 'PAC', 'PVC')
+DEFAULT_SIX_LABEL_THRESHOLDS = {
+  'AFIB': 0.473,
+  '1AVB': 0.131,
+  '2AVB': 0.009,
+  'SVTAC': 0.012,
+  'PAC': 0.251,
+  'PVC': 0.028,
+}
 
 
 class ClassifierWithProbabilities(nn.Module):
@@ -111,6 +119,10 @@ def _label_names(num_classes: int, raw_label_names: str | None) -> list[str]:
   return names
 
 
+def _default_thresholds() -> dict[str, float]:
+  return dict(DEFAULT_SIX_LABEL_THRESHOLDS)
+
+
 def _eval_crop_config(eval_config: configs.eval.Config | None, sampling_frequency: int) -> tuple[int | None, int | None]:
   if eval_config is None or eval_config.crop_duration is None:
     return None, None
@@ -158,7 +170,8 @@ def _metadata_from_config(
     opset: int,
     probability_mode: str | None = None,
     label_names: list[str] | None = None,
-    preprocess: dict[str, list[float]] | None = None) -> dict[str, Any]:
+    preprocess: dict[str, list[float]] | None = None,
+    thresholds: dict[str, float] | None = None) -> dict[str, Any]:
   return {
     'checkpoint': str(checkpoint),
     'export_target': export_target,
@@ -176,6 +189,7 @@ def _metadata_from_config(
     'keep_registers': keep_registers,
     'probability_mode': probability_mode,
     'label_names': label_names,
+    'thresholds': thresholds,
     'preprocess': preprocess,
     'opset': opset,
     'input_name': 'ecg',
@@ -287,7 +301,8 @@ def main() -> None:
         args.opset,
         probability_mode=args.probability_mode if export_target == 'classifier' else None,
         label_names=label_names,
-        preprocess=_preprocess_metadata(chkpt)),
+        preprocess=_preprocess_metadata(chkpt),
+        thresholds=_default_thresholds() if export_target == 'classifier' else None),
       indent=2),
     encoding='utf-8')
   print(f'Exported ONNX {export_target} to {args.output}')
